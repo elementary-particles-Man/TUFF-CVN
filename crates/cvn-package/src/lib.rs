@@ -22,12 +22,15 @@ pub const MANIFEST_FILE: &str = "cvn.json";
 
 /// Content-addressed object prefix inside a CVN preservation package.
 pub const SHA256_OBJECT_PREFIX: &str = "objects/sha256";
+pub const INTEGRITY_VERSION: &str = "cvn-integrity-v4-style-numbering";
 
 const DOMAIN_PAYLOAD: &[u8] = b"TUFF-CVN\0payload\0";
 const DOMAIN_PART_MAP: &[u8] = b"TUFF-CVN\0part-map\0";
 const DOMAIN_RELATIONS: &[u8] = b"TUFF-CVN\0relations\0";
 const DOMAIN_CONTENT_TYPES: &[u8] = b"TUFF-CVN\0content-types\0";
 const DOMAIN_SEMANTIC: &[u8] = b"TUFF-CVN\0semantic\0";
+const DOMAIN_STYLES: &[u8] = b"TUFF-CVN\0styles\0";
+const DOMAIN_NUMBERING: &[u8] = b"TUFF-CVN\0numbering\0";
 const DOMAIN_OBJECTS: &[u8] = b"TUFF-CVN\0objects\0";
 const DOMAIN_ROOT: &[u8] = b"TUFF-CVN\0root\0";
 
@@ -201,6 +204,7 @@ pub fn build_integrity_manifest(
     let nodes = calculate_integrity_nodes(document, objects)?;
     let root_digest = calculate_root_digest(&nodes)?;
     Ok(IntegrityManifest {
+        version: INTEGRITY_VERSION.to_owned(),
         algorithm: DigestAlgorithm::Sha256,
         root: IntegrityRoot {
             digest: root_digest,
@@ -220,6 +224,13 @@ pub fn verify_package_integrity(
 
     let manifest = fs::read(path.join(MANIFEST_FILE))?;
     let cvn_json: CvnJson = serde_json::from_slice(&manifest)?;
+    if cvn_json.integrity.version != INTEGRITY_VERSION {
+        package_failures.push(failure(
+            "CVN_UNSUPPORTED_INTEGRITY_VERSION",
+            "$.integrity.version",
+            "integrity manifest version is not supported by this verifier",
+        ));
+    }
     let objects = scan_objects(path, &mut object_failures, &mut package_failures)?;
 
     let actual_nodes = match calculate_integrity_nodes(&cvn_json.payload, &objects) {
@@ -369,7 +380,17 @@ fn calculate_integrity_nodes(
         (
             IntegrityNodeKind::SemanticProjection,
             DOMAIN_SEMANTIC,
-            to_canonical_bytes(&document.semantic)?,
+            to_canonical_bytes(&semantic_projection(document))?,
+        ),
+        (
+            IntegrityNodeKind::StyleProjection,
+            DOMAIN_STYLES,
+            to_canonical_bytes(&document.semantic.styles)?,
+        ),
+        (
+            IntegrityNodeKind::NumberingProjection,
+            DOMAIN_NUMBERING,
+            to_canonical_bytes(&document.semantic.numbering)?,
         ),
         (
             IntegrityNodeKind::Objects,
@@ -412,13 +433,15 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn integrity_node_order() -> [IntegrityNodeKind; 6] {
+fn integrity_node_order() -> [IntegrityNodeKind; 8] {
     [
         IntegrityNodeKind::CanonicalPayload,
         IntegrityNodeKind::PartMap,
         IntegrityNodeKind::Relations,
         IntegrityNodeKind::ContentTypes,
         IntegrityNodeKind::SemanticProjection,
+        IntegrityNodeKind::StyleProjection,
+        IntegrityNodeKind::NumberingProjection,
         IntegrityNodeKind::Objects,
     ]
 }
@@ -430,6 +453,8 @@ fn mismatch_code(kind: IntegrityNodeKind) -> &'static str {
         IntegrityNodeKind::Relations => "CVN_RELATIONS_DIGEST_MISMATCH",
         IntegrityNodeKind::ContentTypes => "CVN_CONTENT_TYPES_DIGEST_MISMATCH",
         IntegrityNodeKind::SemanticProjection => "CVN_SEMANTIC_PROJECTION_DIGEST_MISMATCH",
+        IntegrityNodeKind::StyleProjection => "CVN_STYLE_PROJECTION_DIGEST_MISMATCH",
+        IntegrityNodeKind::NumberingProjection => "CVN_NUMBERING_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::Objects => "CVN_OBJECT_INVENTORY_DIGEST_MISMATCH",
     }
 }
@@ -477,6 +502,13 @@ fn content_types_projection(document: &CvnDocument) -> ContentTypesProjection {
         .overrides
         .sort_by(|left, right| left.part_name.cmp(&right.part_name));
     projection
+}
+
+fn semantic_projection(document: &CvnDocument) -> cvn_core::SemanticDocument {
+    let mut semantic = document.semantic.clone();
+    semantic.styles = None;
+    semantic.numbering = None;
+    semantic
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -763,6 +795,59 @@ mod tests {
         assert!(has_package_failure(
             &report,
             "CVN_SEMANTIC_PROJECTION_DIGEST_MISMATCH"
+        ));
+        assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
+
+        cleanup(&temp);
+    }
+
+    #[test]
+    fn style_projection_change_is_detected() {
+        let temp = write_integrity_fixture("style-change");
+        let path = temp.join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["payload"]["semantic"]["styles"] = serde_json::json!({
+            "source_part": "word/styles.xml",
+            "definitions": [],
+            "diagnostics": [],
+            "unsupported_features": []
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let report = verify_package_integrity(&temp).unwrap();
+
+        assert!(!report.passed);
+        assert!(has_package_failure(
+            &report,
+            "CVN_STYLE_PROJECTION_DIGEST_MISMATCH"
+        ));
+        assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
+
+        cleanup(&temp);
+    }
+
+    #[test]
+    fn numbering_projection_change_is_detected() {
+        let temp = write_integrity_fixture("numbering-change");
+        let path = temp.join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["payload"]["semantic"]["numbering"] = serde_json::json!({
+            "source_part": "word/numbering.xml",
+            "abstract_numbers": [],
+            "instances": [],
+            "diagnostics": [],
+            "unsupported_features": []
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let report = verify_package_integrity(&temp).unwrap();
+
+        assert!(!report.passed);
+        assert!(has_package_failure(
+            &report,
+            "CVN_NUMBERING_PROJECTION_DIGEST_MISMATCH"
         ));
         assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
 

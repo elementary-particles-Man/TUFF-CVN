@@ -425,6 +425,10 @@ pub enum TargetMode {
 pub struct SemanticDocument {
     pub source_part: String,
     pub blocks: Vec<SemanticBlock>,
+    #[serde(default)]
+    pub styles: Option<StyleRegistryProjection>,
+    #[serde(default)]
+    pub numbering: Option<NumberingRegistryProjection>,
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
 }
 
@@ -443,6 +447,10 @@ pub struct SemanticParagraph {
     pub source_identifier: Option<String>,
     pub source_anchor: SourceAnchor,
     pub properties: ParagraphPropertiesProjection,
+    #[serde(default)]
+    pub numbering: Option<NumberingReference>,
+    #[serde(default)]
+    pub resolved_style: Option<ResolvedStyleProjection>,
     pub runs: Vec<SemanticRun>,
 }
 
@@ -453,6 +461,8 @@ pub struct SemanticRun {
     pub source_identifier: Option<String>,
     pub source_anchor: SourceAnchor,
     pub properties: RunPropertiesProjection,
+    #[serde(default)]
+    pub resolved_style: Option<ResolvedStyleProjection>,
     pub inlines: Vec<SemanticInline>,
 }
 
@@ -522,6 +532,134 @@ pub struct RunPropertiesProjection {
     pub strike: bool,
 }
 
+/// Read-only projection of `word/styles.xml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleRegistryProjection {
+    pub source_part: String,
+    pub definitions: Vec<StyleDefinitionProjection>,
+    pub diagnostics: Vec<StyleResolutionDiagnostic>,
+    pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+/// A DOCX style definition projected without XML reserialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleDefinitionProjection {
+    pub style_id: String,
+    pub style_type: StyleType,
+    pub name: Option<String>,
+    pub aliases: Vec<String>,
+    pub based_on: Option<StyleReference>,
+    pub next: Option<StyleReference>,
+    pub link: Option<StyleReference>,
+    pub is_default: bool,
+    pub custom_style: bool,
+    pub q_format: bool,
+    pub semi_hidden: bool,
+    pub unhide_when_used: bool,
+    pub ui_priority: Option<String>,
+    pub paragraph_properties: ParagraphPropertiesProjection,
+    pub run_properties: RunPropertiesProjection,
+    pub resolved_style: Option<ResolvedStyleProjection>,
+}
+
+/// DOCX style type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StyleType {
+    Paragraph,
+    Character,
+    Table,
+    Numbering,
+    Unknown,
+}
+
+/// Reference to another style definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleReference {
+    pub style_id: String,
+}
+
+/// Deterministic style resolution result. Direct formatting remains separate and
+/// takes precedence when consumers interpret the projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedStyleProjection {
+    pub style_id: String,
+    pub style_type: StyleType,
+    pub chain: Vec<String>,
+    pub paragraph_properties: ParagraphPropertiesProjection,
+    pub run_properties: RunPropertiesProjection,
+}
+
+/// Style projection diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+/// Read-only projection of `word/numbering.xml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberingRegistryProjection {
+    pub source_part: String,
+    pub abstract_numbers: Vec<AbstractNumberingProjection>,
+    pub instances: Vec<NumberingInstanceProjection>,
+    pub diagnostics: Vec<NumberingResolutionDiagnostic>,
+    pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+/// Abstract numbering definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbstractNumberingProjection {
+    pub abstract_num_id: String,
+    pub levels: Vec<NumberingLevelProjection>,
+}
+
+/// Numbering instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberingInstanceProjection {
+    pub num_id: String,
+    pub abstract_num_id: Option<String>,
+    pub level_overrides: Vec<NumberingLevelProjection>,
+}
+
+/// Numbering level projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberingLevelProjection {
+    pub ilvl: String,
+    pub start: Option<String>,
+    pub start_override: Option<String>,
+    pub num_fmt: Option<NumberFormatProjection>,
+    pub lvl_text: Option<String>,
+    pub suff: Option<String>,
+    pub paragraph_style: Option<String>,
+    pub lvl_restart: Option<String>,
+    pub paragraph_properties: ParagraphPropertiesProjection,
+    pub run_properties: RunPropertiesProjection,
+}
+
+/// Paragraph numbering reference with optional resolved level projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberingReference {
+    pub num_id: String,
+    pub ilvl: Option<String>,
+    pub resolved_level: Option<NumberingLevelProjection>,
+}
+
+/// Number format token from `w:numFmt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberFormatProjection {
+    pub value: String,
+}
+
+/// Numbering projection diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NumberingResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
 /// Unsupported or partially projected semantic feature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedSemanticFeature {
@@ -544,6 +682,7 @@ pub enum UnsupportedFeatureHandling {
 /// Package integrity manifest stored alongside the canonical payload.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrityManifest {
+    pub version: String,
     pub algorithm: DigestAlgorithm,
     pub root: IntegrityRoot,
     pub nodes: Vec<IntegrityNode>,
@@ -571,6 +710,8 @@ pub enum IntegrityNodeKind {
     Relations,
     ContentTypes,
     SemanticProjection,
+    StyleProjection,
+    NumberingProjection,
     Objects,
 }
 
@@ -583,6 +724,8 @@ impl IntegrityNodeKind {
             Self::Relations => "relations",
             Self::ContentTypes => "content_types",
             Self::SemanticProjection => "semantic_projection",
+            Self::StyleProjection => "style_projection",
+            Self::NumberingProjection => "numbering_projection",
             Self::Objects => "objects",
         }
     }

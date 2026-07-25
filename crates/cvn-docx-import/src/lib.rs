@@ -6,11 +6,15 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use cvn_core::{
-    ContentTypeDefault, ContentTypeOverride, ContentTypesProjection, CvnDocument, DocumentId,
-    OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship, ParagraphPropertiesProjection,
-    PreservationMode, RunPropertiesProjection, SemanticBlock, SemanticDocument, SemanticInline,
-    SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable, SemanticTableCell,
-    SemanticTableRow, SemanticText, SourceAnchor, SourceDescriptor, SourceFormat, TargetMode,
+    AbstractNumberingProjection, ContentTypeDefault, ContentTypeOverride, ContentTypesProjection,
+    CvnDocument, DocumentId, NumberFormatProjection, NumberingInstanceProjection,
+    NumberingLevelProjection, NumberingReference, NumberingRegistryProjection,
+    NumberingResolutionDiagnostic, OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship,
+    ParagraphPropertiesProjection, PreservationMode, ResolvedStyleProjection,
+    RunPropertiesProjection, SemanticBlock, SemanticDocument, SemanticInline, SemanticNodeId,
+    SemanticParagraph, SemanticRun, SemanticTable, SemanticTableCell, SemanticTableRow,
+    SemanticText, SourceAnchor, SourceDescriptor, SourceFormat, StyleDefinitionProjection,
+    StyleReference, StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
     UnsupportedFeatureHandling, UnsupportedSemanticFeature, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
@@ -250,6 +254,14 @@ pub fn import_docx_with_limits(
     {
         document.semantic = parse_semantic_document(&document.document_id, bytes)?;
     }
+    if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/styles.xml") {
+        document.semantic.styles = Some(parse_styles(bytes)?);
+    }
+    if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/numbering.xml")
+    {
+        document.semantic.numbering = Some(parse_numbering(bytes)?);
+    }
+    resolve_semantic_references(&mut document.semantic);
 
     let objects = objects_by_digest
         .into_iter()
@@ -512,12 +524,43 @@ fn parse_semantic_document(
                             source_identifier,
                             anchor,
                             properties: ParagraphPropertiesProjection::default(),
+                            numbering: None,
                             runs: Vec::new(),
                         });
                     }
                     "pStyle" if name.is_wordprocessingml() => {
                         if let Some(paragraph) = paragraph_stack.last_mut() {
                             paragraph.properties.style_id = attr_val(&attrs);
+                        }
+                    }
+                    "numId" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            let num_id = attr_val(&attrs);
+                            if let Some(num_id) = num_id {
+                                let ilvl = paragraph
+                                    .numbering
+                                    .as_ref()
+                                    .and_then(|numbering| numbering.ilvl.clone());
+                                paragraph.numbering = Some(NumberingReference {
+                                    num_id,
+                                    ilvl,
+                                    resolved_level: None,
+                                });
+                            }
+                        }
+                    }
+                    "ilvl" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            let ilvl = attr_val(&attrs);
+                            if let Some(reference) = paragraph.numbering.as_mut() {
+                                reference.ilvl = ilvl;
+                            } else if let Some(ilvl) = ilvl {
+                                paragraph.numbering = Some(NumberingReference {
+                                    num_id: String::new(),
+                                    ilvl: Some(ilvl),
+                                    resolved_level: None,
+                                });
+                            }
                         }
                     }
                     "r" if name.is_wordprocessingml() => {
@@ -623,12 +666,43 @@ fn parse_semantic_document(
                             source_identifier,
                             anchor,
                             properties: ParagraphPropertiesProjection::default(),
+                            numbering: None,
                             runs: Vec::new(),
                         });
                     }
                     "pStyle" if name.is_wordprocessingml() => {
                         if let Some(paragraph) = paragraph_stack.last_mut() {
                             paragraph.properties.style_id = attr_val(&attrs);
+                        }
+                    }
+                    "numId" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            let num_id = attr_val(&attrs);
+                            if let Some(num_id) = num_id {
+                                let ilvl = paragraph
+                                    .numbering
+                                    .as_ref()
+                                    .and_then(|numbering| numbering.ilvl.clone());
+                                paragraph.numbering = Some(NumberingReference {
+                                    num_id,
+                                    ilvl,
+                                    resolved_level: None,
+                                });
+                            }
+                        }
+                    }
+                    "ilvl" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            let ilvl = attr_val(&attrs);
+                            if let Some(reference) = paragraph.numbering.as_mut() {
+                                reference.ilvl = ilvl;
+                            } else if let Some(ilvl) = ilvl {
+                                paragraph.numbering = Some(NumberingReference {
+                                    num_id: String::new(),
+                                    ilvl: Some(ilvl),
+                                    resolved_level: None,
+                                });
+                            }
                         }
                     }
                     "rStyle" if name.is_wordprocessingml() => {
@@ -741,6 +815,8 @@ fn parse_semantic_document(
     Ok(SemanticDocument {
         source_part: "word/document.xml".to_owned(),
         blocks,
+        styles: None,
+        numbering: None,
         unsupported_features,
     })
 }
@@ -775,6 +851,7 @@ fn end_element(
                         source_identifier: None,
                         source_anchor: run.anchor,
                         properties: run.properties,
+                        resolved_style: None,
                         inlines: run.inlines,
                     });
                 }
@@ -795,6 +872,8 @@ fn end_element(
                     source_identifier: paragraph.source_identifier,
                     source_anchor: paragraph.anchor,
                     properties: paragraph.properties,
+                    numbering: paragraph.numbering,
+                    resolved_style: None,
                     runs: paragraph.runs,
                 });
                 push_block(block, table_stack, blocks);
@@ -930,6 +1009,10 @@ fn attr_val(attrs: &BTreeMap<String, String>) -> Option<String> {
     attrs.get("w:val").or_else(|| attrs.get("val")).cloned()
 }
 
+fn attr_named<'a>(attrs: &'a BTreeMap<String, String>, name: &str) -> Option<&'a String> {
+    attrs.get(name).or_else(|| attrs.get(&format!("w:{name}")))
+}
+
 fn set_run_bool(run_stack: &mut [RunBuilder], property: &str, attrs: &BTreeMap<String, String>) {
     let enabled = attrs
         .get("w:val")
@@ -959,7 +1042,41 @@ fn push_text(run_stack: &mut [RunBuilder], value: &str, preserve_space: bool) {
 fn is_known_wordprocessingml(local_name: &str) -> bool {
     matches!(
         local_name,
-        "document" | "body" | "pPr" | "rPr" | "tblPr" | "tblGrid" | "gridCol" | "tcPr" | "sectPr"
+        "document"
+            | "body"
+            | "pPr"
+            | "rPr"
+            | "tblPr"
+            | "tblGrid"
+            | "gridCol"
+            | "tcPr"
+            | "sectPr"
+            | "styles"
+            | "style"
+            | "name"
+            | "aliases"
+            | "basedOn"
+            | "next"
+            | "link"
+            | "qFormat"
+            | "semiHidden"
+            | "unhideWhenUsed"
+            | "uiPriority"
+            | "numbering"
+            | "abstractNum"
+            | "num"
+            | "lvl"
+            | "lvlOverride"
+            | "abstractNumId"
+            | "start"
+            | "startOverride"
+            | "numFmt"
+            | "lvlText"
+            | "suff"
+            | "lvlRestart"
+            | "numPr"
+            | "numId"
+            | "ilvl"
     )
 }
 
@@ -1001,6 +1118,7 @@ struct ParagraphBuilder {
     source_identifier: Option<String>,
     anchor: SourceAnchor,
     properties: ParagraphPropertiesProjection,
+    numbering: Option<NumberingReference>,
     runs: Vec<SemanticRun>,
 }
 
@@ -1029,6 +1147,1064 @@ struct CellBuilder {
     grid_span: Option<String>,
     v_merge: Option<String>,
     blocks: Vec<SemanticBlock>,
+}
+
+fn parse_styles(bytes: &[u8]) -> Result<StyleRegistryProjection, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
+    let mut definitions = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut unsupported_features = Vec::new();
+    let mut current_style: Option<StyleBuilder> = None;
+    let mut property_context: Option<PropertyContext> = None;
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                handle_style_element(
+                    &name,
+                    &attrs,
+                    &path,
+                    reader.buffer_position(),
+                    &mut current_style,
+                    &mut property_context,
+                    &mut unsupported_features,
+                );
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                handle_style_element(
+                    &name,
+                    &attrs,
+                    &path,
+                    reader.buffer_position(),
+                    &mut current_style,
+                    &mut property_context,
+                    &mut unsupported_features,
+                );
+                if name.local_name == "style" && name.is_wordprocessingml() {
+                    if let Some(style) = current_style.take() {
+                        definitions.push(style.finish());
+                    }
+                }
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if matches!(name.local_name.as_str(), "pPr" | "rPr") && name.is_wordprocessingml() {
+                    property_context = None;
+                }
+                if name.local_name == "style" && name.is_wordprocessingml() {
+                    if let Some(style) = current_style.take() {
+                        definitions.push(style.finish());
+                    }
+                }
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: "word/styles.xml".to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    definitions.sort_by(|left, right| {
+        left.style_id
+            .cmp(&right.style_id)
+            .then(left.style_type.cmp(&right.style_type))
+    });
+    detect_duplicate_styles(&definitions, &mut diagnostics);
+    resolve_style_definitions(&mut definitions, &mut diagnostics);
+    unsupported_features.sort_by(|left, right| {
+        left.source_anchor
+            .xml_path
+            .cmp(&right.source_anchor.xml_path)
+    });
+    diagnostics.sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    Ok(StyleRegistryProjection {
+        source_part: "word/styles.xml".to_owned(),
+        definitions,
+        diagnostics,
+        unsupported_features,
+    })
+}
+
+fn handle_style_element(
+    name: &XmlName,
+    attrs: &BTreeMap<String, String>,
+    path: &str,
+    byte_start: u64,
+    current_style: &mut Option<StyleBuilder>,
+    property_context: &mut Option<PropertyContext>,
+    unsupported_features: &mut Vec<UnsupportedSemanticFeature>,
+) {
+    if !name.is_wordprocessingml() {
+        unsupported_features.push(unsupported_feature(
+            "word/styles.xml",
+            path,
+            byte_start,
+            name,
+        ));
+        return;
+    }
+
+    match name.local_name.as_str() {
+        "style" => {
+            let style_id = attr_named(attrs, "styleId")
+                .cloned()
+                .unwrap_or_else(|| "missing-style-id".to_owned());
+            *current_style = Some(StyleBuilder {
+                style_id,
+                style_type: style_type(attrs.get("type").or_else(|| attrs.get("w:type"))),
+                name: None,
+                aliases: Vec::new(),
+                based_on: None,
+                next: None,
+                link: None,
+                is_default: bool_attr(attrs, "default"),
+                custom_style: bool_attr(attrs, "customStyle"),
+                q_format: false,
+                semi_hidden: false,
+                unhide_when_used: false,
+                ui_priority: None,
+                paragraph_properties: ParagraphPropertiesProjection::default(),
+                run_properties: RunPropertiesProjection::default(),
+            });
+        }
+        "pPr" => *property_context = Some(PropertyContext::Paragraph),
+        "rPr" => *property_context = Some(PropertyContext::Run),
+        "name" => {
+            if let Some(style) = current_style.as_mut() {
+                style.name = attr_val(attrs);
+            }
+        }
+        "aliases" => {
+            if let Some(style) = current_style.as_mut() {
+                if let Some(value) = attr_val(attrs) {
+                    style.aliases = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect();
+                }
+            }
+        }
+        "basedOn" => {
+            if let Some(style) = current_style.as_mut() {
+                style.based_on = attr_val(attrs).map(|style_id| StyleReference { style_id });
+            }
+        }
+        "next" => {
+            if let Some(style) = current_style.as_mut() {
+                style.next = attr_val(attrs).map(|style_id| StyleReference { style_id });
+            }
+        }
+        "link" => {
+            if let Some(style) = current_style.as_mut() {
+                style.link = attr_val(attrs).map(|style_id| StyleReference { style_id });
+            }
+        }
+        "qFormat" => {
+            if let Some(style) = current_style.as_mut() {
+                style.q_format = true;
+            }
+        }
+        "semiHidden" => {
+            if let Some(style) = current_style.as_mut() {
+                style.semi_hidden = true;
+            }
+        }
+        "unhideWhenUsed" => {
+            if let Some(style) = current_style.as_mut() {
+                style.unhide_when_used = true;
+            }
+        }
+        "uiPriority" => {
+            if let Some(style) = current_style.as_mut() {
+                style.ui_priority = attr_val(attrs);
+            }
+        }
+        "pStyle" => {
+            if matches!(property_context, Some(PropertyContext::Paragraph)) {
+                if let Some(style) = current_style.as_mut() {
+                    style.paragraph_properties.style_id = attr_val(attrs);
+                }
+            }
+        }
+        "rStyle" => {
+            if matches!(property_context, Some(PropertyContext::Run)) {
+                if let Some(style) = current_style.as_mut() {
+                    style.run_properties.run_style_id = attr_val(attrs);
+                }
+            }
+        }
+        "b" | "i" | "u" | "strike" => {
+            if matches!(property_context, Some(PropertyContext::Run)) {
+                if let Some(style) = current_style.as_mut() {
+                    set_run_property(&mut style.run_properties, name.local_name.as_str(), attrs);
+                }
+            }
+        }
+        "styles" => {}
+        known if is_known_wordprocessingml(known) => {}
+        _ => unsupported_features.push(unsupported_feature(
+            "word/styles.xml",
+            path,
+            byte_start,
+            name,
+        )),
+    }
+}
+
+fn parse_numbering(bytes: &[u8]) -> Result<NumberingRegistryProjection, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
+    let mut abstract_numbers = Vec::new();
+    let mut instances = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut unsupported_features = Vec::new();
+    let mut current_abstract: Option<AbstractNumberingBuilder> = None;
+    let mut current_instance: Option<NumberingInstanceBuilder> = None;
+    let mut current_level: Option<NumberingLevelBuilder> = None;
+    let mut property_context: Option<PropertyContext> = None;
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                handle_numbering_element(
+                    &name,
+                    &attrs,
+                    &path,
+                    reader.buffer_position(),
+                    &mut current_abstract,
+                    &mut current_instance,
+                    &mut current_level,
+                    &mut property_context,
+                    &mut unsupported_features,
+                );
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                handle_numbering_element(
+                    &name,
+                    &attrs,
+                    &path,
+                    reader.buffer_position(),
+                    &mut current_abstract,
+                    &mut current_instance,
+                    &mut current_level,
+                    &mut property_context,
+                    &mut unsupported_features,
+                );
+                end_numbering_element(
+                    &name,
+                    &mut current_abstract,
+                    &mut current_instance,
+                    &mut current_level,
+                    &mut property_context,
+                    &mut abstract_numbers,
+                    &mut instances,
+                );
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                end_numbering_element(
+                    &name,
+                    &mut current_abstract,
+                    &mut current_instance,
+                    &mut current_level,
+                    &mut property_context,
+                    &mut abstract_numbers,
+                    &mut instances,
+                );
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: "word/numbering.xml".to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    abstract_numbers.sort_by(|left, right| left.abstract_num_id.cmp(&right.abstract_num_id));
+    for abstract_num in &mut abstract_numbers {
+        abstract_num
+            .levels
+            .sort_by(|left, right| left.ilvl.cmp(&right.ilvl));
+    }
+    instances.sort_by(|left, right| left.num_id.cmp(&right.num_id));
+    for instance in &mut instances {
+        instance
+            .level_overrides
+            .sort_by(|left, right| left.ilvl.cmp(&right.ilvl));
+    }
+    detect_numbering_duplicates(&abstract_numbers, &instances, &mut diagnostics);
+    unsupported_features.sort_by(|left, right| {
+        left.source_anchor
+            .xml_path
+            .cmp(&right.source_anchor.xml_path)
+    });
+    diagnostics.sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    Ok(NumberingRegistryProjection {
+        source_part: "word/numbering.xml".to_owned(),
+        abstract_numbers,
+        instances,
+        diagnostics,
+        unsupported_features,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_numbering_element(
+    name: &XmlName,
+    attrs: &BTreeMap<String, String>,
+    path: &str,
+    byte_start: u64,
+    current_abstract: &mut Option<AbstractNumberingBuilder>,
+    current_instance: &mut Option<NumberingInstanceBuilder>,
+    current_level: &mut Option<NumberingLevelBuilder>,
+    property_context: &mut Option<PropertyContext>,
+    unsupported_features: &mut Vec<UnsupportedSemanticFeature>,
+) {
+    if !name.is_wordprocessingml() {
+        unsupported_features.push(unsupported_feature(
+            "word/numbering.xml",
+            path,
+            byte_start,
+            name,
+        ));
+        return;
+    }
+    match name.local_name.as_str() {
+        "abstractNum" => {
+            *current_abstract = Some(AbstractNumberingBuilder {
+                abstract_num_id: attr_named(attrs, "abstractNumId")
+                    .cloned()
+                    .unwrap_or_else(|| "missing-abstractNumId".to_owned()),
+                levels: Vec::new(),
+            });
+        }
+        "num" => {
+            *current_instance = Some(NumberingInstanceBuilder {
+                num_id: attr_named(attrs, "numId")
+                    .cloned()
+                    .unwrap_or_else(|| "missing-numId".to_owned()),
+                abstract_num_id: None,
+                level_overrides: Vec::new(),
+            });
+        }
+        "lvl" => {
+            *current_level = Some(NumberingLevelBuilder::new(
+                attr_named(attrs, "ilvl")
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_owned()),
+            ));
+        }
+        "lvlOverride" => {
+            *current_level = Some(NumberingLevelBuilder::new_override(
+                attr_named(attrs, "ilvl")
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_owned()),
+            ));
+        }
+        "abstractNumId" => {
+            if let Some(instance) = current_instance.as_mut() {
+                instance.abstract_num_id = attr_val(attrs);
+            }
+        }
+        "start" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.start = attr_val(attrs);
+            }
+        }
+        "startOverride" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.start_override = attr_val(attrs);
+            }
+        }
+        "numFmt" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.num_fmt = attr_val(attrs).map(|value| NumberFormatProjection { value });
+            }
+        }
+        "lvlText" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.lvl_text = attr_val(attrs);
+            }
+        }
+        "suff" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.suff = attr_val(attrs);
+            }
+        }
+        "pStyle" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.paragraph_style = attr_val(attrs);
+            }
+        }
+        "lvlRestart" => {
+            if let Some(level) = current_level.as_mut() {
+                level.level.lvl_restart = attr_val(attrs);
+            }
+        }
+        "pPr" => *property_context = Some(PropertyContext::Paragraph),
+        "rPr" => *property_context = Some(PropertyContext::Run),
+        "rStyle" => {
+            if matches!(property_context, Some(PropertyContext::Run)) {
+                if let Some(level) = current_level.as_mut() {
+                    level.level.run_properties.run_style_id = attr_val(attrs);
+                }
+            }
+        }
+        "b" | "i" | "u" | "strike" => {
+            if matches!(property_context, Some(PropertyContext::Run)) {
+                if let Some(level) = current_level.as_mut() {
+                    set_run_property(
+                        &mut level.level.run_properties,
+                        name.local_name.as_str(),
+                        attrs,
+                    );
+                }
+            }
+        }
+        "numbering" => {}
+        known if is_known_wordprocessingml(known) => {}
+        _ => unsupported_features.push(unsupported_feature(
+            "word/numbering.xml",
+            path,
+            byte_start,
+            name,
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn end_numbering_element(
+    name: &XmlName,
+    current_abstract: &mut Option<AbstractNumberingBuilder>,
+    current_instance: &mut Option<NumberingInstanceBuilder>,
+    current_level: &mut Option<NumberingLevelBuilder>,
+    property_context: &mut Option<PropertyContext>,
+    abstract_numbers: &mut Vec<AbstractNumberingProjection>,
+    instances: &mut Vec<NumberingInstanceProjection>,
+) {
+    if !name.is_wordprocessingml() {
+        return;
+    }
+    match name.local_name.as_str() {
+        "pPr" | "rPr" => *property_context = None,
+        "lvl" => {
+            if let (Some(abstract_num), Some(level)) =
+                (current_abstract.as_mut(), current_level.take())
+            {
+                abstract_num.levels.push(level.level);
+            }
+        }
+        "lvlOverride" => {
+            if let (Some(instance), Some(level)) = (current_instance.as_mut(), current_level.take())
+            {
+                instance.level_overrides.push(level.level);
+            }
+        }
+        "abstractNum" => {
+            if let Some(abstract_num) = current_abstract.take() {
+                abstract_numbers.push(AbstractNumberingProjection {
+                    abstract_num_id: abstract_num.abstract_num_id,
+                    levels: abstract_num.levels,
+                });
+            }
+        }
+        "num" => {
+            if let Some(instance) = current_instance.take() {
+                instances.push(NumberingInstanceProjection {
+                    num_id: instance.num_id,
+                    abstract_num_id: instance.abstract_num_id,
+                    level_overrides: instance.level_overrides,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_semantic_references(semantic: &mut SemanticDocument) {
+    let styles_snapshot = semantic.styles.clone();
+    let numbering_snapshot = semantic.numbering.clone();
+    for block in &mut semantic.blocks {
+        resolve_block_references(block, styles_snapshot.as_ref(), numbering_snapshot.as_ref());
+    }
+    if let Some(numbering) = semantic.numbering.as_mut() {
+        detect_numbering_reference_diagnostics(&semantic.blocks, numbering);
+    }
+}
+
+fn resolve_block_references(
+    block: &mut SemanticBlock,
+    styles: Option<&StyleRegistryProjection>,
+    numbering: Option<&NumberingRegistryProjection>,
+) {
+    match block {
+        SemanticBlock::Paragraph(paragraph) => {
+            paragraph.resolved_style = resolve_paragraph_style(paragraph, styles);
+            if let Some(reference) = paragraph.numbering.as_mut() {
+                reference.resolved_level = resolve_numbering_reference(reference, numbering);
+            }
+            for run in &mut paragraph.runs {
+                run.resolved_style = resolve_run_style(run, styles);
+            }
+        }
+        SemanticBlock::Table(table) => {
+            for row in &mut table.rows {
+                for cell in &mut row.cells {
+                    for child in &mut cell.blocks {
+                        resolve_block_references(child, styles, numbering);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_paragraph_style(
+    paragraph: &SemanticParagraph,
+    styles: Option<&StyleRegistryProjection>,
+) -> Option<ResolvedStyleProjection> {
+    let styles = styles?;
+    if let Some(style_id) = paragraph.properties.style_id.as_ref() {
+        return styles
+            .definitions
+            .iter()
+            .find(|style| style.style_id == *style_id)
+            .and_then(|style| style.resolved_style.clone());
+    }
+    styles
+        .definitions
+        .iter()
+        .find(|style| style.style_type == StyleType::Paragraph && style.is_default)
+        .and_then(|style| style.resolved_style.clone())
+}
+
+fn resolve_run_style(
+    run: &SemanticRun,
+    styles: Option<&StyleRegistryProjection>,
+) -> Option<ResolvedStyleProjection> {
+    let styles = styles?;
+    run.properties.run_style_id.as_ref().and_then(|style_id| {
+        styles
+            .definitions
+            .iter()
+            .find(|style| style.style_id == *style_id)
+            .and_then(|style| style.resolved_style.clone())
+    })
+}
+
+fn resolve_numbering_reference(
+    reference: &NumberingReference,
+    numbering: Option<&NumberingRegistryProjection>,
+) -> Option<NumberingLevelProjection> {
+    let numbering = numbering?;
+    let instance = numbering
+        .instances
+        .iter()
+        .find(|instance| instance.num_id == reference.num_id)?;
+    let ilvl = reference.ilvl.as_deref().unwrap_or("0");
+    if let Some(override_level) = instance
+        .level_overrides
+        .iter()
+        .find(|level| level.ilvl == ilvl)
+    {
+        return Some(override_level.clone());
+    }
+    let abstract_id = instance.abstract_num_id.as_ref()?;
+    numbering
+        .abstract_numbers
+        .iter()
+        .find(|abstract_num| abstract_num.abstract_num_id == *abstract_id)?
+        .levels
+        .iter()
+        .find(|level| level.ilvl == ilvl)
+        .cloned()
+}
+
+fn detect_numbering_reference_diagnostics(
+    blocks: &[SemanticBlock],
+    numbering: &mut NumberingRegistryProjection,
+) {
+    let mut diagnostics = Vec::new();
+    collect_numbering_reference_diagnostics(blocks, numbering, &mut diagnostics);
+    numbering.diagnostics.extend(diagnostics);
+    numbering
+        .diagnostics
+        .sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+}
+
+fn collect_numbering_reference_diagnostics(
+    blocks: &[SemanticBlock],
+    numbering: &NumberingRegistryProjection,
+    diagnostics: &mut Vec<NumberingResolutionDiagnostic>,
+) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                if let Some(reference) = paragraph.numbering.as_ref() {
+                    let path = paragraph.source_anchor.xml_path.clone();
+                    let Some(instance) = numbering
+                        .instances
+                        .iter()
+                        .find(|instance| instance.num_id == reference.num_id)
+                    else {
+                        diagnostics.push(numbering_diag(
+                            "CVN_NUMBERING_INSTANCE_MISSING",
+                            &path,
+                            format!("numbering instance `{}` is not defined", reference.num_id),
+                        ));
+                        continue;
+                    };
+                    let Some(abstract_id) = instance.abstract_num_id.as_ref() else {
+                        diagnostics.push(numbering_diag(
+                            "CVN_ABSTRACT_NUMBERING_MISSING",
+                            &path,
+                            format!(
+                                "numbering instance `{}` has no abstractNumId",
+                                instance.num_id
+                            ),
+                        ));
+                        continue;
+                    };
+                    let Some(abstract_num) = numbering
+                        .abstract_numbers
+                        .iter()
+                        .find(|abstract_num| abstract_num.abstract_num_id == *abstract_id)
+                    else {
+                        diagnostics.push(numbering_diag(
+                            "CVN_ABSTRACT_NUMBERING_MISSING",
+                            &path,
+                            format!("abstract numbering `{abstract_id}` is not defined"),
+                        ));
+                        continue;
+                    };
+                    let ilvl = reference.ilvl.as_deref().unwrap_or("0");
+                    let has_override = instance
+                        .level_overrides
+                        .iter()
+                        .any(|level| level.ilvl == ilvl);
+                    let has_base = abstract_num.levels.iter().any(|level| level.ilvl == ilvl);
+                    if !has_override && !has_base {
+                        diagnostics.push(numbering_diag(
+                            "CVN_NUMBERING_LEVEL_MISSING",
+                            &path,
+                            format!(
+                                "level `{ilvl}` is not defined for numId `{}`",
+                                reference.num_id
+                            ),
+                        ));
+                    }
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        collect_numbering_reference_diagnostics(
+                            &cell.blocks,
+                            numbering,
+                            diagnostics,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_style_definitions(
+    definitions: &mut [StyleDefinitionProjection],
+    diagnostics: &mut Vec<StyleResolutionDiagnostic>,
+) {
+    let duplicate_ids = duplicate_style_ids(definitions);
+    let snapshot = definitions.to_vec();
+    for definition in definitions.iter_mut() {
+        if duplicate_ids.contains(&definition.style_id) {
+            continue;
+        }
+        let mut visiting = Vec::new();
+        definition.resolved_style = resolve_style_chain(
+            &definition.style_id,
+            &snapshot,
+            &duplicate_ids,
+            &mut visiting,
+            diagnostics,
+        );
+    }
+}
+
+fn resolve_style_chain(
+    style_id: &str,
+    definitions: &[StyleDefinitionProjection],
+    duplicate_ids: &BTreeSet<String>,
+    visiting: &mut Vec<String>,
+    diagnostics: &mut Vec<StyleResolutionDiagnostic>,
+) -> Option<ResolvedStyleProjection> {
+    if visiting.iter().any(|id| id == style_id) {
+        diagnostics.push(style_diag(
+            "CVN_STYLE_INHERITANCE_CYCLE",
+            style_id,
+            format!("style inheritance cycle includes `{style_id}`"),
+        ));
+        return None;
+    }
+    if duplicate_ids.contains(style_id) {
+        return None;
+    }
+    let definition = definitions
+        .iter()
+        .find(|style| style.style_id == style_id)?;
+    visiting.push(style_id.to_owned());
+    let parent = match definition.based_on.as_ref() {
+        Some(reference) => {
+            if definitions
+                .iter()
+                .all(|style| style.style_id != reference.style_id)
+            {
+                diagnostics.push(style_diag(
+                    "CVN_STYLE_BASE_MISSING",
+                    style_id,
+                    format!("base style `{}` is not defined", reference.style_id),
+                ));
+                None
+            } else {
+                resolve_style_chain(
+                    &reference.style_id,
+                    definitions,
+                    duplicate_ids,
+                    visiting,
+                    diagnostics,
+                )
+            }
+        }
+        None => None,
+    };
+    visiting.pop();
+
+    let mut paragraph_properties = parent
+        .as_ref()
+        .map(|resolved| resolved.paragraph_properties.clone())
+        .unwrap_or_default();
+    if definition.paragraph_properties.style_id.is_some() {
+        paragraph_properties.style_id = definition.paragraph_properties.style_id.clone();
+    }
+    let mut run_properties = parent
+        .as_ref()
+        .map(|resolved| resolved.run_properties.clone())
+        .unwrap_or_default();
+    merge_run_properties(&mut run_properties, &definition.run_properties);
+    let mut chain = parent.map(|resolved| resolved.chain).unwrap_or_default();
+    chain.push(definition.style_id.clone());
+    Some(ResolvedStyleProjection {
+        style_id: definition.style_id.clone(),
+        style_type: definition.style_type,
+        chain,
+        paragraph_properties,
+        run_properties,
+    })
+}
+
+fn detect_duplicate_styles(
+    definitions: &[StyleDefinitionProjection],
+    diagnostics: &mut Vec<StyleResolutionDiagnostic>,
+) {
+    for style_id in duplicate_style_ids(definitions) {
+        diagnostics.push(style_diag(
+            "CVN_STYLE_DUPLICATE_ID",
+            &style_id,
+            format!("style id `{style_id}` is defined more than once"),
+        ));
+    }
+    for definition in definitions {
+        if let Some(link) = definition.link.as_ref() {
+            if definitions
+                .iter()
+                .all(|style| style.style_id != link.style_id)
+            {
+                diagnostics.push(style_diag(
+                    "CVN_STYLE_LINK_MISSING",
+                    &definition.style_id,
+                    format!("linked style `{}` is not defined", link.style_id),
+                ));
+            }
+        }
+    }
+}
+
+fn duplicate_style_ids(definitions: &[StyleDefinitionProjection]) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for definition in definitions {
+        if !seen.insert(definition.style_id.clone()) {
+            duplicates.insert(definition.style_id.clone());
+        }
+    }
+    duplicates
+}
+
+fn detect_numbering_duplicates(
+    abstract_numbers: &[AbstractNumberingProjection],
+    instances: &[NumberingInstanceProjection],
+    diagnostics: &mut Vec<NumberingResolutionDiagnostic>,
+) {
+    let mut seen_abstracts = BTreeSet::new();
+    for abstract_num in abstract_numbers {
+        if !seen_abstracts.insert(abstract_num.abstract_num_id.clone()) {
+            diagnostics.push(numbering_diag(
+                "CVN_NUMBERING_DUPLICATE_ABSTRACT_ID",
+                &abstract_num.abstract_num_id,
+                format!(
+                    "abstract numbering `{}` is defined more than once",
+                    abstract_num.abstract_num_id
+                ),
+            ));
+        }
+        let mut seen_levels = BTreeSet::new();
+        for level in &abstract_num.levels {
+            if !seen_levels.insert(level.ilvl.clone()) {
+                diagnostics.push(numbering_diag(
+                    "CVN_NUMBERING_DUPLICATE_LEVEL",
+                    &format!("{}/{}", abstract_num.abstract_num_id, level.ilvl),
+                    format!(
+                        "level `{}` is defined more than once in abstract numbering `{}`",
+                        level.ilvl, abstract_num.abstract_num_id
+                    ),
+                ));
+            }
+        }
+    }
+    let mut seen_instances = BTreeSet::new();
+    for instance in instances {
+        if !seen_instances.insert(instance.num_id.clone()) {
+            diagnostics.push(numbering_diag(
+                "CVN_NUMBERING_DUPLICATE_INSTANCE_ID",
+                &instance.num_id,
+                format!(
+                    "numbering instance `{}` is defined more than once",
+                    instance.num_id
+                ),
+            ));
+        }
+    }
+}
+
+fn unsupported_feature(
+    source_part_path: &str,
+    xml_path: &str,
+    byte_start: u64,
+    name: &XmlName,
+) -> UnsupportedSemanticFeature {
+    UnsupportedSemanticFeature {
+        code: "unsupported_semantic_element".to_owned(),
+        source_anchor: SourceAnchor {
+            source_part_path: source_part_path.to_owned(),
+            xml_path: xml_path.to_owned(),
+            byte_start: Some(byte_start),
+        },
+        namespace_uri: name.namespace_uri.clone(),
+        local_name: name.local_name.clone(),
+        handling: UnsupportedFeatureHandling::PreservedRaw,
+    }
+}
+
+fn style_diag(code: &str, path: &str, message: impl Into<String>) -> StyleResolutionDiagnostic {
+    StyleResolutionDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn numbering_diag(
+    code: &str,
+    path: &str,
+    message: impl Into<String>,
+) -> NumberingResolutionDiagnostic {
+    NumberingResolutionDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn style_type(value: Option<&String>) -> StyleType {
+    match value.map(String::as_str) {
+        Some("paragraph") => StyleType::Paragraph,
+        Some("character") => StyleType::Character,
+        Some("table") => StyleType::Table,
+        Some("numbering") => StyleType::Numbering,
+        _ => StyleType::Unknown,
+    }
+}
+
+fn bool_attr(attrs: &BTreeMap<String, String>, name: &str) -> bool {
+    attrs
+        .get(name)
+        .or_else(|| attrs.get(&format!("w:{name}")))
+        .map(|value| matches!(value.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
+}
+
+fn set_run_property(
+    properties: &mut RunPropertiesProjection,
+    property: &str,
+    attrs: &BTreeMap<String, String>,
+) {
+    let enabled = attrs
+        .get("w:val")
+        .or_else(|| attrs.get("val"))
+        .map(|value| !matches!(value.as_str(), "false" | "0" | "off"))
+        .unwrap_or(true);
+    match property {
+        "b" => properties.bold = enabled,
+        "i" => properties.italic = enabled,
+        "u" => properties.underline = enabled,
+        "strike" => properties.strike = enabled,
+        _ => {}
+    }
+}
+
+fn merge_run_properties(target: &mut RunPropertiesProjection, overlay: &RunPropertiesProjection) {
+    if overlay.run_style_id.is_some() {
+        target.run_style_id = overlay.run_style_id.clone();
+    }
+    target.bold |= overlay.bold;
+    target.italic |= overlay.italic;
+    target.underline |= overlay.underline;
+    target.strike |= overlay.strike;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PropertyContext {
+    Paragraph,
+    Run,
+}
+
+#[derive(Debug)]
+struct StyleBuilder {
+    style_id: String,
+    style_type: StyleType,
+    name: Option<String>,
+    aliases: Vec<String>,
+    based_on: Option<StyleReference>,
+    next: Option<StyleReference>,
+    link: Option<StyleReference>,
+    is_default: bool,
+    custom_style: bool,
+    q_format: bool,
+    semi_hidden: bool,
+    unhide_when_used: bool,
+    ui_priority: Option<String>,
+    paragraph_properties: ParagraphPropertiesProjection,
+    run_properties: RunPropertiesProjection,
+}
+
+impl StyleBuilder {
+    fn finish(self) -> StyleDefinitionProjection {
+        StyleDefinitionProjection {
+            style_id: self.style_id,
+            style_type: self.style_type,
+            name: self.name,
+            aliases: self.aliases,
+            based_on: self.based_on,
+            next: self.next,
+            link: self.link,
+            is_default: self.is_default,
+            custom_style: self.custom_style,
+            q_format: self.q_format,
+            semi_hidden: self.semi_hidden,
+            unhide_when_used: self.unhide_when_used,
+            ui_priority: self.ui_priority,
+            paragraph_properties: self.paragraph_properties,
+            run_properties: self.run_properties,
+            resolved_style: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AbstractNumberingBuilder {
+    abstract_num_id: String,
+    levels: Vec<NumberingLevelProjection>,
+}
+
+#[derive(Debug)]
+struct NumberingInstanceBuilder {
+    num_id: String,
+    abstract_num_id: Option<String>,
+    level_overrides: Vec<NumberingLevelProjection>,
+}
+
+#[derive(Debug)]
+struct NumberingLevelBuilder {
+    level: NumberingLevelProjection,
+}
+
+impl NumberingLevelBuilder {
+    fn new(ilvl: String) -> Self {
+        Self {
+            level: NumberingLevelProjection {
+                ilvl,
+                start: None,
+                start_override: None,
+                num_fmt: None,
+                lvl_text: None,
+                suff: None,
+                paragraph_style: None,
+                lvl_restart: None,
+                paragraph_properties: ParagraphPropertiesProjection::default(),
+                run_properties: RunPropertiesProjection::default(),
+            },
+        }
+    }
+
+    fn new_override(ilvl: String) -> Self {
+        Self::new(ilvl)
+    }
 }
 
 #[cfg(test)]
@@ -1183,6 +2359,144 @@ mod tests {
         std::fs::remove_file(docx).unwrap();
     }
 
+    #[test]
+    fn style_and_numbering_projection_is_deterministic_and_resolved() {
+        let docx = write_style_numbering_docx("style-numbering");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(
+            first.document.semantic.styles,
+            second.document.semantic.styles
+        );
+        assert_eq!(
+            first.document.semantic.numbering,
+            second.document.semantic.numbering
+        );
+
+        let styles = first.document.semantic.styles.as_ref().unwrap();
+        assert!(styles
+            .definitions
+            .iter()
+            .any(|style| style.style_id == "BodyText"
+                && style
+                    .resolved_style
+                    .as_ref()
+                    .is_some_and(|resolved| resolved.chain == ["Normal", "BodyText"]
+                        && resolved.run_properties.bold)));
+        assert!(styles
+            .definitions
+            .iter()
+            .any(|style| style.style_id == "Strong"
+                && style.style_type == StyleType::Character
+                && style.run_properties.italic));
+        assert!(styles
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_STYLE_INHERITANCE_CYCLE"));
+        assert!(styles
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_STYLE_BASE_MISSING"));
+        assert!(!styles.unsupported_features.is_empty());
+
+        let numbering = first.document.semantic.numbering.as_ref().unwrap();
+        assert!(numbering
+            .abstract_numbers
+            .iter()
+            .any(|abstract_num| abstract_num.abstract_num_id == "10"
+                && abstract_num.levels.iter().any(|level| level.ilvl == "1")));
+        assert!(numbering
+            .instances
+            .iter()
+            .any(|instance| instance.num_id == "20"
+                && instance.abstract_num_id.as_deref() == Some("10")
+                && instance.level_overrides.iter().any(
+                    |level| level.ilvl == "1" && level.start_override.as_deref() == Some("5")
+                )));
+        assert!(numbering
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_NUMBERING_INSTANCE_MISSING"));
+        assert!(numbering
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_ABSTRACT_NUMBERING_MISSING"));
+        assert!(numbering
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_NUMBERING_LEVEL_MISSING"));
+        assert!(!numbering.unsupported_features.is_empty());
+
+        let first_paragraph = match &first.document.semantic.blocks[0] {
+            SemanticBlock::Paragraph(paragraph) => paragraph,
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(
+            first_paragraph.properties.style_id.as_deref(),
+            Some("BodyText")
+        );
+        assert_eq!(
+            first_paragraph
+                .resolved_style
+                .as_ref()
+                .unwrap()
+                .style_id
+                .as_str(),
+            "BodyText"
+        );
+        assert!(
+            first_paragraph
+                .resolved_style
+                .as_ref()
+                .unwrap()
+                .run_properties
+                .bold
+        );
+        assert_eq!(
+            first_paragraph.numbering.as_ref().unwrap().num_id.as_str(),
+            "20"
+        );
+        assert_eq!(
+            first_paragraph.numbering.as_ref().unwrap().ilvl.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            first_paragraph
+                .numbering
+                .as_ref()
+                .unwrap()
+                .resolved_level
+                .as_ref()
+                .unwrap()
+                .start_override
+                .as_deref(),
+            Some("5")
+        );
+        assert!(
+            first_paragraph.runs[0]
+                .resolved_style
+                .as_ref()
+                .unwrap()
+                .run_properties
+                .italic
+        );
+        assert!(first_paragraph.runs[0].properties.bold);
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn missing_optional_style_and_numbering_parts_are_allowed() {
+        let docx = write_semantic_docx("missing-style-numbering");
+        let package = import_docx(&docx).unwrap();
+
+        assert!(package.document.semantic.styles.is_none());
+        assert!(package.document.semantic.numbering.is_none());
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
     fn write_test_docx(
         name: &str,
         duplicate: bool,
@@ -1227,6 +2541,25 @@ mod tests {
         add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdInternal" Type="image" Target="media/image1.bin"/></Relationships>"#);
         add(&mut zip, options, "word/media/image1.bin", b"image-bytes");
         add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:cx="urn:custom"><w:body><w:p w14:paraId="00ABCDEF"><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:rStyle w:val="Strong"/><w:b/><w:i/><w:u w:val="single"/></w:rPr><w:t xml:space="preserve"> Hello </w:t><w:tab/><w:br/></w:r><w:r><w:t>World</w:t></w:r></w:p><w:p/><w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Cell 1</w:t></w:r></w:p></w:tc><w:tc><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Nested</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl><w:p><cx:unknown>kept raw</cx:unknown></w:p></w:body></w:document>"#);
+        zip.finish().unwrap();
+        path
+    }
+
+    fn write_style_numbering_docx(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyles" Type="styles" Target="styles.xml"/><Relationship Id="rIdNumbering" Type="numbering" Target="numbering.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="BodyText"/><w:numPr><w:ilvl w:val="1"/><w:numId w:val="20"/></w:numPr></w:pPr><w:r><w:rPr><w:rStyle w:val="Strong"/><w:b/></w:rPr><w:t>Styled numbered</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="404"/></w:numPr></w:pPr></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="21"/></w:numPr></w:pPr></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="9"/><w:numId w:val="20"/></w:numPr></w:pPr></w:p></w:body></w:document>"#);
+        add(&mut zip, options, "word/styles.xml", br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:cx="urn:style-extra"><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="BodyText" w:customStyle="1"><w:name w:val="Body Text"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:link w:val="Strong"/><w:qFormat/><w:uiPriority w:val="9"/><w:rPr><w:i/></w:rPr></w:style><w:style w:type="character" w:styleId="Strong"><w:name w:val="Strong"/><w:rPr><w:i/></w:rPr></w:style><w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/></w:style><w:style w:type="numbering" w:styleId="ListStyle"><w:name w:val="List Style"/></w:style><w:style w:type="paragraph" w:styleId="CycleA"><w:basedOn w:val="CycleB"/></w:style><w:style w:type="paragraph" w:styleId="CycleB"><w:basedOn w:val="CycleA"/></w:style><w:style w:type="paragraph" w:styleId="MissingBase"><w:basedOn w:val="NoSuchStyle"/></w:style><cx:unknown/></w:styles>"#);
+        add(&mut zip, options, "word/numbering.xml", br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:cx="urn:numbering-extra"><w:abstractNum w:abstractNumId="10"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:suff w:val="tab"/><w:pStyle w:val="BodyText"/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="*"/><w:lvlRestart w:val="1"/><w:rPr><w:b/></w:rPr></w:lvl></w:abstractNum><w:num w:numId="20"><w:abstractNumId w:val="10"/><w:lvlOverride w:ilvl="1"><w:startOverride w:val="5"/></w:lvlOverride></w:num><w:num w:numId="21"><w:abstractNumId w:val="999"/></w:num><cx:unknown/></w:numbering>"#);
         zip.finish().unwrap();
         path
     }

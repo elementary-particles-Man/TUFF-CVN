@@ -103,18 +103,42 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
 }
 
 fn inspect_command(args: &[String]) -> Result<(), CliError> {
-    if args.len() != 2 || args[1] != "--semantic" {
+    if args.len() < 2 {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> --semantic".to_owned(),
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering]".to_owned(),
+        ));
+    }
+    let flags = &args[1..];
+    if flags
+        .iter()
+        .any(|flag| !matches!(flag.as_str(), "--semantic" | "--styles" | "--numbering"))
+    {
+        return Err(CliError::Usage(
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering]".to_owned(),
         ));
     }
     let input = PathBuf::from(&args[0]);
     let bytes = cvn_package::read_cvn_json_bytes(input)?;
     let cvn_json: cvn_core::CvnJson = serde_json::from_slice(&bytes)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&cvn_json.payload.semantic)?
-    );
+    for flag in flags {
+        match flag.as_str() {
+            "--semantic" => println!(
+                "{}",
+                serde_json::to_string_pretty(&cvn_json.payload.semantic)?
+            ),
+            "--styles" => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cvn_json.payload.semantic.styles)?
+                )
+            }
+            "--numbering" => println!(
+                "{}",
+                serde_json::to_string_pretty(&cvn_json.payload.semantic.numbering)?
+            ),
+            _ => unreachable!("validated inspect flag"),
+        }
+    }
     Ok(())
 }
 
@@ -210,16 +234,16 @@ Commands:
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
-  tcvn inspect <input.cvn> --semantic
-      Print the read-only semantic projection from cvn.json.
+  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering]
+      Print read-only semantic, style, and numbering projections from cvn.json.
 
   tcvn diff <left.cvn> <right.cvn>
       Planned; not implemented yet.
 
 Status:
   OPC raw-byte preservation package round trip is implemented for unedited DOCX preservation.
-  DOCX semantic projection import and inspect are implemented as read-only views.
-  Semantic editing and semantic-driven DOCX export are not implemented.",
+  DOCX semantic, style, and numbering projection import/inspect are implemented as read-only views.
+  Semantic editing and projection-driven DOCX export are not implemented.",
         project = cvn_core::PROJECT_NAME,
         expanded = cvn_core::EXPANDED_NAME
     );

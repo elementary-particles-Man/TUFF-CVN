@@ -111,6 +111,8 @@ The `semantic` payload area records:
 
 - `source_part`
 - ordered blocks
+- optional `styles` registry projection
+- optional `numbering` registry projection
 - unsupported features
 
 Supported block kinds are paragraphs and tables. Supported inline kinds are
@@ -133,6 +135,38 @@ guessed.
 Unknown or unsupported XML elements are not silently deleted. They are recorded
 as `UnsupportedSemanticFeature` with feature code, source anchor, namespace URI,
 local name, and handling. The raw bytes remain preserved in the OPC object.
+
+## Style and numbering projections
+
+P0-CVN-05 adds read-only projections for `word/styles.xml` and
+`word/numbering.xml`. These projections are derived from preserved raw OPC parts
+and do not replace those parts. Export still uses saved raw bytes, not projected
+style or numbering data.
+
+The style registry projection records paragraph, character, table, numbering,
+and unknown style definitions. It retains style ID, type, name, aliases,
+default/custom flags, `basedOn`, `next`, `link`, and minimal UI metadata such as
+`qFormat`, `semiHidden`, `unhideWhenUsed`, and `uiPriority`. Basic paragraph
+and run property projections reuse the P0-CVN-04 fields.
+
+Style resolution follows the `basedOn` chain deterministically. Parent
+properties are applied before child properties; child properties override or add
+to parent properties. Direct paragraph/run formatting remains separate on the
+semantic node and takes precedence for consumers. Cycles, missing bases, missing
+links, and duplicate style IDs are diagnostics; ambiguous duplicate styles are
+not resolved.
+
+The numbering registry projection records `abstractNum`, `num`, and `lvl`
+definitions. It retains `numFmt`, `lvlText`, `start`, `suff`, `pStyle`,
+`lvlRestart`, minimal level paragraph/run properties, and `lvlOverride` /
+`startOverride`. Semantic paragraphs retain `numId` and `ilvl` as
+`NumberingReference`; resolution links `numId` to an instance, then to
+`abstractNum`, then to the requested level. Overrides are applied as projected
+level data. Missing instances, missing abstract numbering, and missing levels
+are diagnostics.
+
+TUFF-CVN does not generate locale-dependent numbering strings or infer visual
+bullet rendering in this phase.
 
 ## Warnings and checksums
 
@@ -178,7 +212,13 @@ Integrity leaf nodes use SHA-256 over `domain-prefix || RFC8785-bytes`:
 - `relations`
 - `content_types`
 - `semantic_projection`
+- `style_projection`
+- `numbering_projection`
 - `objects`
+
+The `semantic_projection` leaf covers the document semantic blocks and
+unsupported-feature list. The optional style and numbering registries are hashed
+by their own independent leaves.
 
 The root digest uses fixed child order. Each child record is
 `node-kind || 0x00 || digest-bytes`; the root hashes

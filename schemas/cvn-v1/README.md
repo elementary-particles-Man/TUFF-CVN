@@ -33,6 +33,7 @@ used to regenerate XML payloads during normal export.
 
 P0-CVN-03 adds `IntegrityManifest`:
 
+- `version`
 - `algorithm`
 - `root.digest`
 - `nodes[]`
@@ -44,6 +45,8 @@ The node kinds are:
 - `relations`
 - `content_types`
 - `semantic_projection`
+- `style_projection`
+- `numbering_projection`
 - `objects`
 
 The manifest is calculated from explicit hash-target projections. The
@@ -68,6 +71,32 @@ P0-CVN-04 adds the semantic projection model:
 
 The semantic projection is read-only and does not replace raw OPC preservation.
 Its integrity is checked by the `semantic_projection` leaf.
+
+P0-CVN-05 adds read-only style and numbering projection models:
+
+- `StyleRegistryProjection`
+- `StyleDefinitionProjection`
+- `StyleType`
+- `StyleReference`
+- `ResolvedStyleProjection`
+- `StyleResolutionDiagnostic`
+- `NumberingRegistryProjection`
+- `AbstractNumberingProjection`
+- `NumberingInstanceProjection`
+- `NumberingLevelProjection`
+- `NumberingReference`
+- `NumberFormatProjection`
+- `NumberingResolutionDiagnostic`
+
+`SemanticDocument` may contain optional `styles` and `numbering` projections.
+`SemanticParagraph` may contain a `NumberingReference` and resolved paragraph
+style. `SemanticRun` may contain resolved run style. These projections are
+read-only; raw `word/styles.xml` and `word/numbering.xml` remain preserved as OPC
+objects and are not regenerated from projection data.
+
+The integrity manifest version is now `cvn-integrity-v4-style-numbering`.
+The `style_projection` and `numbering_projection` leaves hash deterministic
+RFC 8785 projections independently from raw object hashes.
 
 Non-supported or not-yet-claimed areas:
 
