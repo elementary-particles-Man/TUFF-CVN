@@ -8,6 +8,11 @@ repository.workspace = true
 [dependencies]
 cvn-core = { path = "../cvn-core" }
 cvn-schema = { path = "../cvn-schema" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
 
 [lib]
 path = "src/lib.rs"
