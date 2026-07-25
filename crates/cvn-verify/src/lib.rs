@@ -6,7 +6,7 @@ use std::path::Path;
 use cvn_canonical::{sha256_canonical, to_canonical_bytes};
 use cvn_core::{ChecksumAlgorithm, ChecksumEntry, CvnDocument, Relation};
 use cvn_docx_import::import_docx;
-use cvn_package::read_package;
+use cvn_package::{read_package, verify_package_integrity, CanonicalPackageIntegrityReport};
 use thiserror::Error;
 
 /// Structural verification report.
@@ -70,6 +70,20 @@ pub enum ExpandedOpcVerifyError {
     Package(#[from] cvn_package::PackageError),
     #[error("DOCX import error: {0}")]
     Import(#[from] cvn_docx_import::DocxImportError),
+}
+
+/// Canonical package integrity verification error.
+#[derive(Debug, Error)]
+pub enum CanonicalPackageIntegrityVerifyError {
+    #[error("package error: {0}")]
+    Package(#[from] cvn_package::PackageError),
+}
+
+/// Verifies CanonicalPackageIntegrity for a CVN package.
+pub fn verify_canonical_package_integrity(
+    cvn_package_path: impl AsRef<Path>,
+) -> Result<CanonicalPackageIntegrityReport, CanonicalPackageIntegrityVerifyError> {
+    verify_package_integrity(cvn_package_path).map_err(CanonicalPackageIntegrityVerifyError::from)
 }
 
 /// Verifies the minimal CVN structural invariants currently implemented.

@@ -11,7 +11,28 @@ The implemented equivalence target is limited to:
 - deterministic canonical bytes for the same typed value
 - deterministic canonical bytes after deserialize and reserialize
 - stable SHA-256 over canonical bytes
+- CanonicalPackageIntegrity for `.cvn` preservation packages
 - Expanded OPC Part Byte Identity for unedited DOCX preservation packages
+
+## CanonicalPackageIntegrity
+
+CanonicalPackageIntegrity verifies the preservation package itself:
+
+- RFC 8785 canonical payload digest
+- OPC part map digest
+- relationship projection digest
+- content types projection digest
+- content-addressed object inventory digest
+- root digest over the fixed integrity tree
+- object filename digest, recorded digest, actual digest, and length
+
+It detects `cvn.json` payload changes, part map changes, relationship changes,
+content type projection changes, object blob changes, missing objects,
+unexpected objects, invalid object names, and root digest tampering.
+
+CanonicalPackageIntegrity and Expanded OPC Part Byte Identity are independent
+verification levels. A package can pass one and fail the other; `tcvn verify`
+reports them separately and does not hide either failure.
 
 ## Expanded OPC Part Byte Identity
 
@@ -54,3 +75,4 @@ Unconfirmed/deferred:
 - XMLDSig public-key verification
 - XMLDSig re-signing
 - encrypted Office document decryption
+- external CVN signing

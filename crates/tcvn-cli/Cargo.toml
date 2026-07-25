@@ -13,5 +13,6 @@ path = "src/main.rs"
 cvn-docx-export = { path = "../cvn-docx-export" }
 cvn-docx-import = { path = "../cvn-docx-import" }
 cvn-core = { path = "../cvn-core" }
+cvn-package = { path = "../cvn-package" }
 cvn-verify = { path = "../cvn-verify" }
 thiserror = "1"

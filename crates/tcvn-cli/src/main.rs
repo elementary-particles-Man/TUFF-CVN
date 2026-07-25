@@ -6,7 +6,7 @@ use thiserror::Error;
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
         eprintln!("tcvn: {error}");
-        std::process::exit(2);
+        std::process::exit(error.exit_code());
     }
 }
 
@@ -59,14 +59,30 @@ fn export_command(args: &[String]) -> Result<(), CliError> {
 }
 
 fn verify_command(args: &[String]) -> Result<(), CliError> {
+    if args.len() == 1 {
+        let input = PathBuf::from(&args[0]);
+        let report = cvn_verify::verify_canonical_package_integrity(input)?;
+        print_integrity_report(&report);
+        if !report.passed {
+            return Err(CliError::IntegrityFailed);
+        }
+        return Ok(());
+    }
+
     if args.len() != 3 || args[1] != "--against" {
         return Err(CliError::Usage(
-            "usage: tcvn verify <input.cvn> --against <document.docx>".to_owned(),
+            "usage: tcvn verify <input.cvn> [--against <document.docx>]".to_owned(),
         ));
     }
 
     let input = PathBuf::from(&args[0]);
     let against = PathBuf::from(&args[2]);
+    let integrity = cvn_verify::verify_canonical_package_integrity(&input)?;
+    print_integrity_report(&integrity);
+    if !integrity.passed {
+        return Err(CliError::IntegrityFailed);
+    }
+
     let report = cvn_verify::verify_expanded_opc_part_byte_identity(input, against)?;
 
     println!(
@@ -85,6 +101,35 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn print_integrity_report(report: &cvn_package::CanonicalPackageIntegrityReport) {
+    println!(
+        "Verification CanonicalPackageIntegrity: passed={} root_expected={} root_actual={}",
+        report.passed,
+        report.root_expected.as_deref().unwrap_or("<none>"),
+        report.root_actual.as_deref().unwrap_or("<none>")
+    );
+    for node in &report.node_results {
+        println!(
+            "  node={:?} passed={} expected={} actual={}",
+            node.kind,
+            node.passed,
+            node.expected.as_deref().unwrap_or("<none>"),
+            node.actual.as_deref().unwrap_or("<none>")
+        );
+    }
+    for failure in report
+        .object_failures
+        .iter()
+        .chain(report.canonicalization_failures.iter())
+        .chain(report.package_failures.iter())
+    {
+        println!(
+            "  failure code={} path={} message={}",
+            failure.code, failure.path, failure.message
+        );
+    }
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{0}")]
@@ -97,8 +142,23 @@ enum CliError {
     Export(#[from] cvn_docx_export::DocxExportError),
     #[error("verification failed: {0}")]
     Verify(#[from] cvn_verify::ExpandedOpcVerifyError),
+    #[error("integrity verification failed: {0}")]
+    Integrity(#[from] cvn_verify::CanonicalPackageIntegrityVerifyError),
+    #[error("CanonicalPackageIntegrity failed")]
+    IntegrityFailed,
     #[error("Expanded OPC Part Byte Identity failed")]
     VerificationFailed,
+}
+
+impl CliError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Usage(_) | Self::UnsupportedCommand(_) => 2,
+            Self::Import(_) | Self::Export(_) | Self::Verify(_) | Self::Integrity(_) => 3,
+            Self::IntegrityFailed => 4,
+            Self::VerificationFailed => 5,
+        }
+    }
 }
 
 fn print_help() {
@@ -118,8 +178,11 @@ Commands:
   tcvn export <input.cvn> --format docx -o <output.docx>
       Rebuild a DOCX ZIP from preserved raw OPC parts.
 
+  tcvn verify <input.cvn>
+      Verify CanonicalPackageIntegrity for a CVN package.
+
   tcvn verify <input.cvn> --against <document.docx>
-      Verify ExpandedOpcPartByteIdentity between a CVN package and DOCX.
+      Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
   tcvn diff <left.cvn> <right.cvn>
       Planned; not implemented yet.

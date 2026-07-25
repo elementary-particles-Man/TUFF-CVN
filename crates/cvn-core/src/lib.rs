@@ -20,6 +20,15 @@ pub const EXPANDED_NAME: &str = "TUFF Canonical Verifiable Notation";
 /// Initial CVN schema version.
 pub const CVN_V1: &str = "cvn-v1";
 
+/// `cvn.json` top-level shape. `payload` is the canonical content being hashed;
+/// `integrity` stores the resulting tree without becoming part of the payload
+/// digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CvnJson {
+    pub payload: CvnDocument,
+    pub integrity: IntegrityManifest,
+}
+
 /// Validation error for stable CVN identifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdError {
@@ -406,6 +415,81 @@ pub struct OpcRelationship {
 pub enum TargetMode {
     Internal,
     External,
+}
+
+/// Package integrity manifest stored alongside the canonical payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityManifest {
+    pub algorithm: DigestAlgorithm,
+    pub root: IntegrityRoot,
+    pub nodes: Vec<IntegrityNode>,
+}
+
+/// Integrity root digest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityRoot {
+    pub digest: String,
+}
+
+/// Integrity tree leaf node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityNode {
+    pub kind: IntegrityNodeKind,
+    pub digest: String,
+}
+
+/// Integrity node kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityNodeKind {
+    CanonicalPayload,
+    PartMap,
+    Relations,
+    ContentTypes,
+    Objects,
+}
+
+impl IntegrityNodeKind {
+    /// Stable name used in root digest child records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalPayload => "canonical_payload",
+            Self::PartMap => "part_map",
+            Self::Relations => "relations",
+            Self::ContentTypes => "content_types",
+            Self::Objects => "objects",
+        }
+    }
+}
+
+/// Digest algorithm for integrity manifests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DigestAlgorithm {
+    #[default]
+    Sha256,
+}
+
+/// Integrity status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityStatus {
+    Passed,
+    Failed,
+}
+
+/// Integrity failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityFailure {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+/// Explicit hash-target projection for the canonical payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanonicalPayloadView<'a> {
+    pub payload: &'a CvnDocument,
 }
 
 #[cfg(test)]

@@ -1,27 +1,30 @@
-//! Canonical JSON support for TUFF-CVN.
+//! RFC 8785/JCS canonical JSON support for TUFF-CVN.
 //!
-//! Current boundary: serialization is deterministic for the typed CVN model by
-//! converting through `serde_json::Value`, sorting object keys recursively, and
-//! emitting compact UTF-8 JSON. This is intentionally not declared as complete
-//! RFC 8785 compliance. Floating point JSON numbers are rejected at this
-//! boundary; duplicate object keys are assumed to be unrepresentable when
-//! serializing typed serde structures.
+//! Canonical bytes are produced by `serde_json_canonicalizer`. TUFF-CVN adds a
+//! fail-closed preflight pass that rejects JSON numbers outside the JCS safe
+//! integer range and rejects non-finite floating point values before hashing.
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Canonical media type placeholder.
 pub const CANONICAL_MEDIA_TYPE: &str = "application/vnd.tuff-cvn+json";
 
+const MAX_JCS_SAFE_INTEGER: u64 = 9_007_199_254_740_992;
+
 /// Error returned by canonical serialization and digest generation.
 #[derive(Debug, Error)]
 pub enum CanonicalError {
     #[error("failed to convert value to JSON: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("floating point JSON numbers are not allowed at {path}")]
-    FloatingPointNumber { path: String },
+    #[error("failed to canonicalize JSON: {0}")]
+    Canonicalize(String),
+    #[error("JCS unsafe number at {path}: {reason}")]
+    UnsafeNumber { path: String, reason: String },
+    #[error("canonical bytes were not valid UTF-8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
 /// Hex-encoded SHA-256 digest of canonical bytes.
@@ -35,11 +38,24 @@ impl CanonicalDigest {
     }
 }
 
-/// Serializes a value into deterministic canonical JSON bytes.
+/// Verifies that a serde value can be represented safely under the current JCS
+/// boundary.
+pub fn assert_jcs_safe<T: Serialize>(value: &T) -> Result<(), CanonicalError> {
+    let value = serde_json::to_value(value)?;
+    assert_value_jcs_safe(&value, "$")
+}
+
+/// Serializes a value into RFC 8785 canonical JSON bytes.
 pub fn to_canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
-    let mut value = serde_json::to_value(value)?;
-    sort_and_validate_value(&mut value, "$")?;
-    serde_json::to_vec(&value).map_err(CanonicalError::from)
+    let value = serde_json::to_value(value)?;
+    assert_value_jcs_safe(&value, "$")?;
+    serde_json_canonicalizer::to_vec(&value)
+        .map_err(|error| CanonicalError::Canonicalize(error.to_string()))
+}
+
+/// Serializes a value into an RFC 8785 canonical JSON string.
+pub fn to_canonical_string<T: Serialize>(value: &T) -> Result<String, CanonicalError> {
+    String::from_utf8(to_canonical_bytes(value)?).map_err(CanonicalError::from)
 }
 
 /// Computes SHA-256 over canonical JSON bytes.
@@ -49,34 +65,51 @@ pub fn sha256_canonical<T: Serialize>(value: &T) -> Result<CanonicalDigest, Cano
     Ok(CanonicalDigest(hex::encode(digest)))
 }
 
-fn sort_and_validate_value(value: &mut Value, path: &str) -> Result<(), CanonicalError> {
+fn assert_value_jcs_safe(value: &Value, path: &str) -> Result<(), CanonicalError> {
     match value {
         Value::Object(object) => {
-            let mut sorted = Map::new();
-            let old_object = std::mem::take(object);
-            let mut entries: Vec<_> = old_object.into_iter().collect();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-            for (key, mut value) in entries {
-                let child_path = format!("{path}.{key}");
-                sort_and_validate_value(&mut value, &child_path)?;
-                sorted.insert(key, value);
+            for (key, value) in object {
+                assert_value_jcs_safe(value, &format!("{path}.{key}"))?;
             }
-
-            *object = sorted;
             Ok(())
         }
         Value::Array(values) => {
-            for (index, value) in values.iter_mut().enumerate() {
-                sort_and_validate_value(value, &format!("{path}[{index}]"))?;
+            for (index, value) in values.iter().enumerate() {
+                assert_value_jcs_safe(value, &format!("{path}[{index}]"))?;
             }
             Ok(())
         }
-        Value::Number(number) if number.is_i64() || number.is_u64() => Ok(()),
-        Value::Number(_) => Err(CanonicalError::FloatingPointNumber {
-            path: path.to_owned(),
-        }),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                if value.unsigned_abs() <= MAX_JCS_SAFE_INTEGER {
+                    Ok(())
+                } else {
+                    Err(unsafe_number(path, "integer magnitude exceeds 2^53"))
+                }
+            } else if let Some(value) = number.as_u64() {
+                if value <= MAX_JCS_SAFE_INTEGER {
+                    Ok(())
+                } else {
+                    Err(unsafe_number(path, "integer magnitude exceeds 2^53"))
+                }
+            } else if let Some(value) = number.as_f64() {
+                if !value.is_finite() {
+                    Err(unsafe_number(path, "non-finite number"))
+                } else {
+                    Ok(())
+                }
+            } else {
+                Err(unsafe_number(path, "unrepresentable number"))
+            }
+        }
         Value::Null | Value::Bool(_) | Value::String(_) => Ok(()),
+    }
+}
+
+fn unsafe_number(path: &str, reason: &str) -> CanonicalError {
+    CanonicalError::UnsafeNumber {
+        path: path.to_owned(),
+        reason: reason.to_owned(),
     }
 }
 
@@ -158,12 +191,31 @@ mod tests {
     }
 
     #[test]
-    fn floating_point_json_is_rejected() {
-        let value = json!({ "safe": 1, "unsafe": 1.5 });
+    fn utf16_key_order_places_supplementary_before_e000() {
+        let value = json!({
+            "\u{E000}": 1,
+            "\u{10000}": 2
+        });
 
-        let error = to_canonical_bytes(&value).unwrap_err();
+        assert_eq!(to_canonical_string(&value).unwrap(), "{\"𐀀\":2,\"\":1}");
+    }
 
-        assert!(matches!(error, CanonicalError::FloatingPointNumber { .. }));
+    #[test]
+    fn safe_integer_boundary_is_enforced() {
+        assert!(to_canonical_bytes(&json!({ "n": 9_007_199_254_740_992_u64 })).is_ok());
+        let error = to_canonical_bytes(&json!({ "n": 9_007_199_254_740_993_u64 })).unwrap_err();
+        assert!(matches!(error, CanonicalError::UnsafeNumber { .. }));
+    }
+
+    #[test]
+    fn negative_zero_is_canonicalized_to_zero() {
+        assert_eq!(to_canonical_string(&json!(-0.0)).unwrap(), "0");
+    }
+
+    #[test]
+    fn non_finite_numbers_are_rejected_by_serde_before_canonicalization() {
+        assert_eq!(serde_json::to_value(f64::NAN).unwrap(), Value::Null);
+        assert_eq!(serde_json::to_value(f64::INFINITY).unwrap(), Value::Null);
     }
 
     #[test]
