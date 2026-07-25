@@ -1,0 +1,13 @@
+[package]
+name = "cvn-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cvn-core = { path = "../cvn-core" }
+cvn-canonical = { path = "../cvn-canonical" }
+
+[lib]
+path = "src/lib.rs"
