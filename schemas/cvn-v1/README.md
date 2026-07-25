@@ -19,6 +19,7 @@ The implemented Rust payload model currently defines these `CvnDocument` areas:
 - `assets`
 - `opaque`
 - `opc`
+- `semantic`
 - `warnings`
 - `checksums`
 
@@ -42,10 +43,31 @@ The node kinds are:
 - `part_map`
 - `relations`
 - `content_types`
+- `semantic_projection`
 - `objects`
 
 The manifest is calculated from explicit hash-target projections. The
 `root.digest` field is not included in its own calculation.
+
+P0-CVN-04 adds the semantic projection model:
+
+- `SemanticDocument`
+- `SemanticBlock`
+- `SemanticParagraph`
+- `SemanticRun`
+- `SemanticText`
+- `SemanticTable`
+- `SemanticTableRow`
+- `SemanticTableCell`
+- `SemanticInline`
+- `SemanticNodeId`
+- `SourceAnchor`
+- `ParagraphPropertiesProjection`
+- `RunPropertiesProjection`
+- `UnsupportedSemanticFeature`
+
+The semantic projection is read-only and does not replace raw OPC preservation.
+Its integrity is checked by the `semantic_projection` leaf.
 
 Non-supported or not-yet-claimed areas:
 

@@ -25,6 +25,7 @@ The current payload root model is `CvnDocument`:
 - `assets`
 - `opaque`
 - `opc`
+- `semantic`
 - `warnings`
 - `checksums`
 
@@ -100,6 +101,39 @@ Projection parsing rejects DOCTYPE and does not resolve external resources.
 `TargetMode="External"` relationship targets are retained as inert original
 strings. TUFF-CVN does not fetch, normalize, rewrite, or delete those URIs.
 
+## Semantic projection
+
+P0-CVN-04 adds a read-only semantic projection from `word/document.xml`.
+The projection does not replace raw OPC preservation and is not used to
+regenerate DOCX XML.
+
+The `semantic` payload area records:
+
+- `source_part`
+- ordered blocks
+- unsupported features
+
+Supported block kinds are paragraphs and tables. Supported inline kinds are
+text, tab, and line break. Tables preserve row/cell order and allow nested
+tables. Paragraphs retain paragraph style IDs and available `w14:paraId`
+source identifiers. Runs retain run style IDs and basic formatting flags:
+bold, italic, underline, and strike.
+
+`SemanticNodeId` is the CVN primary key for semantic nodes. It is separate from
+source identifiers such as `w14:paraId`. When a source identifier exists, the
+generated CVN ID is derived from document ID, source part, node kind, and source
+identifier. When no source identifier exists, the ID is derived from document
+ID, source part, XML structural path, node kind, and raw document digest. The
+generated IDs are persisted in `cvn.json`.
+
+Each semantic node includes a `SourceAnchor` with the source part and XML
+structural path. Byte start may be recorded when available; end offsets are not
+guessed.
+
+Unknown or unsupported XML elements are not silently deleted. They are recorded
+as `UnsupportedSemanticFeature` with feature code, source anchor, namespace URI,
+local name, and handling. The raw bytes remain preserved in the OPC object.
+
 ## Warnings and checksums
 
 Warnings are typed records with `code`, `severity`, `path`, `message`, and
@@ -143,6 +177,7 @@ Integrity leaf nodes use SHA-256 over `domain-prefix || RFC8785-bytes`:
 - `part_map`
 - `relations`
 - `content_types`
+- `semantic_projection`
 - `objects`
 
 The root digest uses fixed child order. Each child record is

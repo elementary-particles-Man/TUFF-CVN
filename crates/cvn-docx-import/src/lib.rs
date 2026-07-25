@@ -7,12 +7,16 @@ use std::path::Path;
 
 use cvn_core::{
     ContentTypeDefault, ContentTypeOverride, ContentTypesProjection, CvnDocument, DocumentId,
-    OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship, PreservationMode,
-    SourceDescriptor, SourceFormat, TargetMode, ZipEntryMetadata,
+    OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship, ParagraphPropertiesProjection,
+    PreservationMode, RunPropertiesProjection, SemanticBlock, SemanticDocument, SemanticInline,
+    SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable, SemanticTableCell,
+    SemanticTableRow, SemanticText, SourceAnchor, SourceDescriptor, SourceFormat, TargetMode,
+    UnsupportedFeatureHandling, UnsupportedSemanticFeature, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::read::ZipArchive;
 
@@ -65,6 +69,8 @@ pub enum DocxImportError {
     MissingContentTypes,
     #[error("DOCTYPE is not allowed in OPC XML projection: {path}")]
     DoctypeNotAllowed { path: String },
+    #[error("semantic ID collision: {0}")]
+    SemanticIdCollision(String),
 }
 
 /// Returns whether DOCX import is implemented.
@@ -240,6 +246,10 @@ pub fn import_docx_with_limits(
         content_types,
         relationships,
     };
+    if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/document.xml")
+    {
+        document.semantic = parse_semantic_document(&document.document_id, bytes)?;
+    }
 
     let objects = objects_by_digest
         .into_iter()
@@ -413,9 +423,29 @@ fn attributes(
         let attr = attr?;
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
         let value = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+        if let Some((_, local_name)) = key.split_once(':') {
+            attrs.entry(local_name.to_owned()).or_insert(value.clone());
+        }
         attrs.insert(key, value);
     }
     Ok(attrs)
+}
+
+fn namespace_declarations(
+    event: &quick_xml::events::BytesStart<'_>,
+) -> Result<BTreeMap<String, String>, quick_xml::Error> {
+    let mut declarations = BTreeMap::new();
+    for attr in event.attributes() {
+        let attr = attr?;
+        let key = String::from_utf8_lossy(attr.key.as_ref());
+        let value = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+        if key == "xmlns" {
+            declarations.insert(String::new(), value);
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            declarations.insert(prefix.to_owned(), value);
+        }
+    }
+    Ok(declarations)
 }
 
 fn relationship_source_part(rels_path: &str) -> Option<String> {
@@ -441,6 +471,564 @@ fn resolve_content_type(content_types: &ContentTypesProjection, path: &str) -> O
         .iter()
         .find(|default| default.extension == extension)
         .map(|default| default.content_type.clone())
+}
+
+fn parse_semantic_document(
+    document_id: &DocumentId,
+    bytes: &[u8],
+) -> Result<SemanticDocument, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let document_digest = sha256_hex(bytes);
+    let mut buffer = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
+    let mut unsupported_features = Vec::new();
+    let mut blocks = Vec::new();
+    let mut paragraph_stack: Vec<ParagraphBuilder> = Vec::new();
+    let mut run_stack: Vec<RunBuilder> = Vec::new();
+    let mut table_stack: Vec<TableBuilder> = Vec::new();
+    let mut text_preserve_stack: Vec<bool> = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut id_set = BTreeSet::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                let anchor = SourceAnchor {
+                    source_part_path: "word/document.xml".to_owned(),
+                    xml_path: path.clone(),
+                    byte_start: Some(reader.buffer_position()),
+                };
+
+                match name.local_name.as_str() {
+                    "p" if name.is_wordprocessingml() => {
+                        let source_identifier = attrs.get("w14:paraId").cloned();
+                        paragraph_stack.push(ParagraphBuilder {
+                            source_identifier,
+                            anchor,
+                            properties: ParagraphPropertiesProjection::default(),
+                            runs: Vec::new(),
+                        });
+                    }
+                    "pStyle" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            paragraph.properties.style_id = attr_val(&attrs);
+                        }
+                    }
+                    "r" if name.is_wordprocessingml() => {
+                        run_stack.push(RunBuilder {
+                            anchor,
+                            properties: RunPropertiesProjection::default(),
+                            inlines: Vec::new(),
+                        });
+                    }
+                    "rStyle" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            run.properties.run_style_id = attr_val(&attrs);
+                        }
+                    }
+                    "b" if name.is_wordprocessingml() => set_run_bool(&mut run_stack, "b", &attrs),
+                    "i" if name.is_wordprocessingml() => set_run_bool(&mut run_stack, "i", &attrs),
+                    "u" if name.is_wordprocessingml() => set_run_bool(&mut run_stack, "u", &attrs),
+                    "strike" if name.is_wordprocessingml() => {
+                        set_run_bool(&mut run_stack, "strike", &attrs)
+                    }
+                    "t" if name.is_wordprocessingml() => {
+                        text_preserve_stack.push(
+                            attrs
+                                .get("xml:space")
+                                .map(|value| value == "preserve")
+                                .unwrap_or(false),
+                        );
+                    }
+                    "tab" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            run.inlines.push(SemanticInline::Tab);
+                        }
+                    }
+                    "br" | "cr" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            run.inlines.push(SemanticInline::LineBreak {
+                                break_kind: name.local_name.clone(),
+                            });
+                        }
+                    }
+                    "tbl" if name.is_wordprocessingml() => {
+                        table_stack.push(TableBuilder {
+                            anchor,
+                            rows: Vec::new(),
+                        });
+                    }
+                    "tr" if name.is_wordprocessingml() => {
+                        if let Some(table) = table_stack.last_mut() {
+                            table.rows.push(RowBuilder {
+                                anchor,
+                                cells: Vec::new(),
+                            });
+                        }
+                    }
+                    "tc" if name.is_wordprocessingml() => {
+                        if let Some(row) = table_stack
+                            .last_mut()
+                            .and_then(|table| table.rows.last_mut())
+                        {
+                            row.cells.push(CellBuilder {
+                                anchor,
+                                grid_span: None,
+                                v_merge: None,
+                                blocks: Vec::new(),
+                            });
+                        }
+                    }
+                    "gridSpan" if name.is_wordprocessingml() => {
+                        if let Some(cell) = current_cell_mut(&mut table_stack) {
+                            cell.grid_span = attr_val(&attrs);
+                        }
+                    }
+                    "vMerge" if name.is_wordprocessingml() => {
+                        if let Some(cell) = current_cell_mut(&mut table_stack) {
+                            cell.v_merge = attr_val(&attrs).or_else(|| Some("continue".to_owned()));
+                        }
+                    }
+                    known if is_known_wordprocessingml(known) && name.is_wordprocessingml() => {}
+                    _ => unsupported_features.push(UnsupportedSemanticFeature {
+                        code: "unsupported_semantic_element".to_owned(),
+                        source_anchor: anchor,
+                        namespace_uri: name.namespace_uri.clone(),
+                        local_name: name.local_name.clone(),
+                        handling: UnsupportedFeatureHandling::PreservedRaw,
+                    }),
+                }
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                let anchor = SourceAnchor {
+                    source_part_path: "word/document.xml".to_owned(),
+                    xml_path: path.clone(),
+                    byte_start: Some(reader.buffer_position()),
+                };
+
+                match name.local_name.as_str() {
+                    "p" if name.is_wordprocessingml() => {
+                        let source_identifier = attrs.get("w14:paraId").cloned();
+                        paragraph_stack.push(ParagraphBuilder {
+                            source_identifier,
+                            anchor,
+                            properties: ParagraphPropertiesProjection::default(),
+                            runs: Vec::new(),
+                        });
+                    }
+                    "pStyle" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            paragraph.properties.style_id = attr_val(&attrs);
+                        }
+                    }
+                    "rStyle" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            run.properties.run_style_id = attr_val(&attrs);
+                        }
+                    }
+                    "b" if name.is_wordprocessingml() => set_run_bool(&mut run_stack, "b", &attrs),
+                    "i" if name.is_wordprocessingml() => set_run_bool(&mut run_stack, "i", &attrs),
+                    "u" if name.is_wordprocessingml() => set_run_bool(&mut run_stack, "u", &attrs),
+                    "strike" if name.is_wordprocessingml() => {
+                        set_run_bool(&mut run_stack, "strike", &attrs)
+                    }
+                    "t" if name.is_wordprocessingml() => push_text(
+                        &mut run_stack,
+                        "",
+                        attrs
+                            .get("xml:space")
+                            .map(|value| value == "preserve")
+                            .unwrap_or(false),
+                    ),
+                    "tab" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            run.inlines.push(SemanticInline::Tab);
+                        }
+                    }
+                    "br" | "cr" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            run.inlines.push(SemanticInline::LineBreak {
+                                break_kind: name.local_name.clone(),
+                            });
+                        }
+                    }
+                    "gridSpan" if name.is_wordprocessingml() => {
+                        if let Some(cell) = current_cell_mut(&mut table_stack) {
+                            cell.grid_span = attr_val(&attrs);
+                        }
+                    }
+                    "vMerge" if name.is_wordprocessingml() => {
+                        if let Some(cell) = current_cell_mut(&mut table_stack) {
+                            cell.v_merge = attr_val(&attrs).or_else(|| Some("continue".to_owned()));
+                        }
+                    }
+                    known if is_known_wordprocessingml(known) && name.is_wordprocessingml() => {}
+                    _ => unsupported_features.push(UnsupportedSemanticFeature {
+                        code: "unsupported_semantic_element".to_owned(),
+                        source_anchor: anchor,
+                        namespace_uri: name.namespace_uri.clone(),
+                        local_name: name.local_name.clone(),
+                        handling: UnsupportedFeatureHandling::PreservedRaw,
+                    }),
+                }
+                end_element(
+                    document_id,
+                    &document_digest,
+                    &name.local_name,
+                    &mut path_stack,
+                    &mut child_counts,
+                    &mut paragraph_stack,
+                    &mut run_stack,
+                    &mut table_stack,
+                    &mut blocks,
+                    &mut id_set,
+                )?;
+                namespace_stack.pop();
+            }
+            Event::Text(text) => {
+                let value = String::from_utf8_lossy(text.as_ref()).into_owned();
+                push_text(
+                    &mut run_stack,
+                    &value,
+                    text_preserve_stack.last().copied().unwrap_or(false),
+                );
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: "word/document.xml".to_owned(),
+                });
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if name.local_name == "t" && name.is_wordprocessingml() {
+                    text_preserve_stack.pop();
+                }
+                end_element(
+                    document_id,
+                    &document_digest,
+                    &name.local_name,
+                    &mut path_stack,
+                    &mut child_counts,
+                    &mut paragraph_stack,
+                    &mut run_stack,
+                    &mut table_stack,
+                    &mut blocks,
+                    &mut id_set,
+                )?;
+                namespace_stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    unsupported_features.sort_by(|left, right| {
+        left.source_anchor
+            .xml_path
+            .cmp(&right.source_anchor.xml_path)
+    });
+    Ok(SemanticDocument {
+        source_part: "word/document.xml".to_owned(),
+        blocks,
+        unsupported_features,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn end_element(
+    document_id: &DocumentId,
+    document_digest: &str,
+    local_name: &str,
+    path_stack: &mut Vec<String>,
+    child_counts: &mut Vec<BTreeMap<String, usize>>,
+    paragraph_stack: &mut Vec<ParagraphBuilder>,
+    run_stack: &mut Vec<RunBuilder>,
+    table_stack: &mut Vec<TableBuilder>,
+    blocks: &mut Vec<SemanticBlock>,
+    id_set: &mut BTreeSet<String>,
+) -> Result<(), DocxImportError> {
+    match local_name {
+        "r" => {
+            if let Some(run) = run_stack.pop() {
+                if let Some(paragraph) = paragraph_stack.last_mut() {
+                    let id = semantic_id(
+                        document_id,
+                        "run",
+                        None,
+                        &run.anchor.xml_path,
+                        document_digest,
+                        id_set,
+                    )?;
+                    paragraph.runs.push(SemanticRun {
+                        id,
+                        source_identifier: None,
+                        source_anchor: run.anchor,
+                        properties: run.properties,
+                        inlines: run.inlines,
+                    });
+                }
+            }
+        }
+        "p" => {
+            if let Some(paragraph) = paragraph_stack.pop() {
+                let id = semantic_id(
+                    document_id,
+                    "paragraph",
+                    paragraph.source_identifier.as_deref(),
+                    &paragraph.anchor.xml_path,
+                    document_digest,
+                    id_set,
+                )?;
+                let block = SemanticBlock::Paragraph(SemanticParagraph {
+                    id,
+                    source_identifier: paragraph.source_identifier,
+                    source_anchor: paragraph.anchor,
+                    properties: paragraph.properties,
+                    runs: paragraph.runs,
+                });
+                push_block(block, table_stack, blocks);
+            }
+        }
+        "tbl" => {
+            if let Some(table) = table_stack.pop() {
+                let id = semantic_id(
+                    document_id,
+                    "table",
+                    None,
+                    &table.anchor.xml_path,
+                    document_digest,
+                    id_set,
+                )?;
+                let block = SemanticBlock::Table(SemanticTable {
+                    id,
+                    source_anchor: table.anchor,
+                    rows: table
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            let row_id = semantic_id(
+                                document_id,
+                                "row",
+                                None,
+                                &row.anchor.xml_path,
+                                document_digest,
+                                id_set,
+                            )?;
+                            let cells = row
+                                .cells
+                                .into_iter()
+                                .map(|cell| {
+                                    let cell_id = semantic_id(
+                                        document_id,
+                                        "cell",
+                                        None,
+                                        &cell.anchor.xml_path,
+                                        document_digest,
+                                        id_set,
+                                    )?;
+                                    Ok(SemanticTableCell {
+                                        id: cell_id,
+                                        source_anchor: cell.anchor,
+                                        grid_span: cell.grid_span,
+                                        v_merge: cell.v_merge,
+                                        blocks: cell.blocks,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, DocxImportError>>()?;
+                            Ok(SemanticTableRow {
+                                id: row_id,
+                                source_anchor: row.anchor,
+                                cells,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, DocxImportError>>()?,
+                });
+                push_block(block, table_stack, blocks);
+            }
+        }
+        _ => {}
+    }
+    path_stack.pop();
+    child_counts.pop();
+    Ok(())
+}
+
+fn push_block(
+    block: SemanticBlock,
+    table_stack: &mut [TableBuilder],
+    blocks: &mut Vec<SemanticBlock>,
+) {
+    if let Some(cell) = current_cell_mut(table_stack) {
+        cell.blocks.push(block);
+    } else {
+        blocks.push(block);
+    }
+}
+
+fn current_cell_mut(table_stack: &mut [TableBuilder]) -> Option<&mut CellBuilder> {
+    table_stack
+        .last_mut()
+        .and_then(|table| table.rows.last_mut())
+        .and_then(|row| row.cells.last_mut())
+}
+
+fn next_path(
+    path_stack: &mut Vec<String>,
+    child_counts: &mut Vec<BTreeMap<String, usize>>,
+    local_name: &str,
+) -> String {
+    let count = child_counts
+        .last_mut()
+        .expect("root child counter")
+        .entry(local_name.to_owned())
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
+    let segment = format!("{local_name}[{count}]");
+    path_stack.push(segment);
+    child_counts.push(BTreeMap::new());
+    format!("/{}", path_stack.join("/"))
+}
+
+fn semantic_id(
+    document_id: &DocumentId,
+    kind: &str,
+    source_identifier: Option<&str>,
+    xml_path: &str,
+    document_digest: &str,
+    id_set: &mut BTreeSet<String>,
+) -> Result<SemanticNodeId, DocxImportError> {
+    let material = match source_identifier {
+        Some(source_identifier) => format!(
+            "{}|word/document.xml|{kind}|source:{source_identifier}",
+            document_id.as_str()
+        ),
+        None => format!(
+            "{}|word/document.xml|{kind}|path:{xml_path}|doc-sha256:{document_digest}",
+            document_id.as_str()
+        ),
+    };
+    let digest = hex::encode(Sha256::digest(material.as_bytes()));
+    let id = format!("sem:{kind}:{}", &digest[..24]);
+    if !id_set.insert(id.clone()) {
+        return Err(DocxImportError::SemanticIdCollision(id));
+    }
+    SemanticNodeId::new(id).map_err(|error| DocxImportError::SemanticIdCollision(error.to_string()))
+}
+
+fn attr_val(attrs: &BTreeMap<String, String>) -> Option<String> {
+    attrs.get("w:val").or_else(|| attrs.get("val")).cloned()
+}
+
+fn set_run_bool(run_stack: &mut [RunBuilder], property: &str, attrs: &BTreeMap<String, String>) {
+    let enabled = attrs
+        .get("w:val")
+        .or_else(|| attrs.get("val"))
+        .map(|value| !matches!(value.as_str(), "false" | "0" | "off"))
+        .unwrap_or(true);
+    if let Some(run) = run_stack.last_mut() {
+        match property {
+            "b" => run.properties.bold = enabled,
+            "i" => run.properties.italic = enabled,
+            "u" => run.properties.underline = enabled,
+            "strike" => run.properties.strike = enabled,
+            _ => {}
+        }
+    }
+}
+
+fn push_text(run_stack: &mut [RunBuilder], value: &str, preserve_space: bool) {
+    if let Some(run) = run_stack.last_mut() {
+        run.inlines.push(SemanticInline::Text(SemanticText {
+            value: value.to_owned(),
+            preserve_space,
+        }));
+    }
+}
+
+fn is_known_wordprocessingml(local_name: &str) -> bool {
+    matches!(
+        local_name,
+        "document" | "body" | "pPr" | "rPr" | "tblPr" | "tblGrid" | "gridCol" | "tcPr" | "sectPr"
+    )
+}
+
+#[derive(Debug, Clone)]
+struct XmlName {
+    local_name: String,
+    namespace_uri: Option<String>,
+}
+
+impl XmlName {
+    fn is_wordprocessingml(&self) -> bool {
+        matches!(
+            self.namespace_uri.as_deref(),
+            Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                | Some("http://purl.oclc.org/ooxml/wordprocessingml/main")
+        )
+    }
+}
+
+fn qname(name: &[u8], namespace_stack: &[BTreeMap<String, String>]) -> XmlName {
+    let raw = String::from_utf8_lossy(name);
+    let (prefix, local_name) = raw
+        .split_once(':')
+        .map(|(prefix, local)| (prefix, local))
+        .unwrap_or(("", raw.as_ref()));
+    let namespace_uri = namespace_stack
+        .iter()
+        .rev()
+        .find_map(|scope| scope.get(prefix))
+        .cloned();
+    XmlName {
+        local_name: local_name.to_owned(),
+        namespace_uri,
+    }
+}
+
+#[derive(Debug)]
+struct ParagraphBuilder {
+    source_identifier: Option<String>,
+    anchor: SourceAnchor,
+    properties: ParagraphPropertiesProjection,
+    runs: Vec<SemanticRun>,
+}
+
+#[derive(Debug)]
+struct RunBuilder {
+    anchor: SourceAnchor,
+    properties: RunPropertiesProjection,
+    inlines: Vec<SemanticInline>,
+}
+
+#[derive(Debug)]
+struct TableBuilder {
+    anchor: SourceAnchor,
+    rows: Vec<RowBuilder>,
+}
+
+#[derive(Debug)]
+struct RowBuilder {
+    anchor: SourceAnchor,
+    cells: Vec<CellBuilder>,
+}
+
+#[derive(Debug)]
+struct CellBuilder {
+    anchor: SourceAnchor,
+    grid_span: Option<String>,
+    v_merge: Option<String>,
+    blocks: Vec<SemanticBlock>,
 }
 
 #[cfg(test)]
@@ -522,6 +1110,79 @@ mod tests {
         std::fs::remove_file(docx).unwrap();
     }
 
+    #[test]
+    fn semantic_projection_is_deterministic_and_preserves_supported_shapes() {
+        let docx = write_semantic_docx("semantic");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(first.document.semantic, second.document.semantic);
+        assert_eq!(first.document.semantic.blocks.len(), 4);
+        assert!(!first.document.semantic.unsupported_features.is_empty());
+
+        let ids = collect_semantic_ids(&first.document.semantic);
+        assert_eq!(ids, collect_semantic_ids(&second.document.semantic));
+
+        let first_paragraph = match &first.document.semantic.blocks[0] {
+            SemanticBlock::Paragraph(paragraph) => paragraph,
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(
+            first_paragraph.source_identifier.as_deref(),
+            Some("00ABCDEF")
+        );
+        assert_eq!(
+            first_paragraph.properties.style_id.as_deref(),
+            Some("Heading1")
+        );
+        assert_eq!(first_paragraph.runs.len(), 2);
+        assert!(first_paragraph.runs[0].properties.bold);
+        assert!(first_paragraph.runs[0].properties.italic);
+        assert!(first_paragraph.runs[0].properties.underline);
+        assert_eq!(
+            first_paragraph.runs[0].properties.run_style_id.as_deref(),
+            Some("Strong")
+        );
+        assert!(matches!(
+            first_paragraph.runs[0].inlines[0],
+            SemanticInline::Text(SemanticText {
+                preserve_space: true,
+                ..
+            })
+        ));
+        assert!(first_paragraph
+            .runs
+            .iter()
+            .flat_map(|run| run.inlines.iter())
+            .any(|inline| matches!(inline, SemanticInline::Tab)));
+        assert!(first_paragraph
+            .runs
+            .iter()
+            .flat_map(|run| run.inlines.iter())
+            .any(|inline| matches!(inline, SemanticInline::LineBreak { break_kind } if break_kind == "br")));
+
+        let empty_paragraph = match &first.document.semantic.blocks[1] {
+            SemanticBlock::Paragraph(paragraph) => paragraph,
+            _ => panic!("expected empty paragraph"),
+        };
+        assert!(empty_paragraph.source_identifier.is_none());
+        assert!(empty_paragraph.runs.is_empty());
+
+        let table = match &first.document.semantic.blocks[2] {
+            SemanticBlock::Table(table) => table,
+            _ => panic!("expected table"),
+        };
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].cells.len(), 2);
+        assert_eq!(table.rows[0].cells[0].grid_span.as_deref(), Some("2"));
+        assert!(table.rows[0].cells[1]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, SemanticBlock::Table(_))));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
     fn write_test_docx(
         name: &str,
         duplicate: bool,
@@ -550,6 +1211,55 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+
+    fn write_semantic_docx(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/><Relationship Id="rIdExt" Type="hyperlink" Target="https://example.invalid/" TargetMode="External"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdInternal" Type="image" Target="media/image1.bin"/></Relationships>"#);
+        add(&mut zip, options, "word/media/image1.bin", b"image-bytes");
+        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:cx="urn:custom"><w:body><w:p w14:paraId="00ABCDEF"><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:rStyle w:val="Strong"/><w:b/><w:i/><w:u w:val="single"/></w:rPr><w:t xml:space="preserve"> Hello </w:t><w:tab/><w:br/></w:r><w:r><w:t>World</w:t></w:r></w:p><w:p/><w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Cell 1</w:t></w:r></w:p></w:tc><w:tc><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Nested</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl><w:p><cx:unknown>kept raw</cx:unknown></w:p></w:body></w:document>"#);
+        zip.finish().unwrap();
+        path
+    }
+
+    fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
+        let mut ids = Vec::new();
+        for block in &document.blocks {
+            collect_block_ids(block, &mut ids);
+        }
+        ids
+    }
+
+    fn collect_block_ids(block: &SemanticBlock, ids: &mut Vec<String>) {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                ids.push(paragraph.id.as_str().to_owned());
+                for run in &paragraph.runs {
+                    ids.push(run.id.as_str().to_owned());
+                }
+            }
+            SemanticBlock::Table(table) => {
+                ids.push(table.id.as_str().to_owned());
+                for row in &table.rows {
+                    ids.push(row.id.as_str().to_owned());
+                    for cell in &row.cells {
+                        ids.push(cell.id.as_str().to_owned());
+                        for block in &cell.blocks {
+                            collect_block_ids(block, ids);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn add<W: Write + std::io::Seek>(

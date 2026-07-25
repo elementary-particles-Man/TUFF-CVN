@@ -152,6 +152,7 @@ stable_id!(OpaqueId);
 stable_id!(RelationId);
 stable_id!(ChecksumId);
 stable_id!(SourceId);
+stable_id!(SemanticNodeId);
 
 /// Root CVN document model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +167,7 @@ pub struct CvnDocument {
     pub assets: Vec<AssetEntry>,
     pub opaque: Vec<OpaqueEntry>,
     pub opc: OpcPackageProjection,
+    pub semantic: SemanticDocument,
     pub warnings: Vec<CvnWarning>,
     pub checksums: Vec<ChecksumEntry>,
 }
@@ -184,6 +186,7 @@ impl CvnDocument {
             assets: Vec::new(),
             opaque: Vec::new(),
             opc: OpcPackageProjection::default(),
+            semantic: SemanticDocument::default(),
             warnings: Vec::new(),
             checksums: Vec::new(),
         }
@@ -417,6 +420,127 @@ pub enum TargetMode {
     External,
 }
 
+/// Read-only semantic projection extracted from preserved source parts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticDocument {
+    pub source_part: String,
+    pub blocks: Vec<SemanticBlock>,
+    pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+/// Semantic block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SemanticBlock {
+    Paragraph(SemanticParagraph),
+    Table(SemanticTable),
+}
+
+/// Semantic paragraph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticParagraph {
+    pub id: SemanticNodeId,
+    pub source_identifier: Option<String>,
+    pub source_anchor: SourceAnchor,
+    pub properties: ParagraphPropertiesProjection,
+    pub runs: Vec<SemanticRun>,
+}
+
+/// Semantic run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticRun {
+    pub id: SemanticNodeId,
+    pub source_identifier: Option<String>,
+    pub source_anchor: SourceAnchor,
+    pub properties: RunPropertiesProjection,
+    pub inlines: Vec<SemanticInline>,
+}
+
+/// Semantic text inline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticText {
+    pub value: String,
+    pub preserve_space: bool,
+}
+
+/// Semantic table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticTable {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub rows: Vec<SemanticTableRow>,
+}
+
+/// Semantic table row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticTableRow {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub cells: Vec<SemanticTableCell>,
+}
+
+/// Semantic table cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticTableCell {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub grid_span: Option<String>,
+    pub v_merge: Option<String>,
+    pub blocks: Vec<SemanticBlock>,
+}
+
+/// Semantic inline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SemanticInline {
+    Text(SemanticText),
+    Tab,
+    LineBreak { break_kind: String },
+}
+
+/// Source anchor for semantic nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAnchor {
+    pub source_part_path: String,
+    pub xml_path: String,
+    pub byte_start: Option<u64>,
+}
+
+/// Paragraph properties projected without interpreting all OOXML formatting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParagraphPropertiesProjection {
+    pub style_id: Option<String>,
+}
+
+/// Run properties projected without interpreting all OOXML formatting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPropertiesProjection {
+    pub run_style_id: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+/// Unsupported or partially projected semantic feature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedSemanticFeature {
+    pub code: String,
+    pub source_anchor: SourceAnchor,
+    pub namespace_uri: Option<String>,
+    pub local_name: String,
+    pub handling: UnsupportedFeatureHandling,
+}
+
+/// Handling strategy for unsupported features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedFeatureHandling {
+    PreservedRaw,
+    ProjectedPartially,
+    IgnoredForSemanticView,
+}
+
 /// Package integrity manifest stored alongside the canonical payload.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrityManifest {
@@ -446,6 +570,7 @@ pub enum IntegrityNodeKind {
     PartMap,
     Relations,
     ContentTypes,
+    SemanticProjection,
     Objects,
 }
 
@@ -457,6 +582,7 @@ impl IntegrityNodeKind {
             Self::PartMap => "part_map",
             Self::Relations => "relations",
             Self::ContentTypes => "content_types",
+            Self::SemanticProjection => "semantic_projection",
             Self::Objects => "objects",
         }
     }

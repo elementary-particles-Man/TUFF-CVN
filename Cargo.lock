@@ -533,6 +533,7 @@ dependencies = [
  "cvn-docx-import",
  "cvn-package",
  "cvn-verify",
+ "serde_json",
  "thiserror",
 ]
 

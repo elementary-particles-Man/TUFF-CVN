@@ -27,6 +27,7 @@ const DOMAIN_PAYLOAD: &[u8] = b"TUFF-CVN\0payload\0";
 const DOMAIN_PART_MAP: &[u8] = b"TUFF-CVN\0part-map\0";
 const DOMAIN_RELATIONS: &[u8] = b"TUFF-CVN\0relations\0";
 const DOMAIN_CONTENT_TYPES: &[u8] = b"TUFF-CVN\0content-types\0";
+const DOMAIN_SEMANTIC: &[u8] = b"TUFF-CVN\0semantic\0";
 const DOMAIN_OBJECTS: &[u8] = b"TUFF-CVN\0objects\0";
 const DOMAIN_ROOT: &[u8] = b"TUFF-CVN\0root\0";
 
@@ -366,6 +367,11 @@ fn calculate_integrity_nodes(
             to_canonical_bytes(&content_types_projection(document))?,
         ),
         (
+            IntegrityNodeKind::SemanticProjection,
+            DOMAIN_SEMANTIC,
+            to_canonical_bytes(&document.semantic)?,
+        ),
+        (
             IntegrityNodeKind::Objects,
             DOMAIN_OBJECTS,
             to_canonical_bytes(&object_inventory_projection(objects))?,
@@ -406,12 +412,13 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn integrity_node_order() -> [IntegrityNodeKind; 5] {
+fn integrity_node_order() -> [IntegrityNodeKind; 6] {
     [
         IntegrityNodeKind::CanonicalPayload,
         IntegrityNodeKind::PartMap,
         IntegrityNodeKind::Relations,
         IntegrityNodeKind::ContentTypes,
+        IntegrityNodeKind::SemanticProjection,
         IntegrityNodeKind::Objects,
     ]
 }
@@ -422,6 +429,7 @@ fn mismatch_code(kind: IntegrityNodeKind) -> &'static str {
         IntegrityNodeKind::PartMap => "CVN_PART_MAP_DIGEST_MISMATCH",
         IntegrityNodeKind::Relations => "CVN_RELATIONS_DIGEST_MISMATCH",
         IntegrityNodeKind::ContentTypes => "CVN_CONTENT_TYPES_DIGEST_MISMATCH",
+        IntegrityNodeKind::SemanticProjection => "CVN_SEMANTIC_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::Objects => "CVN_OBJECT_INVENTORY_DIGEST_MISMATCH",
     }
 }
@@ -734,6 +742,28 @@ mod tests {
 
         assert!(!report.passed);
         assert!(has_package_failure(&report, "CVN_PART_MAP_DIGEST_MISMATCH"));
+        assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
+
+        cleanup(&temp);
+    }
+
+    #[test]
+    fn semantic_projection_change_is_detected() {
+        let temp = write_integrity_fixture("semantic-change");
+        let path = temp.join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["payload"]["semantic"]["source_part"] =
+            serde_json::Value::String("changed/document.xml".to_owned());
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let report = verify_package_integrity(&temp).unwrap();
+
+        assert!(!report.passed);
+        assert!(has_package_failure(
+            &report,
+            "CVN_SEMANTIC_PROJECTION_DIGEST_MISMATCH"
+        ));
         assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
 
         cleanup(&temp);

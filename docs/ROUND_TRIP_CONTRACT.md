@@ -22,12 +22,13 @@ CanonicalPackageIntegrity verifies the preservation package itself:
 - OPC part map digest
 - relationship projection digest
 - content types projection digest
+- semantic projection digest
 - content-addressed object inventory digest
 - root digest over the fixed integrity tree
 - object filename digest, recorded digest, actual digest, and length
 
 It detects `cvn.json` payload changes, part map changes, relationship changes,
-content type projection changes, object blob changes, missing objects,
+content type projection changes, semantic projection changes, object blob changes, missing objects,
 unexpected objects, invalid object names, and root digest tampering.
 
 CanonicalPackageIntegrity and Expanded OPC Part Byte Identity are independent
@@ -54,6 +55,13 @@ re-serialized for normal export; saved raw bytes are used as the payload.
 
 This is not DOCX semantic equivalence. No OOXML semantic document model is
 implemented in this phase.
+
+## Semantic projection scope
+
+The semantic projection is read-only. It is generated during import from
+preserved `word/document.xml` bytes and stored in `cvn.json`, but export still
+uses preserved raw OPC part payloads. Semantic projection data is not an XML
+serialization source in this phase.
 
 ## Deferred round-trip decisions
 

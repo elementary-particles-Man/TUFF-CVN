@@ -20,6 +20,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         "import" => import_command(&args[1..]),
         "export" => export_command(&args[1..]),
         "verify" => verify_command(&args[1..]),
+        "inspect" => inspect_command(&args[1..]),
         "diff" => Err(CliError::UnsupportedCommand("diff".to_owned())),
         command => Err(CliError::UnsupportedCommand(command.to_owned())),
     }
@@ -101,6 +102,22 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn inspect_command(args: &[String]) -> Result<(), CliError> {
+    if args.len() != 2 || args[1] != "--semantic" {
+        return Err(CliError::Usage(
+            "usage: tcvn inspect <input.cvn> --semantic".to_owned(),
+        ));
+    }
+    let input = PathBuf::from(&args[0]);
+    let bytes = cvn_package::read_cvn_json_bytes(input)?;
+    let cvn_json: cvn_core::CvnJson = serde_json::from_slice(&bytes)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&cvn_json.payload.semantic)?
+    );
+    Ok(())
+}
+
 fn print_integrity_report(report: &cvn_package::CanonicalPackageIntegrityReport) {
     println!(
         "Verification CanonicalPackageIntegrity: passed={} root_expected={} root_actual={}",
@@ -144,6 +161,10 @@ enum CliError {
     Verify(#[from] cvn_verify::ExpandedOpcVerifyError),
     #[error("integrity verification failed: {0}")]
     Integrity(#[from] cvn_verify::CanonicalPackageIntegrityVerifyError),
+    #[error("package error: {0}")]
+    Package(#[from] cvn_package::PackageError),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("CanonicalPackageIntegrity failed")]
     IntegrityFailed,
     #[error("Expanded OPC Part Byte Identity failed")]
@@ -154,7 +175,12 @@ impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
             Self::Usage(_) | Self::UnsupportedCommand(_) => 2,
-            Self::Import(_) | Self::Export(_) | Self::Verify(_) | Self::Integrity(_) => 3,
+            Self::Import(_)
+            | Self::Export(_)
+            | Self::Verify(_)
+            | Self::Integrity(_)
+            | Self::Package(_)
+            | Self::Json(_) => 3,
             Self::IntegrityFailed => 4,
             Self::VerificationFailed => 5,
         }
@@ -184,12 +210,16 @@ Commands:
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
+  tcvn inspect <input.cvn> --semantic
+      Print the read-only semantic projection from cvn.json.
+
   tcvn diff <left.cvn> <right.cvn>
       Planned; not implemented yet.
 
 Status:
   OPC raw-byte preservation package round trip is implemented for unedited DOCX preservation.
-  DOCX semantic conversion is not implemented.",
+  DOCX semantic projection import and inspect are implemented as read-only views.
+  Semantic editing and semantic-driven DOCX export are not implemented.",
         project = cvn_core::PROJECT_NAME,
         expanded = cvn_core::EXPANDED_NAME
     );
