@@ -1,9 +1,13 @@
 //! Verification support for TUFF-CVN.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use cvn_canonical::{sha256_canonical, to_canonical_bytes};
 use cvn_core::{ChecksumAlgorithm, ChecksumEntry, CvnDocument, Relation};
+use cvn_docx_import::import_docx;
+use cvn_package::read_package;
+use thiserror::Error;
 
 /// Structural verification report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +33,43 @@ pub struct VerificationWarning {
     pub code: String,
     pub path: String,
     pub message: String,
+}
+
+/// Expanded OPC part byte identity verification report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedOpcPartByteIdentityReport {
+    pub passed: bool,
+    pub part_count: usize,
+    pub missing_parts: Vec<String>,
+    pub unexpected_parts: Vec<String>,
+    pub length_mismatches: Vec<PartLengthMismatch>,
+    pub digest_mismatches: Vec<PartDigestMismatch>,
+    pub package_errors: Vec<String>,
+}
+
+/// Length mismatch for one OPC part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartLengthMismatch {
+    pub path: String,
+    pub expected: u64,
+    pub actual: u64,
+}
+
+/// Digest mismatch for one OPC part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartDigestMismatch {
+    pub path: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+/// Expanded OPC verification error.
+#[derive(Debug, Error)]
+pub enum ExpandedOpcVerifyError {
+    #[error("package error: {0}")]
+    Package(#[from] cvn_package::PackageError),
+    #[error("DOCX import error: {0}")]
+    Import(#[from] cvn_docx_import::DocxImportError),
 }
 
 /// Verifies the minimal CVN structural invariants currently implemented.
@@ -154,6 +195,103 @@ pub fn verify_document(document: &CvnDocument) -> VerificationReport {
         canonical_bytes_available,
         canonical_sha256_available,
     }
+}
+
+/// Verifies Expanded OPC Part Byte Identity between a CVN package and a DOCX.
+pub fn verify_expanded_opc_part_byte_identity(
+    cvn_package_path: impl AsRef<Path>,
+    against_docx: impl AsRef<Path>,
+) -> Result<ExpandedOpcPartByteIdentityReport, ExpandedOpcVerifyError> {
+    let package = read_package(cvn_package_path)?;
+    let against = import_docx(against_docx)?;
+
+    let expected_parts = package
+        .document
+        .opc
+        .parts
+        .iter()
+        .map(|part| {
+            (
+                part.original_path.clone(),
+                (part.original_size, part.content_digest.clone()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let actual_parts = against
+        .document
+        .opc
+        .parts
+        .iter()
+        .map(|part| {
+            (
+                part.original_path.clone(),
+                (part.original_size, part.content_digest.clone()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let expected_paths = expected_parts.keys().cloned().collect::<BTreeSet<_>>();
+    let actual_paths = actual_parts.keys().cloned().collect::<BTreeSet<_>>();
+
+    let missing_parts = expected_paths
+        .difference(&actual_paths)
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected_parts = actual_paths
+        .difference(&expected_paths)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut length_mismatches = Vec::new();
+    let mut digest_mismatches = Vec::new();
+    for path in expected_paths.intersection(&actual_paths) {
+        let (expected_length, expected_digest) = expected_parts.get(path).expect("known path");
+        let (actual_length, actual_digest) = actual_parts.get(path).expect("known path");
+        if expected_length != actual_length {
+            length_mismatches.push(PartLengthMismatch {
+                path: path.clone(),
+                expected: *expected_length,
+                actual: *actual_length,
+            });
+        }
+        if expected_digest != actual_digest {
+            digest_mismatches.push(PartDigestMismatch {
+                path: path.clone(),
+                expected: expected_digest.clone(),
+                actual: actual_digest.clone(),
+            });
+        }
+    }
+
+    let package_errors = package
+        .document
+        .opc
+        .parts
+        .iter()
+        .filter(|part| cvn_package::object_bytes(&package, &part.content_digest).is_none())
+        .map(|part| {
+            format!(
+                "missing object for {} sha256:{}",
+                part.original_path, part.content_digest
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let passed = missing_parts.is_empty()
+        && unexpected_parts.is_empty()
+        && length_mismatches.is_empty()
+        && digest_mismatches.is_empty()
+        && package_errors.is_empty();
+
+    Ok(ExpandedOpcPartByteIdentityReport {
+        passed,
+        part_count: expected_parts.len(),
+        missing_parts,
+        unexpected_parts,
+        length_mismatches,
+        digest_mismatches,
+        package_errors,
+    })
 }
 
 fn check_duplicates<'a>(

@@ -16,6 +16,7 @@ The current root model is `CvnDocument`:
 - `permissions`
 - `assets`
 - `opaque`
+- `opc`
 - `warnings`
 - `checksums`
 
@@ -51,8 +52,45 @@ It carries:
 - `preservation_mode`
 
 Opaque content can be represented as an external blob or as a package
-content-addressed object. The current model records references and digests; it
-does not define package storage bytes yet.
+content-addressed object. In the preservation package, raw bytes are stored
+outside `cvn.json` under `objects/sha256/<lowercase-hex-digest>`. `cvn.json`
+must not inline blob bytes as Base64.
+
+## OPC preservation package
+
+P0-CVN-02 introduces a directory-shaped `.cvn` preservation package:
+
+- `cvn.json`
+- `objects/sha256/<lowercase-hex-digest>`
+
+The `opc` root area records OPC part metadata:
+
+- original part path
+- content type, when projected from `[Content_Types].xml`
+- original uncompressed size
+- raw-byte SHA-256 digest
+- ZIP entry metadata for diagnostics
+
+Multiple OPC part paths may reference the same content-addressed object. The
+same digest is written once. If the same digest is ever observed with different
+bytes, import or package writing fails hard.
+
+Package object paths are derived only from validated lowercase SHA-256 digests;
+path traversal is not allowed.
+
+## Raw bytes and parsed projections
+
+Raw bytes and parsed projections are separate:
+
+- OPC part payloads are preserved as raw bytes in package objects.
+- `[Content_Types].xml` is parsed into a read-only Default/Override projection.
+- package-level and part-level `.rels` files are parsed into a read-only
+  relationship projection.
+- export does not regenerate XML from projections for unedited preservation.
+
+Projection parsing rejects DOCTYPE and does not resolve external resources.
+`TargetMode="External"` relationship targets are retained as inert original
+strings. TUFF-CVN does not fetch, normalize, rewrite, or delete those URIs.
 
 ## Warnings and checksums
 
@@ -82,3 +120,6 @@ Unconfirmed/deferred:
 - complete RFC 8785 compliance
 - OOXML infoset preservation
 - byte-identical DOCX regeneration
+- ZIP physical byte identity
+- XML C14N equivalence
+- DOCX semantic conversion

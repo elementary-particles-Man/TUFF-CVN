@@ -156,6 +156,7 @@ pub struct CvnDocument {
     pub permissions: PermissionSet,
     pub assets: Vec<AssetEntry>,
     pub opaque: Vec<OpaqueEntry>,
+    pub opc: OpcPackageProjection,
     pub warnings: Vec<CvnWarning>,
     pub checksums: Vec<ChecksumEntry>,
 }
@@ -173,6 +174,7 @@ impl CvnDocument {
             permissions: PermissionSet::default(),
             assets: Vec::new(),
             opaque: Vec::new(),
+            opc: OpcPackageProjection::default(),
             warnings: Vec::new(),
             checksums: Vec::new(),
         }
@@ -336,6 +338,74 @@ pub struct ChecksumEntry {
 #[serde(rename_all = "kebab-case")]
 pub enum ChecksumAlgorithm {
     Sha256,
+}
+
+/// Read-only OPC package projection. Raw bytes live in package objects and are
+/// referenced by digest; parsed XML projections never replace payload bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcPackageProjection {
+    pub parts: Vec<OpcPart>,
+    pub content_types: ContentTypesProjection,
+    pub relationships: Vec<OpcRelationship>,
+}
+
+/// OPC part metadata and content-addressed raw-byte reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcPart {
+    pub original_path: String,
+    pub content_type: Option<String>,
+    pub original_size: u64,
+    pub content_digest: String,
+    pub compression: ZipEntryMetadata,
+}
+
+/// ZIP entry metadata retained for diagnostics and future export choices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZipEntryMetadata {
+    pub is_directory: bool,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub compression_method: String,
+}
+
+/// Parsed projection of `[Content_Types].xml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentTypesProjection {
+    pub defaults: Vec<ContentTypeDefault>,
+    pub overrides: Vec<ContentTypeOverride>,
+}
+
+/// Content type default by extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentTypeDefault {
+    pub extension: String,
+    pub content_type: String,
+}
+
+/// Content type override by part name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentTypeOverride {
+    pub part_name: String,
+    pub content_type: String,
+}
+
+/// Read-only OPC relationship projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcRelationship {
+    pub source_part: Option<String>,
+    pub relationship_id: String,
+    pub relationship_type: String,
+    pub target: String,
+    pub target_mode: TargetMode,
+}
+
+/// OPC relationship target mode. External targets are inert strings and must
+/// not be resolved as network resources by import, export, or verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetMode {
+    Internal,
+    External,
 }
 
 #[cfg(test)]

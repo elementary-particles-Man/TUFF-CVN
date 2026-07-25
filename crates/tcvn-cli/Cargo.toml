@@ -10,4 +10,8 @@ name = "tcvn"
 path = "src/main.rs"
 
 [dependencies]
+cvn-docx-export = { path = "../cvn-docx-export" }
+cvn-docx-import = { path = "../cvn-docx-import" }
 cvn-core = { path = "../cvn-core" }
+cvn-verify = { path = "../cvn-verify" }
+thiserror = "1"

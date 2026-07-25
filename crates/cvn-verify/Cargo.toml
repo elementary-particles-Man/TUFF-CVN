@@ -8,6 +8,9 @@ repository.workspace = true
 [dependencies]
 cvn-core = { path = "../cvn-core" }
 cvn-canonical = { path = "../cvn-canonical" }
+cvn-docx-import = { path = "../cvn-docx-import" }
+cvn-package = { path = "../cvn-package" }
+thiserror = "1"
 
 [lib]
 path = "src/lib.rs"
