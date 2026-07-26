@@ -71,6 +71,10 @@ style inheritance chains, and paragraph numbering references inspectable and
 verifiable, but they are not DOCX export sources. `word/styles.xml` and
 `word/numbering.xml` raw bytes remain the preservation source.
 
+Story projections are also read-only. Header, footer, footnote, endnote, and
+comment registry data can be inspected and verified, but it is not a DOCX export
+source. Raw story XML parts remain the preservation source.
+
 ## Deferred round-trip decisions
 
 Future DOCX round-trip work must define:

@@ -6,15 +6,18 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use cvn_core::{
-    AbstractNumberingProjection, ContentTypeDefault, ContentTypeOverride, ContentTypesProjection,
-    CvnDocument, DocumentId, NumberFormatProjection, NumberingInstanceProjection,
-    NumberingLevelProjection, NumberingReference, NumberingRegistryProjection,
-    NumberingResolutionDiagnostic, OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship,
-    ParagraphPropertiesProjection, PreservationMode, ResolvedStyleProjection,
-    RunPropertiesProjection, SemanticBlock, SemanticDocument, SemanticInline, SemanticNodeId,
-    SemanticParagraph, SemanticRun, SemanticTable, SemanticTableCell, SemanticTableRow,
-    SemanticText, SourceAnchor, SourceDescriptor, SourceFormat, StyleDefinitionProjection,
-    StyleReference, StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
+    AbstractNumberingProjection, CommentProjection, CommentRangeProjection, ContentTypeDefault,
+    ContentTypeOverride, ContentTypesProjection, CvnDocument, DocumentId,
+    HeaderFooterReferenceProjection, NoteProjection, NumberFormatProjection,
+    NumberingInstanceProjection, NumberingLevelProjection, NumberingReference,
+    NumberingRegistryProjection, NumberingResolutionDiagnostic, OpaqueEntry, OpcPackageProjection,
+    OpcPart, OpcRelationship, ParagraphPropertiesProjection, PreservationMode,
+    ResolvedStyleProjection, RunPropertiesProjection, SemanticBlock, SemanticDocument,
+    SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable,
+    SemanticTableCell, SemanticTableRow, SemanticText, SourceAnchor, SourceDescriptor,
+    SourceFormat, StoryPartKind, StoryPartProjection, StoryReference, StoryReferenceKind,
+    StoryRegistryProjection, StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference,
+    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
     UnsupportedFeatureHandling, UnsupportedSemanticFeature, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
@@ -252,7 +255,8 @@ pub fn import_docx_with_limits(
     };
     if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/document.xml")
     {
-        document.semantic = parse_semantic_document(&document.document_id, bytes)?;
+        document.semantic =
+            parse_semantic_document(&document.document_id, "word/document.xml", bytes)?;
     }
     if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/styles.xml") {
         document.semantic.styles = Some(parse_styles(bytes)?);
@@ -261,7 +265,13 @@ pub fn import_docx_with_limits(
     {
         document.semantic.numbering = Some(parse_numbering(bytes)?);
     }
-    resolve_semantic_references(&mut document.semantic);
+    document.semantic.stories = build_story_registry(
+        &document.document_id,
+        &raw_parts,
+        &objects_by_digest,
+        &document.semantic.blocks,
+    )?;
+    resolve_semantic_references(&mut document.semantic, &document.opc.relationships);
 
     let objects = objects_by_digest
         .into_iter()
@@ -286,6 +296,566 @@ fn object_bytes_for_part<'a>(
 ) -> Option<&'a [u8]> {
     let digest = &parts.iter().find(|part| part.path == path)?.digest;
     objects.get(digest).map(Vec::as_slice)
+}
+
+fn build_story_registry(
+    document_id: &DocumentId,
+    raw_parts: &[RawPart],
+    objects_by_digest: &BTreeMap<String, Vec<u8>>,
+    semantic_blocks: &[SemanticBlock],
+) -> Result<Option<StoryRegistryProjection>, DocxImportError> {
+    let mut registry = StoryRegistryProjection {
+        source_part: "docx-story-registry".to_owned(),
+        ..StoryRegistryProjection::default()
+    };
+    let mut has_candidates = contains_story_references(semantic_blocks);
+    let mut story_id_set = BTreeSet::new();
+    let mut diagnostics = Vec::new();
+
+    for part in raw_parts {
+        if let Some(kind) = classify_story_part(&part.path) {
+            match kind {
+                StoryPartKind::HeaderDefault
+                | StoryPartKind::HeaderFirst
+                | StoryPartKind::HeaderEven
+                | StoryPartKind::FooterDefault
+                | StoryPartKind::FooterFirst
+                | StoryPartKind::FooterEven => {
+                    has_candidates = true;
+                    if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let id = semantic_id(
+                            document_id,
+                            &part.path,
+                            "story-part",
+                            None,
+                            "/",
+                            &part.digest,
+                            &mut story_id_set,
+                        )?;
+                        registry.parts.push(StoryPartProjection {
+                            id,
+                            kind,
+                            source_part: part.path.clone(),
+                            source_anchor: SourceAnchor {
+                                source_part_path: part.path.clone(),
+                                xml_path: "/".to_owned(),
+                                byte_start: Some(0),
+                            },
+                            section_story_references: Vec::new(),
+                            blocks: semantic.blocks,
+                            notes: Vec::new(),
+                            comments: Vec::new(),
+                            references: Vec::new(),
+                            diagnostics: Vec::new(),
+                            unsupported_features: semantic.unsupported_features,
+                        });
+                    }
+                }
+                StoryPartKind::Footnotes => {
+                    has_candidates = true;
+                    if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let items = collect_note_items(
+                            document_id,
+                            &part.path,
+                            bytes,
+                            "footnote",
+                            "CVN_FOOTNOTE_DUPLICATE_ID",
+                            &mut diagnostics,
+                        )?;
+                        let id = semantic_id(
+                            document_id,
+                            &part.path,
+                            "story-part",
+                            None,
+                            "/",
+                            &part.digest,
+                            &mut story_id_set,
+                        )?;
+                        let blocks = semantic.blocks;
+                        registry.parts.push(StoryPartProjection {
+                            id,
+                            kind,
+                            source_part: part.path.clone(),
+                            source_anchor: SourceAnchor {
+                                source_part_path: part.path.clone(),
+                                xml_path: "/".to_owned(),
+                                byte_start: Some(0),
+                            },
+                            section_story_references: Vec::new(),
+                            blocks: Vec::new(),
+                            notes: items
+                                .into_iter()
+                                .map(|item| NoteProjection {
+                                    note_id: item.note_id,
+                                    is_reserved: item.is_reserved,
+                                    source_anchor: item.source_anchor,
+                                    blocks: blocks_with_prefix(&blocks, &item.xml_path),
+                                    references: Vec::new(),
+                                    diagnostics: Vec::new(),
+                                })
+                                .collect(),
+                            comments: Vec::new(),
+                            references: Vec::new(),
+                            diagnostics: Vec::new(),
+                            unsupported_features: semantic.unsupported_features,
+                        });
+                    }
+                }
+                StoryPartKind::Endnotes => {
+                    has_candidates = true;
+                    if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let items = collect_note_items(
+                            document_id,
+                            &part.path,
+                            bytes,
+                            "endnote",
+                            "CVN_ENDNOTE_DUPLICATE_ID",
+                            &mut diagnostics,
+                        )?;
+                        let id = semantic_id(
+                            document_id,
+                            &part.path,
+                            "story-part",
+                            None,
+                            "/",
+                            &part.digest,
+                            &mut story_id_set,
+                        )?;
+                        let blocks = semantic.blocks;
+                        registry.parts.push(StoryPartProjection {
+                            id,
+                            kind,
+                            source_part: part.path.clone(),
+                            source_anchor: SourceAnchor {
+                                source_part_path: part.path.clone(),
+                                xml_path: "/".to_owned(),
+                                byte_start: Some(0),
+                            },
+                            section_story_references: Vec::new(),
+                            blocks: Vec::new(),
+                            notes: items
+                                .into_iter()
+                                .map(|item| NoteProjection {
+                                    note_id: item.note_id,
+                                    is_reserved: item.is_reserved,
+                                    source_anchor: item.source_anchor,
+                                    blocks: blocks_with_prefix(&blocks, &item.xml_path),
+                                    references: Vec::new(),
+                                    diagnostics: Vec::new(),
+                                })
+                                .collect(),
+                            comments: Vec::new(),
+                            references: Vec::new(),
+                            diagnostics: Vec::new(),
+                            unsupported_features: semantic.unsupported_features,
+                        });
+                    }
+                }
+                StoryPartKind::Comments => {
+                    has_candidates = true;
+                    if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let items = collect_comment_items(
+                            document_id,
+                            &part.path,
+                            bytes,
+                            &mut diagnostics,
+                        )?;
+                        let id = semantic_id(
+                            document_id,
+                            &part.path,
+                            "story-part",
+                            None,
+                            "/",
+                            &part.digest,
+                            &mut story_id_set,
+                        )?;
+                        let blocks = semantic.blocks;
+                        registry.parts.push(StoryPartProjection {
+                            id,
+                            kind,
+                            source_part: part.path.clone(),
+                            source_anchor: SourceAnchor {
+                                source_part_path: part.path.clone(),
+                                xml_path: "/".to_owned(),
+                                byte_start: Some(0),
+                            },
+                            section_story_references: Vec::new(),
+                            blocks: Vec::new(),
+                            notes: Vec::new(),
+                            comments: items
+                                .into_iter()
+                                .map(|item| CommentProjection {
+                                    comment_id: item.comment_id,
+                                    author: item.author,
+                                    initials: item.initials,
+                                    date: item.date,
+                                    source_anchor: item.source_anchor,
+                                    blocks: blocks_with_prefix(&blocks, &item.xml_path),
+                                    ranges: Vec::new(),
+                                    diagnostics: Vec::new(),
+                                })
+                                .collect(),
+                            references: Vec::new(),
+                            diagnostics: Vec::new(),
+                            unsupported_features: semantic.unsupported_features,
+                        });
+                    }
+                }
+                StoryPartKind::MainDocument => {}
+            }
+        }
+    }
+
+    if !has_candidates {
+        return Ok(None);
+    }
+
+    registry.parts.sort_by(|left, right| {
+        left.source_part
+            .cmp(&right.source_part)
+            .then(left.kind.cmp(&right.kind))
+    });
+    Ok(Some(registry))
+}
+
+fn blocks_with_prefix(blocks: &[SemanticBlock], prefix: &str) -> Vec<SemanticBlock> {
+    blocks
+        .iter()
+        .filter(|block| story_block_has_prefix(block, prefix))
+        .cloned()
+        .collect()
+}
+
+fn story_block_has_prefix(block: &SemanticBlock, prefix: &str) -> bool {
+    match block {
+        SemanticBlock::Paragraph(paragraph) => paragraph.source_anchor.xml_path.starts_with(prefix),
+        SemanticBlock::Table(table) => table.source_anchor.xml_path.starts_with(prefix),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoryItemProjection {
+    note_id: String,
+    is_reserved: bool,
+    author: Option<String>,
+    initials: Option<String>,
+    date: Option<String>,
+    source_anchor: SourceAnchor,
+    xml_path: String,
+    comment_id: String,
+}
+
+fn collect_note_items(
+    document_id: &DocumentId,
+    source_part: &str,
+    bytes: &[u8],
+    item_local_name: &str,
+    duplicate_code: &str,
+    diagnostics: &mut Vec<StoryResolutionDiagnostic>,
+) -> Result<Vec<StoryItemProjection>, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
+    let mut seen = BTreeSet::new();
+    let mut items = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                if name.local_name == item_local_name && name.is_wordprocessingml() {
+                    let note_id = attr_named(&attrs, "id")
+                        .cloned()
+                        .or_else(|| attrs.get("w:id").cloned())
+                        .unwrap_or_default();
+                    if seen.insert(note_id.clone()) {
+                        items.push(StoryItemProjection {
+                            note_id: note_id.clone(),
+                            is_reserved: is_reserved_note_id(&note_id),
+                            author: None,
+                            initials: None,
+                            date: None,
+                            source_anchor: SourceAnchor {
+                                source_part_path: source_part.to_owned(),
+                                xml_path: path.clone(),
+                                byte_start: Some(reader.buffer_position()),
+                            },
+                            xml_path: path,
+                            comment_id: note_id,
+                        });
+                    } else {
+                        diagnostics.push(story_diag(
+                            duplicate_code,
+                            &path,
+                            format!("story note `{note_id}` is defined more than once"),
+                        ));
+                    }
+                }
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                if name.local_name == item_local_name && name.is_wordprocessingml() {
+                    let note_id = attr_named(&attrs, "id")
+                        .cloned()
+                        .or_else(|| attrs.get("w:id").cloned())
+                        .unwrap_or_default();
+                    if seen.insert(note_id.clone()) {
+                        items.push(StoryItemProjection {
+                            note_id: note_id.clone(),
+                            is_reserved: is_reserved_note_id(&note_id),
+                            author: None,
+                            initials: None,
+                            date: None,
+                            source_anchor: SourceAnchor {
+                                source_part_path: source_part.to_owned(),
+                                xml_path: path.clone(),
+                                byte_start: Some(reader.buffer_position()),
+                            },
+                            xml_path: path,
+                            comment_id: note_id,
+                        });
+                    } else {
+                        diagnostics.push(story_diag(
+                            duplicate_code,
+                            &path,
+                            format!("story note `{note_id}` is defined more than once"),
+                        ));
+                    }
+                }
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::End(_) => {
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    let _ = document_id;
+    Ok(items)
+}
+
+fn collect_comment_items(
+    document_id: &DocumentId,
+    source_part: &str,
+    bytes: &[u8],
+    diagnostics: &mut Vec<StoryResolutionDiagnostic>,
+) -> Result<Vec<StoryItemProjection>, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
+    let mut seen = BTreeSet::new();
+    let mut items = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                if name.local_name == "comment" && name.is_wordprocessingml() {
+                    let comment_id = attr_named(&attrs, "id")
+                        .cloned()
+                        .or_else(|| attrs.get("w:id").cloned())
+                        .unwrap_or_default();
+                    if seen.insert(comment_id.clone()) {
+                        items.push(StoryItemProjection {
+                            note_id: comment_id.clone(),
+                            is_reserved: false,
+                            author: attr_named(&attrs, "author").cloned(),
+                            initials: attr_named(&attrs, "initials").cloned(),
+                            date: attr_named(&attrs, "date").cloned(),
+                            source_anchor: SourceAnchor {
+                                source_part_path: source_part.to_owned(),
+                                xml_path: path.clone(),
+                                byte_start: Some(reader.buffer_position()),
+                            },
+                            xml_path: path,
+                            comment_id,
+                        });
+                    } else {
+                        diagnostics.push(story_diag(
+                            "CVN_COMMENT_DUPLICATE_ID",
+                            &path,
+                            format!("comment `{comment_id}` is defined more than once"),
+                        ));
+                    }
+                }
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                if name.local_name == "comment" && name.is_wordprocessingml() {
+                    let comment_id = attr_named(&attrs, "id")
+                        .cloned()
+                        .or_else(|| attrs.get("w:id").cloned())
+                        .unwrap_or_default();
+                    if seen.insert(comment_id.clone()) {
+                        items.push(StoryItemProjection {
+                            note_id: comment_id.clone(),
+                            is_reserved: false,
+                            author: attr_named(&attrs, "author").cloned(),
+                            initials: attr_named(&attrs, "initials").cloned(),
+                            date: attr_named(&attrs, "date").cloned(),
+                            source_anchor: SourceAnchor {
+                                source_part_path: source_part.to_owned(),
+                                xml_path: path.clone(),
+                                byte_start: Some(reader.buffer_position()),
+                            },
+                            xml_path: path,
+                            comment_id,
+                        });
+                    } else {
+                        diagnostics.push(story_diag(
+                            "CVN_COMMENT_DUPLICATE_ID",
+                            &path,
+                            format!("comment `{comment_id}` is defined more than once"),
+                        ));
+                    }
+                }
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::End(_) => {
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    let _ = document_id;
+    Ok(items)
+}
+
+fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                if !paragraph.section_story_references.is_empty() {
+                    return true;
+                }
+                for run in &paragraph.runs {
+                    for inline in &run.inlines {
+                        match inline {
+                            SemanticInline::FootnoteReference { .. }
+                            | SemanticInline::EndnoteReference { .. }
+                            | SemanticInline::CommentReference { .. }
+                            | SemanticInline::CommentRangeStart { .. }
+                            | SemanticInline::CommentRangeEnd { .. } => return true,
+                            SemanticInline::Text(_)
+                            | SemanticInline::Tab
+                            | SemanticInline::LineBreak { .. } => {}
+                        }
+                    }
+                }
+            }
+            SemanticBlock::Table(table) => {
+                if contains_story_references_in_table(table) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn contains_story_references_in_table(table: &SemanticTable) -> bool {
+    for row in &table.rows {
+        for cell in &row.cells {
+            if contains_story_references(&cell.blocks) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn classify_story_part(path: &str) -> Option<StoryPartKind> {
+    match path {
+        p if p.starts_with("word/header") && p.ends_with(".xml") => {
+            Some(StoryPartKind::HeaderDefault)
+        }
+        p if p.starts_with("word/footer") && p.ends_with(".xml") => {
+            Some(StoryPartKind::FooterDefault)
+        }
+        "word/footnotes.xml" => Some(StoryPartKind::Footnotes),
+        "word/endnotes.xml" => Some(StoryPartKind::Endnotes),
+        "word/comments.xml" => Some(StoryPartKind::Comments),
+        _ => None,
+    }
+}
+
+fn story_part_kind_from_header_footer_type(value: &str, is_header: bool) -> StoryPartKind {
+    match (is_header, value) {
+        (true, "first") => StoryPartKind::HeaderFirst,
+        (true, "even") => StoryPartKind::HeaderEven,
+        (false, "first") => StoryPartKind::FooterFirst,
+        (false, "even") => StoryPartKind::FooterEven,
+        (true, _) => StoryPartKind::HeaderDefault,
+        (false, _) => StoryPartKind::FooterDefault,
+    }
+}
+
+fn is_reserved_note_id(note_id: &str) -> bool {
+    matches!(note_id, "-1" | "0" | "1" | "2")
+}
+
+fn resolve_internal_target_path(source_part: &str, target: &str) -> Option<String> {
+    if target.starts_with('/') || target.starts_with('\\') || target.contains("..") {
+        return None;
+    }
+    let parent = Path::new(source_part).parent()?;
+    let candidate = parent.join(target);
+    let mut normalized = Vec::new();
+    for component in candidate.components() {
+        use std::path::Component;
+        match component {
+            Component::Normal(part) => normalized.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(normalized.join("/"))
 }
 
 fn normalize_opc_path(path: &str, is_directory: bool) -> Result<String, DocxImportError> {
@@ -487,6 +1057,7 @@ fn resolve_content_type(content_types: &ContentTypesProjection, path: &str) -> O
 
 fn parse_semantic_document(
     document_id: &DocumentId,
+    source_part_path: &str,
     bytes: &[u8],
 ) -> Result<SemanticDocument, DocxImportError> {
     let mut reader = Reader::from_reader(Cursor::new(bytes));
@@ -503,6 +1074,7 @@ fn parse_semantic_document(
     let mut text_preserve_stack: Vec<bool> = Vec::new();
     let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
     let mut id_set = BTreeSet::new();
+    let mut section_index = 0_u64;
 
     loop {
         match reader.read_event_into(&mut buffer)? {
@@ -512,7 +1084,7 @@ fn parse_semantic_document(
                 let attrs = attributes(&reader, &event)?;
                 let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
                 let anchor = SourceAnchor {
-                    source_part_path: "word/document.xml".to_owned(),
+                    source_part_path: source_part_path.to_owned(),
                     xml_path: path.clone(),
                     byte_start: Some(reader.buffer_position()),
                 };
@@ -525,12 +1097,67 @@ fn parse_semantic_document(
                             anchor,
                             properties: ParagraphPropertiesProjection::default(),
                             numbering: None,
+                            section_story_references: Vec::new(),
                             runs: Vec::new(),
                         });
                     }
                     "pStyle" if name.is_wordprocessingml() => {
                         if let Some(paragraph) = paragraph_stack.last_mut() {
                             paragraph.properties.style_id = attr_val(&attrs);
+                        }
+                    }
+                    "sectPr" if name.is_wordprocessingml() => {
+                        section_index = section_index.saturating_add(1);
+                    }
+                    "headerReference" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            if let (Some(rel_id), Some(rel_type)) = (
+                                attr_named(&attrs, "id")
+                                    .cloned()
+                                    .or_else(|| attrs.get("r:id").cloned()),
+                                attr_named(&attrs, "type")
+                                    .cloned()
+                                    .or_else(|| attrs.get("w:type").cloned()),
+                            ) {
+                                let kind = story_part_kind_from_header_footer_type(&rel_type, true);
+                                paragraph.section_story_references.push(
+                                    HeaderFooterReferenceProjection {
+                                        section_index,
+                                        kind,
+                                        relationship_id: rel_id.clone(),
+                                        relationship_type: rel_type,
+                                        target: String::new(),
+                                        resolved_part_path: None,
+                                        source_anchor: anchor.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    "footerReference" if name.is_wordprocessingml() => {
+                        if let Some(paragraph) = paragraph_stack.last_mut() {
+                            if let (Some(rel_id), Some(rel_type)) = (
+                                attr_named(&attrs, "id")
+                                    .cloned()
+                                    .or_else(|| attrs.get("r:id").cloned()),
+                                attr_named(&attrs, "type")
+                                    .cloned()
+                                    .or_else(|| attrs.get("w:type").cloned()),
+                            ) {
+                                let kind =
+                                    story_part_kind_from_header_footer_type(&rel_type, false);
+                                paragraph.section_story_references.push(
+                                    HeaderFooterReferenceProjection {
+                                        section_index,
+                                        kind,
+                                        relationship_id: rel_id.clone(),
+                                        relationship_type: rel_type,
+                                        target: String::new(),
+                                        resolved_part_path: None,
+                                        source_anchor: anchor.clone(),
+                                    },
+                                );
+                            }
                         }
                     }
                     "numId" if name.is_wordprocessingml() => {
@@ -594,6 +1221,62 @@ fn parse_semantic_document(
                             run.inlines.push(SemanticInline::Tab);
                         }
                     }
+                    "footnoteReference" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            let note_id = attr_named(&attrs, "id")
+                                .cloned()
+                                .or_else(|| attrs.get("w:id").cloned())
+                                .unwrap_or_default();
+                            run.inlines.push(SemanticInline::FootnoteReference {
+                                note_id,
+                                resolved_part_path: None,
+                            });
+                        }
+                    }
+                    "endnoteReference" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            let note_id = attr_named(&attrs, "id")
+                                .cloned()
+                                .or_else(|| attrs.get("w:id").cloned())
+                                .unwrap_or_default();
+                            run.inlines.push(SemanticInline::EndnoteReference {
+                                note_id,
+                                resolved_part_path: None,
+                            });
+                        }
+                    }
+                    "commentRangeStart" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            let comment_id = attr_named(&attrs, "id")
+                                .cloned()
+                                .or_else(|| attrs.get("w:id").cloned())
+                                .unwrap_or_default();
+                            run.inlines
+                                .push(SemanticInline::CommentRangeStart { comment_id });
+                        }
+                    }
+                    "commentRangeEnd" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            let comment_id = attr_named(&attrs, "id")
+                                .cloned()
+                                .or_else(|| attrs.get("w:id").cloned())
+                                .unwrap_or_default();
+                            run.inlines
+                                .push(SemanticInline::CommentRangeEnd { comment_id });
+                        }
+                    }
+                    "commentReference" if name.is_wordprocessingml() => {
+                        if let Some(run) = run_stack.last_mut() {
+                            let comment_id = attr_named(&attrs, "id")
+                                .cloned()
+                                .or_else(|| attrs.get("w:id").cloned())
+                                .unwrap_or_default();
+                            run.inlines.push(SemanticInline::CommentReference {
+                                comment_id,
+                                resolved_part_path: None,
+                            });
+                        }
+                    }
                     "br" | "cr" if name.is_wordprocessingml() => {
                         if let Some(run) = run_stack.last_mut() {
                             run.inlines.push(SemanticInline::LineBreak {
@@ -654,7 +1337,7 @@ fn parse_semantic_document(
                 let attrs = attributes(&reader, &event)?;
                 let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
                 let anchor = SourceAnchor {
-                    source_part_path: "word/document.xml".to_owned(),
+                    source_part_path: source_part_path.to_owned(),
                     xml_path: path.clone(),
                     byte_start: Some(reader.buffer_position()),
                 };
@@ -667,6 +1350,7 @@ fn parse_semantic_document(
                             anchor,
                             properties: ParagraphPropertiesProjection::default(),
                             numbering: None,
+                            section_story_references: Vec::new(),
                             runs: Vec::new(),
                         });
                     }
@@ -674,6 +1358,9 @@ fn parse_semantic_document(
                         if let Some(paragraph) = paragraph_stack.last_mut() {
                             paragraph.properties.style_id = attr_val(&attrs);
                         }
+                    }
+                    "sectPr" if name.is_wordprocessingml() => {
+                        section_index = section_index.saturating_add(1);
                     }
                     "numId" if name.is_wordprocessingml() => {
                         if let Some(paragraph) = paragraph_stack.last_mut() {
@@ -758,6 +1445,7 @@ fn parse_semantic_document(
                 end_element(
                     document_id,
                     &document_digest,
+                    source_part_path,
                     &name.local_name,
                     &mut path_stack,
                     &mut child_counts,
@@ -779,7 +1467,7 @@ fn parse_semantic_document(
             }
             Event::DocType(_) => {
                 return Err(DocxImportError::DoctypeNotAllowed {
-                    path: "word/document.xml".to_owned(),
+                    path: source_part_path.to_owned(),
                 });
             }
             Event::End(event) => {
@@ -790,6 +1478,7 @@ fn parse_semantic_document(
                 end_element(
                     document_id,
                     &document_digest,
+                    source_part_path,
                     &name.local_name,
                     &mut path_stack,
                     &mut child_counts,
@@ -817,6 +1506,7 @@ fn parse_semantic_document(
         blocks,
         styles: None,
         numbering: None,
+        stories: None,
         unsupported_features,
     })
 }
@@ -825,6 +1515,7 @@ fn parse_semantic_document(
 fn end_element(
     document_id: &DocumentId,
     document_digest: &str,
+    source_part_path: &str,
     local_name: &str,
     path_stack: &mut Vec<String>,
     child_counts: &mut Vec<BTreeMap<String, usize>>,
@@ -840,6 +1531,7 @@ fn end_element(
                 if let Some(paragraph) = paragraph_stack.last_mut() {
                     let id = semantic_id(
                         document_id,
+                        source_part_path,
                         "run",
                         None,
                         &run.anchor.xml_path,
@@ -861,6 +1553,7 @@ fn end_element(
             if let Some(paragraph) = paragraph_stack.pop() {
                 let id = semantic_id(
                     document_id,
+                    source_part_path,
                     "paragraph",
                     paragraph.source_identifier.as_deref(),
                     &paragraph.anchor.xml_path,
@@ -874,6 +1567,7 @@ fn end_element(
                     properties: paragraph.properties,
                     numbering: paragraph.numbering,
                     resolved_style: None,
+                    section_story_references: paragraph.section_story_references,
                     runs: paragraph.runs,
                 });
                 push_block(block, table_stack, blocks);
@@ -883,6 +1577,7 @@ fn end_element(
             if let Some(table) = table_stack.pop() {
                 let id = semantic_id(
                     document_id,
+                    source_part_path,
                     "table",
                     None,
                     &table.anchor.xml_path,
@@ -898,6 +1593,7 @@ fn end_element(
                         .map(|row| {
                             let row_id = semantic_id(
                                 document_id,
+                                source_part_path,
                                 "row",
                                 None,
                                 &row.anchor.xml_path,
@@ -910,6 +1606,7 @@ fn end_element(
                                 .map(|cell| {
                                     let cell_id = semantic_id(
                                         document_id,
+                                        source_part_path,
                                         "cell",
                                         None,
                                         &cell.anchor.xml_path,
@@ -981,6 +1678,7 @@ fn next_path(
 
 fn semantic_id(
     document_id: &DocumentId,
+    source_part_path: &str,
     kind: &str,
     source_identifier: Option<&str>,
     xml_path: &str,
@@ -989,11 +1687,11 @@ fn semantic_id(
 ) -> Result<SemanticNodeId, DocxImportError> {
     let material = match source_identifier {
         Some(source_identifier) => format!(
-            "{}|word/document.xml|{kind}|source:{source_identifier}",
+            "{}|{source_part_path}|{kind}|source:{source_identifier}",
             document_id.as_str()
         ),
         None => format!(
-            "{}|word/document.xml|{kind}|path:{xml_path}|doc-sha256:{document_digest}",
+            "{}|{source_part_path}|{kind}|path:{xml_path}|doc-sha256:{document_digest}",
             document_id.as_str()
         ),
     };
@@ -1119,6 +1817,7 @@ struct ParagraphBuilder {
     anchor: SourceAnchor,
     properties: ParagraphPropertiesProjection,
     numbering: Option<NumberingReference>,
+    section_story_references: Vec<HeaderFooterReferenceProjection>,
     runs: Vec<SemanticRun>,
 }
 
@@ -1667,14 +2366,22 @@ fn end_numbering_element(
     }
 }
 
-fn resolve_semantic_references(semantic: &mut SemanticDocument) {
+fn resolve_semantic_references(semantic: &mut SemanticDocument, relationships: &[OpcRelationship]) {
     let styles_snapshot = semantic.styles.clone();
     let numbering_snapshot = semantic.numbering.clone();
     for block in &mut semantic.blocks {
-        resolve_block_references(block, styles_snapshot.as_ref(), numbering_snapshot.as_ref());
+        resolve_block_references(
+            block,
+            styles_snapshot.as_ref(),
+            numbering_snapshot.as_ref(),
+            relationships,
+        );
     }
     if let Some(numbering) = semantic.numbering.as_mut() {
         detect_numbering_reference_diagnostics(&semantic.blocks, numbering);
+    }
+    if let Some(stories) = semantic.stories.as_mut() {
+        resolve_story_registry(stories, &semantic.blocks, relationships);
     }
 }
 
@@ -1682,6 +2389,7 @@ fn resolve_block_references(
     block: &mut SemanticBlock,
     styles: Option<&StyleRegistryProjection>,
     numbering: Option<&NumberingRegistryProjection>,
+    relationships: &[OpcRelationship],
 ) {
     match block {
         SemanticBlock::Paragraph(paragraph) => {
@@ -1689,15 +2397,17 @@ fn resolve_block_references(
             if let Some(reference) = paragraph.numbering.as_mut() {
                 reference.resolved_level = resolve_numbering_reference(reference, numbering);
             }
+            resolve_section_story_references(paragraph, relationships);
             for run in &mut paragraph.runs {
                 run.resolved_style = resolve_run_style(run, styles);
+                resolve_run_story_references(run, relationships);
             }
         }
         SemanticBlock::Table(table) => {
             for row in &mut table.rows {
                 for cell in &mut row.cells {
                     for child in &mut cell.blocks {
-                        resolve_block_references(child, styles, numbering);
+                        resolve_block_references(child, styles, numbering, relationships);
                     }
                 }
             }
@@ -1736,6 +2446,491 @@ fn resolve_run_style(
             .find(|style| style.style_id == *style_id)
             .and_then(|style| style.resolved_style.clone())
     })
+}
+
+fn resolve_section_story_references(
+    paragraph: &mut SemanticParagraph,
+    relationships: &[OpcRelationship],
+) {
+    let mut seen = BTreeSet::new();
+    for reference in &mut paragraph.section_story_references {
+        let key = (
+            reference.section_index,
+            reference.kind,
+            reference.relationship_id.clone(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        if let Some(relationship) = relationships.iter().find(|relationship| {
+            relationship.source_part.as_deref() == Some("word/document.xml")
+                && relationship.relationship_id == reference.relationship_id
+        }) {
+            reference.target = relationship.target.clone();
+            if relationship.target_mode == TargetMode::Internal {
+                reference.resolved_part_path =
+                    resolve_internal_target_path("word/document.xml", &relationship.target);
+            }
+        }
+    }
+}
+
+fn resolve_run_story_references(run: &mut SemanticRun, relationships: &[OpcRelationship]) {
+    for inline in &mut run.inlines {
+        match inline {
+            SemanticInline::FootnoteReference {
+                note_id,
+                resolved_part_path,
+            } => {
+                if resolved_part_path.is_none() {
+                    *resolved_part_path =
+                        resolve_story_part_for_note(relationships, "word/footnotes.xml", note_id);
+                }
+            }
+            SemanticInline::EndnoteReference {
+                note_id,
+                resolved_part_path,
+            } => {
+                if resolved_part_path.is_none() {
+                    *resolved_part_path =
+                        resolve_story_part_for_note(relationships, "word/endnotes.xml", note_id);
+                }
+            }
+            SemanticInline::CommentReference {
+                comment_id,
+                resolved_part_path,
+            } => {
+                if resolved_part_path.is_none() {
+                    *resolved_part_path = resolve_story_part_for_comment(
+                        relationships,
+                        "word/comments.xml",
+                        comment_id,
+                    );
+                }
+            }
+            SemanticInline::CommentRangeStart { .. }
+            | SemanticInline::CommentRangeEnd { .. }
+            | SemanticInline::Text(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. } => {}
+        }
+    }
+}
+
+fn resolve_story_part_for_note(
+    _relationships: &[OpcRelationship],
+    default_part: &str,
+    _note_id: &str,
+) -> Option<String> {
+    Some(default_part.to_owned())
+}
+
+fn resolve_story_part_for_comment(
+    _relationships: &[OpcRelationship],
+    default_part: &str,
+    _comment_id: &str,
+) -> Option<String> {
+    Some(default_part.to_owned())
+}
+
+fn resolve_story_references(
+    references: &mut [StoryReference],
+    relationships: &[OpcRelationship],
+    diagnostics: &mut Vec<StoryResolutionDiagnostic>,
+) {
+    for reference in references {
+        match reference.kind {
+            StoryReferenceKind::HeaderReference | StoryReferenceKind::FooterReference => {
+                if let Some(relationship_id) = reference.relationship_id.clone() {
+                    if let Some(relationship) = relationships.iter().find(|relationship| {
+                        relationship.source_part.as_deref() == Some("word/document.xml")
+                            && relationship.relationship_id == relationship_id
+                    }) {
+                        reference.target = Some(relationship.target.clone());
+                        reference.target_mode = Some(relationship.target_mode);
+                        if relationship.target_mode == TargetMode::Internal {
+                            reference.resolved_part_path = resolve_internal_target_path(
+                                "word/document.xml",
+                                &relationship.target,
+                            );
+                        } else {
+                            diagnostics.push(story_diag(
+                                "CVN_STORY_EXTERNAL_TARGET_UNSUPPORTED",
+                                &reference.source_anchor.xml_path,
+                                "external story relationship targets are not resolved",
+                            ));
+                        }
+                    } else {
+                        diagnostics.push(story_diag(
+                            "CVN_STORY_RELATIONSHIP_MISSING",
+                            &reference.source_anchor.xml_path,
+                            format!("relationship `{relationship_id}` is not defined"),
+                        ));
+                    }
+                }
+            }
+            StoryReferenceKind::FootnoteReference => {
+                if reference.resolved_part_path.is_none() {
+                    reference.resolved_part_path = Some("word/footnotes.xml".to_owned());
+                }
+            }
+            StoryReferenceKind::EndnoteReference => {
+                if reference.resolved_part_path.is_none() {
+                    reference.resolved_part_path = Some("word/endnotes.xml".to_owned());
+                }
+            }
+            StoryReferenceKind::CommentReference => {
+                if reference.resolved_part_path.is_none() {
+                    reference.resolved_part_path = Some("word/comments.xml".to_owned());
+                }
+            }
+            StoryReferenceKind::CommentRangeStart | StoryReferenceKind::CommentRangeEnd => {}
+        }
+    }
+}
+
+fn resolve_story_registry(
+    stories: &mut StoryRegistryProjection,
+    blocks: &[SemanticBlock],
+    relationships: &[OpcRelationship],
+) {
+    let mut references = Vec::new();
+    collect_story_references(blocks, &mut references);
+    resolve_story_references(&mut references, relationships, &mut stories.diagnostics);
+    let mut ranges_by_comment = BTreeMap::<String, Vec<CommentRangeProjection>>::new();
+    collect_comment_ranges(blocks, &mut ranges_by_comment);
+    let note_targets = story_note_targets(&stories.parts);
+    let comment_targets = story_comment_targets(&stories.parts);
+    for reference in &references {
+        match reference.kind {
+            StoryReferenceKind::FootnoteReference => {
+                if let Some(note_id) = reference.source_identifier.as_ref() {
+                    if !note_targets.contains_key(note_id) {
+                        stories.diagnostics.push(story_diag(
+                            "CVN_FOOTNOTE_TARGET_MISSING",
+                            &reference.source_anchor.xml_path,
+                            format!("footnote `{note_id}` is not defined"),
+                        ));
+                    }
+                }
+            }
+            StoryReferenceKind::EndnoteReference => {
+                if let Some(note_id) = reference.source_identifier.as_ref() {
+                    if !note_targets.contains_key(note_id) {
+                        stories.diagnostics.push(story_diag(
+                            "CVN_ENDNOTE_TARGET_MISSING",
+                            &reference.source_anchor.xml_path,
+                            format!("endnote `{note_id}` is not defined"),
+                        ));
+                    }
+                }
+            }
+            StoryReferenceKind::CommentReference => {
+                if let Some(comment_id) = reference.source_identifier.as_ref() {
+                    if !comment_targets.contains_key(comment_id) {
+                        stories.diagnostics.push(story_diag(
+                            "CVN_COMMENT_TARGET_MISSING",
+                            &reference.source_anchor.xml_path,
+                            format!("comment `{comment_id}` is not defined"),
+                        ));
+                    }
+                }
+            }
+            StoryReferenceKind::HeaderReference
+            | StoryReferenceKind::FooterReference
+            | StoryReferenceKind::CommentRangeStart
+            | StoryReferenceKind::CommentRangeEnd => {}
+        }
+    }
+    resolve_story_parts(
+        &mut stories.parts,
+        &note_targets,
+        &comment_targets,
+        &ranges_by_comment,
+        &mut stories.diagnostics,
+        relationships,
+    );
+    stories.references = references;
+    stories
+        .diagnostics
+        .sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+}
+
+fn resolve_story_parts(
+    parts: &mut [StoryPartProjection],
+    note_targets: &BTreeMap<String, String>,
+    comment_targets: &BTreeMap<String, String>,
+    ranges_by_comment: &BTreeMap<String, Vec<CommentRangeProjection>>,
+    diagnostics: &mut Vec<StoryResolutionDiagnostic>,
+    relationships: &[OpcRelationship],
+) {
+    let mut seen_section_refs = BTreeSet::new();
+    for part in parts {
+        for reference in &mut part.section_story_references {
+            let key = (
+                reference.section_index,
+                reference.kind,
+                reference.relationship_id.clone(),
+            );
+            if !seen_section_refs.insert(key) {
+                diagnostics.push(story_diag(
+                    "CVN_STORY_DUPLICATE_REFERENCE",
+                    &reference.source_anchor.xml_path,
+                    "duplicate section story reference in the same section",
+                ));
+                continue;
+            }
+            if let Some(relationship) = relationships.iter().find(|relationship| {
+                relationship.source_part.as_deref() == Some("word/document.xml")
+                    && relationship.relationship_id == reference.relationship_id
+            }) {
+                reference.target = relationship.target.clone();
+                if relationship.target_mode == TargetMode::Internal {
+                    reference.resolved_part_path =
+                        resolve_internal_target_path("word/document.xml", &relationship.target);
+                } else {
+                    diagnostics.push(story_diag(
+                        "CVN_STORY_EXTERNAL_TARGET_UNSUPPORTED",
+                        &reference.source_anchor.xml_path,
+                        "external story relationship targets are not resolved",
+                    ));
+                }
+            } else {
+                diagnostics.push(story_diag(
+                    "CVN_STORY_RELATIONSHIP_MISSING",
+                    &reference.source_anchor.xml_path,
+                    format!(
+                        "relationship `{}` is not defined for section reference",
+                        reference.relationship_id
+                    ),
+                ));
+            }
+        }
+
+        for note in &mut part.notes {
+            if !note_targets.contains_key(&note.note_id) {
+                diagnostics.push(story_diag(
+                    if part.kind == StoryPartKind::Footnotes {
+                        "CVN_FOOTNOTE_TARGET_MISSING"
+                    } else {
+                        "CVN_ENDNOTE_TARGET_MISSING"
+                    },
+                    &note.source_anchor.xml_path,
+                    format!("story note `{}` is not defined", note.note_id),
+                ));
+            }
+        }
+
+        for comment in &mut part.comments {
+            match comment_targets.get(&comment.comment_id) {
+                Some(_) => {
+                    if let Some(ranges) = ranges_by_comment.get(&comment.comment_id) {
+                        comment.ranges = ranges.clone();
+                    } else {
+                        diagnostics.push(story_diag(
+                            "CVN_COMMENT_RANGE_START_MISSING",
+                            &comment.source_anchor.xml_path,
+                            format!("comment `{}` has no range markers", comment.comment_id),
+                        ));
+                    }
+                }
+                None => diagnostics.push(story_diag(
+                    "CVN_COMMENT_TARGET_MISSING",
+                    &comment.source_anchor.xml_path,
+                    format!("comment `{}` is not defined", comment.comment_id),
+                )),
+            }
+        }
+    }
+}
+
+fn collect_story_references(blocks: &[SemanticBlock], references: &mut Vec<StoryReference>) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for reference in &paragraph.section_story_references {
+                    references.push(StoryReference {
+                        kind: match reference.kind {
+                            StoryPartKind::HeaderDefault
+                            | StoryPartKind::HeaderFirst
+                            | StoryPartKind::HeaderEven => StoryReferenceKind::HeaderReference,
+                            StoryPartKind::FooterDefault
+                            | StoryPartKind::FooterFirst
+                            | StoryPartKind::FooterEven => StoryReferenceKind::FooterReference,
+                            _ => StoryReferenceKind::HeaderReference,
+                        },
+                        source_anchor: reference.source_anchor.clone(),
+                        source_identifier: None,
+                        relationship_id: Some(reference.relationship_id.clone()),
+                        relationship_type: Some(reference.relationship_type.clone()),
+                        target: Some(reference.target.clone()),
+                        target_mode: None,
+                        resolved_part_path: reference.resolved_part_path.clone(),
+                    });
+                }
+                for run in &paragraph.runs {
+                    collect_run_story_references(run, references);
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        collect_story_references(&cell.blocks, references);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_run_story_references(run: &SemanticRun, references: &mut Vec<StoryReference>) {
+    for inline in &run.inlines {
+        match inline {
+            SemanticInline::FootnoteReference {
+                note_id,
+                resolved_part_path,
+            } => references.push(StoryReference {
+                kind: StoryReferenceKind::FootnoteReference,
+                source_anchor: run.source_anchor.clone(),
+                source_identifier: Some(note_id.clone()),
+                relationship_id: None,
+                relationship_type: None,
+                target: None,
+                target_mode: None,
+                resolved_part_path: resolved_part_path.clone(),
+            }),
+            SemanticInline::EndnoteReference {
+                note_id,
+                resolved_part_path,
+            } => references.push(StoryReference {
+                kind: StoryReferenceKind::EndnoteReference,
+                source_anchor: run.source_anchor.clone(),
+                source_identifier: Some(note_id.clone()),
+                relationship_id: None,
+                relationship_type: None,
+                target: None,
+                target_mode: None,
+                resolved_part_path: resolved_part_path.clone(),
+            }),
+            SemanticInline::CommentReference {
+                comment_id,
+                resolved_part_path,
+            } => references.push(StoryReference {
+                kind: StoryReferenceKind::CommentReference,
+                source_anchor: run.source_anchor.clone(),
+                source_identifier: Some(comment_id.clone()),
+                relationship_id: None,
+                relationship_type: None,
+                target: None,
+                target_mode: None,
+                resolved_part_path: resolved_part_path.clone(),
+            }),
+            SemanticInline::CommentRangeStart { comment_id } => references.push(StoryReference {
+                kind: StoryReferenceKind::CommentRangeStart,
+                source_anchor: run.source_anchor.clone(),
+                source_identifier: Some(comment_id.clone()),
+                relationship_id: None,
+                relationship_type: None,
+                target: None,
+                target_mode: None,
+                resolved_part_path: None,
+            }),
+            SemanticInline::CommentRangeEnd { comment_id } => references.push(StoryReference {
+                kind: StoryReferenceKind::CommentRangeEnd,
+                source_anchor: run.source_anchor.clone(),
+                source_identifier: Some(comment_id.clone()),
+                relationship_id: None,
+                relationship_type: None,
+                target: None,
+                target_mode: None,
+                resolved_part_path: None,
+            }),
+            SemanticInline::Text(_) | SemanticInline::Tab | SemanticInline::LineBreak { .. } => {}
+        }
+    }
+}
+
+fn collect_comment_ranges(
+    blocks: &[SemanticBlock],
+    ranges_by_comment: &mut BTreeMap<String, Vec<CommentRangeProjection>>,
+) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for run in &paragraph.runs {
+                    for inline in &run.inlines {
+                        match inline {
+                            SemanticInline::CommentRangeStart { comment_id } => {
+                                ranges_by_comment
+                                    .entry(comment_id.clone())
+                                    .or_default()
+                                    .push(CommentRangeProjection {
+                                        comment_id: comment_id.clone(),
+                                        kind: StoryReferenceKind::CommentRangeStart,
+                                        source_anchor: run.source_anchor.clone(),
+                                    });
+                            }
+                            SemanticInline::CommentRangeEnd { comment_id } => {
+                                ranges_by_comment
+                                    .entry(comment_id.clone())
+                                    .or_default()
+                                    .push(CommentRangeProjection {
+                                        comment_id: comment_id.clone(),
+                                        kind: StoryReferenceKind::CommentRangeEnd,
+                                        source_anchor: run.source_anchor.clone(),
+                                    });
+                            }
+                            SemanticInline::Text(_)
+                            | SemanticInline::Tab
+                            | SemanticInline::LineBreak { .. }
+                            | SemanticInline::FootnoteReference { .. }
+                            | SemanticInline::EndnoteReference { .. }
+                            | SemanticInline::CommentReference { .. } => {}
+                        }
+                    }
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        collect_comment_ranges(&cell.blocks, ranges_by_comment);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn story_note_targets(parts: &[StoryPartProjection]) -> BTreeMap<String, String> {
+    let mut targets = BTreeMap::new();
+    for part in parts {
+        for note in &part.notes {
+            targets
+                .entry(note.note_id.clone())
+                .or_insert_with(|| part.source_part.clone());
+        }
+    }
+    targets
+}
+
+fn story_comment_targets(parts: &[StoryPartProjection]) -> BTreeMap<String, String> {
+    let mut targets = BTreeMap::new();
+    for part in parts {
+        for comment in &part.comments {
+            targets
+                .entry(comment.comment_id.clone())
+                .or_insert_with(|| part.source_part.clone());
+        }
+    }
+    targets
+}
+
+fn story_diag(code: &str, path: &str, message: impl Into<String>) -> StoryResolutionDiagnostic {
+    StoryResolutionDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+    }
 }
 
 fn resolve_numbering_reference(
@@ -2209,7 +3404,9 @@ impl NumberingLevelBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write;
+    use std::path::PathBuf;
 
     use zip::write::FileOptions;
     use zip::ZipWriter;
@@ -2564,12 +3761,154 @@ mod tests {
         path
     }
 
+    fn write_story_docx(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+
+        add(
+            &mut zip,
+            options,
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/headerFirst.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/word/footerEven.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/><Override PartName="/word/endnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml"/><Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/></Types>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdHeaderFirst" Type="header" Target="headerFirst.xml"/><Relationship Id="rIdFooter1" Type="footer" Target="footer1.xml"/><Relationship Id="rIdFooterEven" Type="footer" Target="footerEven.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/><Relationship Id="rIdEndnotes" Type="endnotes" Target="endnotes.xml"/><Relationship Id="rIdComments" Type="comments" Target="comments.xml"/></Relationships>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/document.xml",
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:cx="urn:story-extra"><w:body><w:p w14:paraId="11111111"><w:r><w:t>Main story</w:t></w:r><w:r><w:footnoteReference w:id="1"/><w:endnoteReference w:id="2"/><w:commentRangeStart w:id="4"/><w:t>commented</w:t><w:commentRangeEnd w:id="4"/><w:commentReference w:id="4"/></w:r></w:p><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/><w:footerReference r:id="rIdFooter1" w:type="default"/><w:headerReference r:id="rIdHeaderFirst" w:type="first"/><w:footerReference r:id="rIdFooterEven" w:type="even"/></w:sectPr></w:pPr></w:p></w:body></w:document>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/header1.xml",
+            br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:cx="urn:story-extra"><w:p><w:r><w:t>Header</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Header cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><cx:unknown/></w:hdr>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/headerFirst.xml",
+            br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Header first</w:t></w:r></w:p></w:hdr>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/footer1.xml",
+            br#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Footer</w:t></w:r></w:p></w:ftr>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/footerEven.xml",
+            br#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Footer even</w:t></w:r></w:p></w:ftr>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/footnotes.xml",
+            br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:cx="urn:story-extra"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:t>Footnote one</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Nested note</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:footnote><cx:unknown/></w:footnotes>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/endnotes.xml",
+            br#"<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:endnote w:id="2"><w:p><w:r><w:t>Endnote two</w:t></w:r></w:p></w:endnote></w:endnotes>"#,
+        );
+        add(
+            &mut zip,
+            options,
+            "word/comments.xml",
+            br#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:cx="urn:story-extra"><w:comment w:id="4" w:author="Alice" w:initials="AL" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>Comment body</w:t></w:r></w:p></w:comment><cx:unknown/></w:comments>"#,
+        );
+        zip.finish().unwrap();
+        path
+    }
+
     fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         for block in &document.blocks {
             collect_block_ids(block, &mut ids);
         }
         ids
+    }
+
+    #[test]
+    fn story_parts_are_projected_deterministically() {
+        let docx = write_story_docx("story-deterministic");
+        let package1 = import_docx(&docx).unwrap();
+        let package2 = import_docx(&docx).unwrap();
+
+        assert_eq!(
+            package1.document.semantic.stories,
+            package2.document.semantic.stories
+        );
+
+        let out1 =
+            std::env::temp_dir().join(format!("tuff-cvn-story-out-1-{}", std::process::id()));
+        let out2 =
+            std::env::temp_dir().join(format!("tuff-cvn-story-out-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+        cvn_package::write_package(&out1, &package1).unwrap();
+        cvn_package::write_package(&out2, &package2).unwrap();
+
+        let bytes1 = cvn_package::read_cvn_json_bytes(&out1).unwrap();
+        let bytes2 = cvn_package::read_cvn_json_bytes(&out2).unwrap();
+        assert_eq!(bytes1, bytes2);
+
+        let report1 = cvn_package::verify_package_integrity(&out1).unwrap();
+        let report2 = cvn_package::verify_package_integrity(&out2).unwrap();
+        assert_eq!(report1.root_actual, report2.root_actual);
+
+        let stories = package1.document.semantic.stories.as_ref().unwrap();
+        assert!(stories
+            .parts
+            .iter()
+            .any(|part| matches!(part.kind, StoryPartKind::HeaderDefault)));
+        assert!(stories
+            .parts
+            .iter()
+            .any(|part| matches!(part.kind, StoryPartKind::FooterDefault)));
+        assert!(stories
+            .parts
+            .iter()
+            .any(|part| matches!(part.kind, StoryPartKind::Footnotes)));
+        assert!(stories
+            .parts
+            .iter()
+            .any(|part| matches!(part.kind, StoryPartKind::Endnotes)));
+        assert!(stories
+            .parts
+            .iter()
+            .any(|part| matches!(part.kind, StoryPartKind::Comments)));
+
+        let _ = fs::remove_dir_all(&docx);
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+    }
+
+    #[test]
+    fn story_projection_absent_is_allowed() {
+        let docx = write_semantic_docx("no-story-parts");
+        let package = import_docx(&docx).unwrap();
+        assert!(package.document.semantic.stories.is_none());
+        let _ = fs::remove_file(docx);
     }
 
     fn collect_block_ids(block: &SemanticBlock, ids: &mut Vec<String>) {

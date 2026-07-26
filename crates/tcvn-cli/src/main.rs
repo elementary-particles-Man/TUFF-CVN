@@ -109,12 +109,15 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
         ));
     }
     let flags = &args[1..];
-    if flags
-        .iter()
-        .any(|flag| !matches!(flag.as_str(), "--semantic" | "--styles" | "--numbering"))
-    {
+    if flags.iter().any(|flag| {
+        !matches!(
+            flag.as_str(),
+            "--semantic" | "--styles" | "--numbering" | "--stories"
+        )
+    }) {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering]".to_owned(),
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories]"
+                .to_owned(),
         ));
     }
     let input = PathBuf::from(&args[0]);
@@ -135,6 +138,10 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
             "--numbering" => println!(
                 "{}",
                 serde_json::to_string_pretty(&cvn_json.payload.semantic.numbering)?
+            ),
+            "--stories" => println!(
+                "{}",
+                serde_json::to_string_pretty(&cvn_json.payload.semantic.stories)?
             ),
             _ => unreachable!("validated inspect flag"),
         }
@@ -234,7 +241,7 @@ Commands:
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
-  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering]
+  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories]
       Print read-only semantic, style, and numbering projections from cvn.json.
 
   tcvn diff <left.cvn> <right.cvn>

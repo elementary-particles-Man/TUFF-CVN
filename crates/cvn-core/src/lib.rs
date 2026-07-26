@@ -429,6 +429,8 @@ pub struct SemanticDocument {
     pub styles: Option<StyleRegistryProjection>,
     #[serde(default)]
     pub numbering: Option<NumberingRegistryProjection>,
+    #[serde(default)]
+    pub stories: Option<StoryRegistryProjection>,
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
 }
 
@@ -451,6 +453,8 @@ pub struct SemanticParagraph {
     pub numbering: Option<NumberingReference>,
     #[serde(default)]
     pub resolved_style: Option<ResolvedStyleProjection>,
+    #[serde(default)]
+    pub section_story_references: Vec<HeaderFooterReferenceProjection>,
     pub runs: Vec<SemanticRun>,
 }
 
@@ -505,7 +509,27 @@ pub struct SemanticTableCell {
 pub enum SemanticInline {
     Text(SemanticText),
     Tab,
-    LineBreak { break_kind: String },
+    LineBreak {
+        break_kind: String,
+    },
+    FootnoteReference {
+        note_id: String,
+        resolved_part_path: Option<String>,
+    },
+    EndnoteReference {
+        note_id: String,
+        resolved_part_path: Option<String>,
+    },
+    CommentReference {
+        comment_id: String,
+        resolved_part_path: Option<String>,
+    },
+    CommentRangeStart {
+        comment_id: String,
+    },
+    CommentRangeEnd {
+        comment_id: String,
+    },
 }
 
 /// Source anchor for semantic nodes.
@@ -660,6 +684,142 @@ pub struct NumberingResolutionDiagnostic {
     pub message: String,
 }
 
+/// Read-only projection of headers, footers, notes, and comments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryRegistryProjection {
+    pub source_part: String,
+    pub parts: Vec<StoryPartProjection>,
+    pub references: Vec<StoryReference>,
+    pub diagnostics: Vec<StoryResolutionDiagnostic>,
+    pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+/// Projected story part.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryPartProjection {
+    pub id: SemanticNodeId,
+    pub kind: StoryPartKind,
+    pub source_part: String,
+    pub source_anchor: SourceAnchor,
+    #[serde(default)]
+    pub section_story_references: Vec<HeaderFooterReferenceProjection>,
+    pub blocks: Vec<SemanticBlock>,
+    #[serde(default)]
+    pub notes: Vec<NoteProjection>,
+    #[serde(default)]
+    pub comments: Vec<CommentProjection>,
+    #[serde(default)]
+    pub references: Vec<StoryReference>,
+    pub diagnostics: Vec<StoryResolutionDiagnostic>,
+    pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+/// Story part kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryPartKind {
+    MainDocument,
+    HeaderDefault,
+    HeaderFirst,
+    HeaderEven,
+    FooterDefault,
+    FooterFirst,
+    FooterEven,
+    Footnotes,
+    Endnotes,
+    Comments,
+}
+
+/// Relationship or note/comment reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryReference {
+    pub kind: StoryReferenceKind,
+    pub source_anchor: SourceAnchor,
+    #[serde(default)]
+    pub source_identifier: Option<String>,
+    #[serde(default)]
+    pub relationship_id: Option<String>,
+    #[serde(default)]
+    pub relationship_type: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub target_mode: Option<TargetMode>,
+    #[serde(default)]
+    pub resolved_part_path: Option<String>,
+}
+
+/// Story reference kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryReferenceKind {
+    HeaderReference,
+    FooterReference,
+    FootnoteReference,
+    EndnoteReference,
+    CommentReference,
+    CommentRangeStart,
+    CommentRangeEnd,
+}
+
+/// Header/footer reference projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderFooterReferenceProjection {
+    pub section_index: u64,
+    pub kind: StoryPartKind,
+    pub relationship_id: String,
+    pub relationship_type: String,
+    pub target: String,
+    #[serde(default)]
+    pub resolved_part_path: Option<String>,
+    pub source_anchor: SourceAnchor,
+}
+
+/// Footnote or endnote projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteProjection {
+    pub note_id: String,
+    pub is_reserved: bool,
+    pub source_anchor: SourceAnchor,
+    pub blocks: Vec<SemanticBlock>,
+    #[serde(default)]
+    pub references: Vec<StoryReference>,
+    pub diagnostics: Vec<StoryResolutionDiagnostic>,
+}
+
+/// Comment projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentProjection {
+    pub comment_id: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub initials: Option<String>,
+    #[serde(default)]
+    pub date: Option<String>,
+    pub source_anchor: SourceAnchor,
+    pub blocks: Vec<SemanticBlock>,
+    #[serde(default)]
+    pub ranges: Vec<CommentRangeProjection>,
+    pub diagnostics: Vec<StoryResolutionDiagnostic>,
+}
+
+/// Comment range marker projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentRangeProjection {
+    pub comment_id: String,
+    pub kind: StoryReferenceKind,
+    pub source_anchor: SourceAnchor,
+}
+
+/// Story projection diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
 /// Unsupported or partially projected semantic feature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedSemanticFeature {
@@ -712,6 +872,7 @@ pub enum IntegrityNodeKind {
     SemanticProjection,
     StyleProjection,
     NumberingProjection,
+    StoryProjection,
     Objects,
 }
 
@@ -726,6 +887,7 @@ impl IntegrityNodeKind {
             Self::SemanticProjection => "semantic_projection",
             Self::StyleProjection => "style_projection",
             Self::NumberingProjection => "numbering_projection",
+            Self::StoryProjection => "story_projection",
             Self::Objects => "objects",
         }
     }

@@ -47,6 +47,7 @@ The node kinds are:
 - `semantic_projection`
 - `style_projection`
 - `numbering_projection`
+- `story_projection`
 - `objects`
 
 The manifest is calculated from explicit hash-target projections. The
@@ -88,15 +89,30 @@ P0-CVN-05 adds read-only style and numbering projection models:
 - `NumberFormatProjection`
 - `NumberingResolutionDiagnostic`
 
-`SemanticDocument` may contain optional `styles` and `numbering` projections.
-`SemanticParagraph` may contain a `NumberingReference` and resolved paragraph
-style. `SemanticRun` may contain resolved run style. These projections are
-read-only; raw `word/styles.xml` and `word/numbering.xml` remain preserved as OPC
-objects and are not regenerated from projection data.
+P0-CVN-06 adds read-only story projection models:
 
-The integrity manifest version is now `cvn-integrity-v4-style-numbering`.
-The `style_projection` and `numbering_projection` leaves hash deterministic
-RFC 8785 projections independently from raw object hashes.
+- `StoryRegistryProjection`
+- `StoryPartProjection`
+- `StoryPartKind`
+- `StoryReference`
+- `StoryReferenceKind`
+- `HeaderFooterReferenceProjection`
+- `NoteProjection`
+- `CommentProjection`
+- `CommentRangeProjection`
+- `StoryResolutionDiagnostic`
+
+`SemanticDocument` may contain optional `styles` and `numbering` projections.
+`SemanticDocument` may contain optional `stories` projections. `SemanticParagraph`
+may contain a `NumberingReference`, resolved paragraph style, and section story
+references. `SemanticRun` may contain resolved run style and read-only story
+references. These projections are read-only; raw `word/styles.xml`,
+`word/numbering.xml`, and story XML parts remain preserved as OPC objects and
+are not regenerated from projection data.
+
+The integrity manifest version is now `cvn-integrity-v5-story-parts`.
+The `style_projection`, `numbering_projection`, and `story_projection` leaves
+hash deterministic RFC 8785 projections independently from raw object hashes.
 
 Non-supported or not-yet-claimed areas:
 

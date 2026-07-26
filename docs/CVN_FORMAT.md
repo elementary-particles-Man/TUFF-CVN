@@ -168,6 +168,25 @@ are diagnostics.
 TUFF-CVN does not generate locale-dependent numbering strings or infer visual
 bullet rendering in this phase.
 
+## Story projections
+
+P0-CVN-06 adds a read-only story registry projection for:
+
+- `word/header*.xml`
+- `word/footer*.xml`
+- `word/footnotes.xml`
+- `word/endnotes.xml`
+- `word/comments.xml`
+
+The registry is derived from preserved raw OPC parts and does not replace them.
+It records section header/footer references, note/comment containers, source
+anchors, relationship resolution results, and typed diagnostics. `SemanticInline`
+retains `footnoteReference`, `endnoteReference`, `commentRangeStart`,
+`commentRangeEnd`, and `commentReference` nodes as read-only references.
+
+Story registry projection data is not an XML serialization source. Raw story XML
+remains the preservation source for export.
+
 ## Warnings and checksums
 
 Warnings are typed records with `code`, `severity`, `path`, `message`, and
@@ -214,6 +233,7 @@ Integrity leaf nodes use SHA-256 over `domain-prefix || RFC8785-bytes`:
 - `semantic_projection`
 - `style_projection`
 - `numbering_projection`
+- `story_projection`
 - `objects`
 
 The `semantic_projection` leaf covers the document semantic blocks and
