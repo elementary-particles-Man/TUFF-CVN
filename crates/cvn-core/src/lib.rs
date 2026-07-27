@@ -168,6 +168,8 @@ pub struct CvnDocument {
     pub opaque: Vec<OpaqueEntry>,
     pub opc: OpcPackageProjection,
     pub semantic: SemanticDocument,
+    #[serde(default)]
+    pub track_changes: Option<TrackChangesProjection>,
     pub warnings: Vec<CvnWarning>,
     pub checksums: Vec<ChecksumEntry>,
 }
@@ -187,6 +189,7 @@ impl CvnDocument {
             opaque: Vec::new(),
             opc: OpcPackageProjection::default(),
             semantic: SemanticDocument::default(),
+            track_changes: None,
             warnings: Vec::new(),
             checksums: Vec::new(),
         }
@@ -434,12 +437,127 @@ pub struct SemanticDocument {
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
 }
 
+/// Read-only projection of tracked changes across a DOCX story part.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackChangesProjection {
+    pub source_part: String,
+    pub changes: Vec<TrackedChange>,
+    pub move_ranges: Vec<MoveRangeProjection>,
+    pub diagnostics: Vec<TrackChangeResolutionDiagnostic>,
+    pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedChange {
+    pub id: TrackedChangeId,
+    pub kind: TrackedChangeKind,
+    pub metadata: TrackedChangeMetadata,
+    pub content: TrackedContent,
+    pub source_anchor: SourceAnchor,
+    pub semantic_node_id: SemanticNodeId,
+    #[serde(default)]
+    pub references: Vec<TrackChangeReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrackedChangeId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedChangeKind {
+    Insertion,
+    Deletion,
+    MoveFrom,
+    MoveTo,
+    ParagraphProperties,
+    RunProperties,
+    TableProperties,
+    TableRowProperties,
+    TableCellProperties,
+    SectionProperties,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TrackedChangeMetadata {
+    pub change_id: Option<String>,
+    pub author: Option<String>,
+    pub date_raw: Option<String>,
+    pub date_utc_raw: Option<String>,
+    pub date: Option<String>,
+    pub date_utc: Option<String>,
+    pub rsid_r: Option<String>,
+    pub rsid_del: Option<String>,
+    pub rsid_p: Option<String>,
+    pub rsid_rpr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TrackedContent {
+    Inline {
+        items: Vec<SemanticInline>,
+    },
+    Block {
+        blocks: Vec<SemanticBlock>,
+    },
+    PropertyChange {
+        properties: PropertyChangeProjection,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveRangeProjection {
+    pub change_id: String,
+    pub start: Option<SourceAnchor>,
+    pub end: Option<SourceAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyChangeProjection {
+    pub kind: PropertyChangeKind,
+    pub source_anchor: SourceAnchor,
+    pub previous: Option<Box<PropertyChangeSnapshot>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyChangeKind {
+    ParagraphProperties,
+    RunProperties,
+    TableProperties,
+    TableRowProperties,
+    TableCellProperties,
+    SectionProperties,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyChangeSnapshot {
+    pub raw: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackChangeReference {
+    pub kind: String,
+    pub change_id: String,
+    pub source_anchor: SourceAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackChangeResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
 /// Semantic block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SemanticBlock {
     Paragraph(SemanticParagraph),
     Table(SemanticTable),
+    TrackedChange(TrackedChange),
 }
 
 /// Semantic paragraph.
@@ -530,6 +648,7 @@ pub enum SemanticInline {
     CommentRangeEnd {
         comment_id: String,
     },
+    TrackedChange(TrackedChange),
 }
 
 /// Source anchor for semantic nodes.
@@ -873,6 +992,7 @@ pub enum IntegrityNodeKind {
     StyleProjection,
     NumberingProjection,
     StoryProjection,
+    TrackChangesProjection,
     Objects,
 }
 
@@ -888,6 +1008,7 @@ impl IntegrityNodeKind {
             Self::StyleProjection => "style_projection",
             Self::NumberingProjection => "numbering_projection",
             Self::StoryProjection => "story_projection",
+            Self::TrackChangesProjection => "track_changes_projection",
             Self::Objects => "objects",
         }
     }

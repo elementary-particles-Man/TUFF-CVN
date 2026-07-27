@@ -17,7 +17,8 @@ use cvn_core::{
     SemanticTableCell, SemanticTableRow, SemanticText, SourceAnchor, SourceDescriptor,
     SourceFormat, StoryPartKind, StoryPartProjection, StoryReference, StoryReferenceKind,
     StoryRegistryProjection, StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference,
-    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
+    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode, TrackedChange,
+    TrackedChangeId, TrackedChangeKind, TrackedChangeMetadata, TrackedContent,
     UnsupportedFeatureHandling, UnsupportedSemanticFeature, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
@@ -534,6 +535,7 @@ fn story_block_has_prefix(block: &SemanticBlock, prefix: &str) -> bool {
     match block {
         SemanticBlock::Paragraph(paragraph) => paragraph.source_anchor.xml_path.starts_with(prefix),
         SemanticBlock::Table(table) => table.source_anchor.xml_path.starts_with(prefix),
+        SemanticBlock::TrackedChange(change) => change.source_anchor.xml_path.starts_with(prefix),
     }
 }
 
@@ -782,6 +784,11 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                             | SemanticInline::CommentReference { .. }
                             | SemanticInline::CommentRangeStart { .. }
                             | SemanticInline::CommentRangeEnd { .. } => return true,
+                            SemanticInline::TrackedChange(change) => {
+                                if tracked_change_contains_story_references(change) {
+                                    return true;
+                                }
+                            }
                             SemanticInline::Text(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. } => {}
@@ -794,9 +801,27 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                     return true;
                 }
             }
+            SemanticBlock::TrackedChange(_) => {}
         }
     }
     false
+}
+
+fn tracked_change_contains_story_references(change: &TrackedChange) -> bool {
+    match &change.content {
+        TrackedContent::Inline { items } => items.iter().any(|inline| {
+            matches!(
+                inline,
+                SemanticInline::FootnoteReference { .. }
+                    | SemanticInline::EndnoteReference { .. }
+                    | SemanticInline::CommentReference { .. }
+                    | SemanticInline::CommentRangeStart { .. }
+                    | SemanticInline::CommentRangeEnd { .. }
+            )
+        }),
+        TrackedContent::Block { blocks } => contains_story_references(blocks),
+        TrackedContent::PropertyChange { .. } => false,
+    }
 }
 
 fn contains_story_references_in_table(table: &SemanticTable) -> bool {
@@ -1071,6 +1096,8 @@ fn parse_semantic_document(
     let mut paragraph_stack: Vec<ParagraphBuilder> = Vec::new();
     let mut run_stack: Vec<RunBuilder> = Vec::new();
     let mut table_stack: Vec<TableBuilder> = Vec::new();
+    let mut tracked_changes: Vec<TrackedChange> = Vec::new();
+    let mut active_change: Option<TrackedChangeBuilder> = None;
     let mut text_preserve_stack: Vec<bool> = Vec::new();
     let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
     let mut id_set = BTreeSet::new();
@@ -1090,6 +1117,15 @@ fn parse_semantic_document(
                 };
 
                 match name.local_name.as_str() {
+                    "ins" | "del" | "moveFrom" | "moveTo" | "pPrChange" | "rPrChange"
+                    | "tblPrChange" | "trPrChange" | "tcPrChange" | "sectPrChange" => {
+                        active_change = Some(TrackedChangeBuilder::new(
+                            source_part_path,
+                            &name.local_name,
+                            &attrs,
+                            anchor.clone(),
+                        ));
+                    }
                     "p" if name.is_wordprocessingml() => {
                         let source_identifier = attrs.get("w14:paraId").cloned();
                         paragraph_stack.push(ParagraphBuilder {
@@ -1215,8 +1251,14 @@ fn parse_semantic_document(
                                 .map(|value| value == "preserve")
                                 .unwrap_or(false),
                         );
+                        if let Some(change) = active_change.as_mut() {
+                            change.seen_text = true;
+                        }
                     }
                     "tab" if name.is_wordprocessingml() => {
+                        if let Some(change) = active_change.as_mut() {
+                            change.inline_items.push(SemanticInline::Tab);
+                        }
                         if let Some(run) = run_stack.last_mut() {
                             run.inlines.push(SemanticInline::Tab);
                         }
@@ -1278,6 +1320,11 @@ fn parse_semantic_document(
                         }
                     }
                     "br" | "cr" if name.is_wordprocessingml() => {
+                        if let Some(change) = active_change.as_mut() {
+                            change.inline_items.push(SemanticInline::LineBreak {
+                                break_kind: name.local_name.clone(),
+                            });
+                        }
                         if let Some(run) = run_stack.last_mut() {
                             run.inlines.push(SemanticInline::LineBreak {
                                 break_kind: name.local_name.clone(),
@@ -1459,11 +1506,24 @@ fn parse_semantic_document(
             }
             Event::Text(text) => {
                 let value = String::from_utf8_lossy(text.as_ref()).into_owned();
-                push_text(
-                    &mut run_stack,
-                    &value,
-                    text_preserve_stack.last().copied().unwrap_or(false),
-                );
+                let preserve = text_preserve_stack.last().copied().unwrap_or(false);
+                if let Some(change) = active_change.as_mut() {
+                    change.inline_items.push(SemanticInline::Text(SemanticText {
+                        value: value.clone(),
+                        preserve_space: preserve,
+                    }));
+                }
+                if active_change
+                    .as_ref()
+                    .map(|change| {
+                        change.kind == TrackedChangeKind::Deletion
+                            || change.kind == TrackedChangeKind::MoveFrom
+                    })
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                push_text(&mut run_stack, &value, preserve);
             }
             Event::DocType(_) => {
                 return Err(DocxImportError::DoctypeNotAllowed {
@@ -1474,6 +1534,29 @@ fn parse_semantic_document(
                 let name = qname(event.name().as_ref(), &namespace_stack);
                 if name.local_name == "t" && name.is_wordprocessingml() {
                     text_preserve_stack.pop();
+                }
+                if matches!(
+                    name.local_name.as_str(),
+                    "ins"
+                        | "del"
+                        | "moveFrom"
+                        | "moveTo"
+                        | "pPrChange"
+                        | "rPrChange"
+                        | "tblPrChange"
+                        | "trPrChange"
+                        | "tcPrChange"
+                        | "sectPrChange"
+                ) {
+                    if let Some(change) = active_change.take() {
+                        tracked_changes.push(change.finish(
+                            document_id,
+                            &name.local_name,
+                            &source_part_path.to_owned(),
+                            &document_digest,
+                            &mut id_set,
+                        )?);
+                    }
                 }
                 end_element(
                     document_id,
@@ -1846,6 +1929,118 @@ struct CellBuilder {
     grid_span: Option<String>,
     v_merge: Option<String>,
     blocks: Vec<SemanticBlock>,
+}
+
+#[derive(Debug)]
+struct TrackedChangeBuilder {
+    kind: TrackedChangeKind,
+    change_id: Option<String>,
+    author: Option<String>,
+    date_raw: Option<String>,
+    date_utc_raw: Option<String>,
+    rsid_r: Option<String>,
+    rsid_del: Option<String>,
+    rsid_p: Option<String>,
+    rsid_rpr: Option<String>,
+    inline_items: Vec<SemanticInline>,
+    seen_text: bool,
+    anchor: SourceAnchor,
+}
+
+impl TrackedChangeBuilder {
+    fn new(
+        _source_part_path: &str,
+        local_name: &str,
+        attrs: &BTreeMap<String, String>,
+        anchor: SourceAnchor,
+    ) -> Self {
+        Self {
+            kind: tracked_change_kind(local_name),
+            change_id: attr_named(attrs, "id")
+                .cloned()
+                .or_else(|| attrs.get("w:id").cloned()),
+            author: attr_named(attrs, "author")
+                .cloned()
+                .or_else(|| attrs.get("w:author").cloned()),
+            date_raw: attr_named(attrs, "date")
+                .cloned()
+                .or_else(|| attrs.get("w:date").cloned()),
+            date_utc_raw: attrs
+                .get("w16du:dateUtc")
+                .cloned()
+                .or_else(|| attrs.get("dateUtc").cloned()),
+            rsid_r: attrs.get("w:rsidR").cloned(),
+            rsid_del: attrs.get("w:rsidDel").cloned(),
+            rsid_p: attrs.get("w:rsidP").cloned(),
+            rsid_rpr: attrs.get("w:rsidRPr").cloned(),
+            inline_items: Vec::new(),
+            seen_text: false,
+            anchor,
+        }
+    }
+
+    fn finish(
+        self,
+        document_id: &DocumentId,
+        local_name: &str,
+        source_part_path: &str,
+        document_digest: &str,
+        id_set: &mut BTreeSet<String>,
+    ) -> Result<TrackedChange, DocxImportError> {
+        let id = TrackedChangeId(format!(
+            "tr:{local_name}:{}",
+            &hex::encode(Sha256::digest(
+                format!("{source_part_path}|{local_name}|{}", self.anchor.xml_path).as_bytes()
+            ))[..24]
+        ));
+        let anchor_xml_path = self.anchor.xml_path.clone();
+        Ok(TrackedChange {
+            id,
+            kind: self.kind,
+            metadata: TrackedChangeMetadata {
+                change_id: self.change_id,
+                author: self.author,
+                date_raw: self.date_raw,
+                date_utc_raw: self.date_utc_raw,
+                date: None,
+                date_utc: None,
+                rsid_r: self.rsid_r,
+                rsid_del: self.rsid_del,
+                rsid_p: self.rsid_p,
+                rsid_rpr: self.rsid_rpr,
+            },
+            content: TrackedContent::Inline {
+                items: self.inline_items,
+            },
+            source_anchor: self.anchor,
+            semantic_node_id: semantic_id(
+                document_id,
+                source_part_path,
+                "tracked-change",
+                None,
+                &anchor_xml_path,
+                document_digest,
+                id_set,
+            )?,
+            references: Vec::new(),
+        })
+    }
+}
+
+fn tracked_change_kind(local_name: &str) -> TrackedChangeKind {
+    match local_name {
+        "ins" => TrackedChangeKind::Insertion,
+        "del" => TrackedChangeKind::Deletion,
+        "moveFrom" => TrackedChangeKind::MoveFrom,
+        "moveTo" => TrackedChangeKind::MoveTo,
+        "pPrChange" => TrackedChangeKind::ParagraphProperties,
+        "rPrChange" => TrackedChangeKind::RunProperties,
+        "tblPrChange" => TrackedChangeKind::TableProperties,
+        "trPrChange" => TrackedChangeKind::TableRowProperties,
+        "tcPrChange" => TrackedChangeKind::TableCellProperties,
+        "sectPrChange" => TrackedChangeKind::SectionProperties,
+        _ => TrackedChangeKind::Unknown,
+    }
 }
 
 fn parse_styles(bytes: &[u8]) -> Result<StyleRegistryProjection, DocxImportError> {
@@ -2412,6 +2607,32 @@ fn resolve_block_references(
                 }
             }
         }
+        SemanticBlock::TrackedChange(change) => {
+            resolve_tracked_change_references(change, styles, numbering, relationships);
+        }
+    }
+}
+
+fn resolve_tracked_change_references(
+    change: &mut TrackedChange,
+    styles: Option<&StyleRegistryProjection>,
+    numbering: Option<&NumberingRegistryProjection>,
+    relationships: &[OpcRelationship],
+) {
+    match &mut change.content {
+        TrackedContent::Inline { items } => {
+            for inline in items {
+                if let SemanticInline::TrackedChange(inner) = inline {
+                    resolve_tracked_change_references(inner, styles, numbering, relationships);
+                }
+            }
+        }
+        TrackedContent::Block { blocks } => {
+            for block in blocks {
+                resolve_block_references(block, styles, numbering, relationships);
+            }
+        }
+        TrackedContent::PropertyChange { .. } => {}
     }
 }
 
@@ -2512,7 +2733,8 @@ fn resolve_run_story_references(run: &mut SemanticRun, relationships: &[OpcRelat
             | SemanticInline::CommentRangeEnd { .. }
             | SemanticInline::Text(_)
             | SemanticInline::Tab
-            | SemanticInline::LineBreak { .. } => {}
+            | SemanticInline::LineBreak { .. }
+            | SemanticInline::TrackedChange(_) => {}
         }
     }
 }
@@ -2779,7 +3001,93 @@ fn collect_story_references(blocks: &[SemanticBlock], references: &mut Vec<Story
                     }
                 }
             }
+            SemanticBlock::TrackedChange(change) => {
+                collect_track_change_story_references(change, references)
+            }
         }
+    }
+}
+
+fn collect_track_change_story_references(
+    change: &TrackedChange,
+    references: &mut Vec<StoryReference>,
+) {
+    match &change.content {
+        TrackedContent::Inline { items } => {
+            for inline in items {
+                match inline {
+                    SemanticInline::FootnoteReference {
+                        note_id,
+                        resolved_part_path,
+                    } => references.push(StoryReference {
+                        kind: StoryReferenceKind::FootnoteReference,
+                        source_anchor: change.source_anchor.clone(),
+                        source_identifier: Some(note_id.clone()),
+                        relationship_id: None,
+                        relationship_type: None,
+                        target: None,
+                        target_mode: None,
+                        resolved_part_path: resolved_part_path.clone(),
+                    }),
+                    SemanticInline::EndnoteReference {
+                        note_id,
+                        resolved_part_path,
+                    } => references.push(StoryReference {
+                        kind: StoryReferenceKind::EndnoteReference,
+                        source_anchor: change.source_anchor.clone(),
+                        source_identifier: Some(note_id.clone()),
+                        relationship_id: None,
+                        relationship_type: None,
+                        target: None,
+                        target_mode: None,
+                        resolved_part_path: resolved_part_path.clone(),
+                    }),
+                    SemanticInline::CommentReference {
+                        comment_id,
+                        resolved_part_path,
+                    } => references.push(StoryReference {
+                        kind: StoryReferenceKind::CommentReference,
+                        source_anchor: change.source_anchor.clone(),
+                        source_identifier: Some(comment_id.clone()),
+                        relationship_id: None,
+                        relationship_type: None,
+                        target: None,
+                        target_mode: None,
+                        resolved_part_path: resolved_part_path.clone(),
+                    }),
+                    SemanticInline::CommentRangeStart { comment_id } => {
+                        references.push(StoryReference {
+                            kind: StoryReferenceKind::CommentRangeStart,
+                            source_anchor: change.source_anchor.clone(),
+                            source_identifier: Some(comment_id.clone()),
+                            relationship_id: None,
+                            relationship_type: None,
+                            target: None,
+                            target_mode: None,
+                            resolved_part_path: None,
+                        })
+                    }
+                    SemanticInline::CommentRangeEnd { comment_id } => {
+                        references.push(StoryReference {
+                            kind: StoryReferenceKind::CommentRangeEnd,
+                            source_anchor: change.source_anchor.clone(),
+                            source_identifier: Some(comment_id.clone()),
+                            relationship_id: None,
+                            relationship_type: None,
+                            target: None,
+                            target_mode: None,
+                            resolved_part_path: None,
+                        })
+                    }
+                    SemanticInline::Text(_)
+                    | SemanticInline::Tab
+                    | SemanticInline::LineBreak { .. }
+                    | SemanticInline::TrackedChange(_) => {}
+                }
+            }
+        }
+        TrackedContent::Block { blocks } => collect_story_references(blocks, references),
+        TrackedContent::PropertyChange { .. } => {}
     }
 }
 
@@ -2846,6 +3154,9 @@ fn collect_run_story_references(run: &SemanticRun, references: &mut Vec<StoryRef
                 resolved_part_path: None,
             }),
             SemanticInline::Text(_) | SemanticInline::Tab | SemanticInline::LineBreak { .. } => {}
+            SemanticInline::TrackedChange(change) => {
+                collect_track_change_story_references(change, references)
+            }
         }
     }
 }
@@ -2885,7 +3196,8 @@ fn collect_comment_ranges(
                             | SemanticInline::LineBreak { .. }
                             | SemanticInline::FootnoteReference { .. }
                             | SemanticInline::EndnoteReference { .. }
-                            | SemanticInline::CommentReference { .. } => {}
+                            | SemanticInline::CommentReference { .. }
+                            | SemanticInline::TrackedChange(_) => {}
                         }
                     }
                 }
@@ -2897,7 +3209,53 @@ fn collect_comment_ranges(
                     }
                 }
             }
+            SemanticBlock::TrackedChange(change) => {
+                collect_track_change_comment_ranges(change, ranges_by_comment)
+            }
         }
+    }
+}
+
+fn collect_track_change_comment_ranges(
+    change: &TrackedChange,
+    ranges_by_comment: &mut BTreeMap<String, Vec<CommentRangeProjection>>,
+) {
+    match &change.content {
+        TrackedContent::Inline { items } => {
+            for inline in items {
+                match inline {
+                    SemanticInline::CommentRangeStart { comment_id } => {
+                        ranges_by_comment
+                            .entry(comment_id.clone())
+                            .or_default()
+                            .push(CommentRangeProjection {
+                                comment_id: comment_id.clone(),
+                                kind: StoryReferenceKind::CommentRangeStart,
+                                source_anchor: change.source_anchor.clone(),
+                            });
+                    }
+                    SemanticInline::CommentRangeEnd { comment_id } => {
+                        ranges_by_comment
+                            .entry(comment_id.clone())
+                            .or_default()
+                            .push(CommentRangeProjection {
+                                comment_id: comment_id.clone(),
+                                kind: StoryReferenceKind::CommentRangeEnd,
+                                source_anchor: change.source_anchor.clone(),
+                            });
+                    }
+                    SemanticInline::Text(_)
+                    | SemanticInline::Tab
+                    | SemanticInline::LineBreak { .. }
+                    | SemanticInline::FootnoteReference { .. }
+                    | SemanticInline::EndnoteReference { .. }
+                    | SemanticInline::CommentReference { .. }
+                    | SemanticInline::TrackedChange(_) => {}
+                }
+            }
+        }
+        TrackedContent::Block { blocks } => collect_comment_ranges(blocks, ranges_by_comment),
+        TrackedContent::PropertyChange { .. } => {}
     }
 }
 
@@ -3045,6 +3403,11 @@ fn collect_numbering_reference_diagnostics(
                             diagnostics,
                         );
                     }
+                }
+            }
+            SemanticBlock::TrackedChange(change) => {
+                if let TrackedContent::Block { blocks } = &change.content {
+                    collect_numbering_reference_diagnostics(blocks, numbering, diagnostics);
                 }
             }
         }
@@ -3928,6 +4291,14 @@ mod tests {
                         for block in &cell.blocks {
                             collect_block_ids(block, ids);
                         }
+                    }
+                }
+            }
+            SemanticBlock::TrackedChange(change) => {
+                ids.push(change.semantic_node_id.as_str().to_owned());
+                if let TrackedContent::Block { blocks } = &change.content {
+                    for block in blocks {
+                        collect_block_ids(block, ids);
                     }
                 }
             }

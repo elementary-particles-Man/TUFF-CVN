@@ -22,7 +22,7 @@ pub const MANIFEST_FILE: &str = "cvn.json";
 
 /// Content-addressed object prefix inside a CVN preservation package.
 pub const SHA256_OBJECT_PREFIX: &str = "objects/sha256";
-pub const INTEGRITY_VERSION: &str = "cvn-integrity-v5-story-parts";
+pub const INTEGRITY_VERSION: &str = "cvn-integrity-v6-track-changes";
 
 const DOMAIN_PAYLOAD: &[u8] = b"TUFF-CVN\0payload\0";
 const DOMAIN_PART_MAP: &[u8] = b"TUFF-CVN\0part-map\0";
@@ -32,6 +32,7 @@ const DOMAIN_SEMANTIC: &[u8] = b"TUFF-CVN\0semantic\0";
 const DOMAIN_STYLES: &[u8] = b"TUFF-CVN\0styles\0";
 const DOMAIN_NUMBERING: &[u8] = b"TUFF-CVN\0numbering\0";
 const DOMAIN_STORIES: &[u8] = b"TUFF-CVN\0stories\0";
+const DOMAIN_TRACK_CHANGES: &[u8] = b"TUFF-CVN\0track-changes\0";
 const DOMAIN_OBJECTS: &[u8] = b"TUFF-CVN\0objects\0";
 const DOMAIN_ROOT: &[u8] = b"TUFF-CVN\0root\0";
 
@@ -399,6 +400,11 @@ fn calculate_integrity_nodes(
             to_canonical_bytes(&document.semantic.stories)?,
         ),
         (
+            IntegrityNodeKind::TrackChangesProjection,
+            DOMAIN_TRACK_CHANGES,
+            to_canonical_bytes(&document.track_changes)?,
+        ),
+        (
             IntegrityNodeKind::Objects,
             DOMAIN_OBJECTS,
             to_canonical_bytes(&object_inventory_projection(objects))?,
@@ -439,7 +445,7 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn integrity_node_order() -> [IntegrityNodeKind; 9] {
+fn integrity_node_order() -> [IntegrityNodeKind; 10] {
     [
         IntegrityNodeKind::CanonicalPayload,
         IntegrityNodeKind::PartMap,
@@ -449,6 +455,7 @@ fn integrity_node_order() -> [IntegrityNodeKind; 9] {
         IntegrityNodeKind::StyleProjection,
         IntegrityNodeKind::NumberingProjection,
         IntegrityNodeKind::StoryProjection,
+        IntegrityNodeKind::TrackChangesProjection,
         IntegrityNodeKind::Objects,
     ]
 }
@@ -463,6 +470,7 @@ fn mismatch_code(kind: IntegrityNodeKind) -> &'static str {
         IntegrityNodeKind::StyleProjection => "CVN_STYLE_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::NumberingProjection => "CVN_NUMBERING_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::StoryProjection => "CVN_STORY_PROJECTION_DIGEST_MISMATCH",
+        IntegrityNodeKind::TrackChangesProjection => "CVN_TRACK_CHANGES_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::Objects => "CVN_OBJECT_INVENTORY_DIGEST_MISMATCH",
     }
 }
