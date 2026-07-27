@@ -17,9 +17,10 @@ use cvn_core::{
     SemanticTableCell, SemanticTableRow, SemanticText, SourceAnchor, SourceDescriptor,
     SourceFormat, StoryPartKind, StoryPartProjection, StoryReference, StoryReferenceKind,
     StoryRegistryProjection, StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference,
-    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode, TrackedChange,
-    TrackedChangeId, TrackedChangeKind, TrackedChangeMetadata, TrackedContent,
-    UnsupportedFeatureHandling, UnsupportedSemanticFeature, ZipEntryMetadata,
+    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
+    TrackChangesProjection, TrackedChange, TrackedChangeId, TrackedChangeKind,
+    TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling, UnsupportedSemanticFeature,
+    ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
 use quick_xml::events::Event;
@@ -256,8 +257,10 @@ pub fn import_docx_with_limits(
     };
     if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/document.xml")
     {
-        document.semantic =
+        let (semantic, track_changes) =
             parse_semantic_document(&document.document_id, "word/document.xml", bytes)?;
+        document.semantic = semantic;
+        document.track_changes = track_changes;
     }
     if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/styles.xml") {
         document.semantic.styles = Some(parse_styles(bytes)?);
@@ -266,12 +269,41 @@ pub fn import_docx_with_limits(
     {
         document.semantic.numbering = Some(parse_numbering(bytes)?);
     }
-    document.semantic.stories = build_story_registry(
+    let (stories, story_track_changes) = build_story_registry(
         &document.document_id,
         &raw_parts,
         &objects_by_digest,
         &document.semantic.blocks,
     )?;
+    document.semantic.stories = stories;
+    if let Some(mut projection) = document.track_changes.take() {
+        for child in story_track_changes {
+            projection.changes.extend(child.changes);
+            projection.move_ranges.extend(child.move_ranges);
+            projection.diagnostics.extend(child.diagnostics);
+            projection
+                .unsupported_features
+                .extend(child.unsupported_features);
+        }
+        document.track_changes = Some(projection);
+    } else if !story_track_changes.is_empty() {
+        let mut projection = TrackChangesProjection {
+            source_part: "docx-track-changes".to_owned(),
+            changes: Vec::new(),
+            move_ranges: Vec::new(),
+            diagnostics: Vec::new(),
+            unsupported_features: Vec::new(),
+        };
+        for child in story_track_changes {
+            projection.changes.extend(child.changes);
+            projection.move_ranges.extend(child.move_ranges);
+            projection.diagnostics.extend(child.diagnostics);
+            projection
+                .unsupported_features
+                .extend(child.unsupported_features);
+        }
+        document.track_changes = Some(projection);
+    }
     resolve_semantic_references(&mut document.semantic, &document.opc.relationships);
 
     let objects = objects_by_digest
@@ -304,7 +336,7 @@ fn build_story_registry(
     raw_parts: &[RawPart],
     objects_by_digest: &BTreeMap<String, Vec<u8>>,
     semantic_blocks: &[SemanticBlock],
-) -> Result<Option<StoryRegistryProjection>, DocxImportError> {
+) -> Result<(Option<StoryRegistryProjection>, Vec<TrackChangesProjection>), DocxImportError> {
     let mut registry = StoryRegistryProjection {
         source_part: "docx-story-registry".to_owned(),
         ..StoryRegistryProjection::default()
@@ -312,6 +344,7 @@ fn build_story_registry(
     let mut has_candidates = contains_story_references(semantic_blocks);
     let mut story_id_set = BTreeSet::new();
     let mut diagnostics = Vec::new();
+    let mut track_changes = Vec::new();
 
     for part in raw_parts {
         if let Some(kind) = classify_story_part(&part.path) {
@@ -324,7 +357,11 @@ fn build_story_registry(
                 | StoryPartKind::FooterEven => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
-                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let (semantic, track_change) =
+                            parse_semantic_document(document_id, &part.path, bytes)?;
+                        if let Some(track_change) = track_change {
+                            track_changes.push(track_change);
+                        }
                         let id = semantic_id(
                             document_id,
                             &part.path,
@@ -356,7 +393,11 @@ fn build_story_registry(
                 StoryPartKind::Footnotes => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
-                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let (semantic, track_change) =
+                            parse_semantic_document(document_id, &part.path, bytes)?;
+                        if let Some(track_change) = track_change {
+                            track_changes.push(track_change);
+                        }
                         let items = collect_note_items(
                             document_id,
                             &part.path,
@@ -407,7 +448,11 @@ fn build_story_registry(
                 StoryPartKind::Endnotes => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
-                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let (semantic, track_change) =
+                            parse_semantic_document(document_id, &part.path, bytes)?;
+                        if let Some(track_change) = track_change {
+                            track_changes.push(track_change);
+                        }
                         let items = collect_note_items(
                             document_id,
                             &part.path,
@@ -458,7 +503,11 @@ fn build_story_registry(
                 StoryPartKind::Comments => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
-                        let semantic = parse_semantic_document(document_id, &part.path, bytes)?;
+                        let (semantic, track_change) =
+                            parse_semantic_document(document_id, &part.path, bytes)?;
+                        if let Some(track_change) = track_change {
+                            track_changes.push(track_change);
+                        }
                         let items = collect_comment_items(
                             document_id,
                             &part.path,
@@ -512,7 +561,7 @@ fn build_story_registry(
     }
 
     if !has_candidates {
-        return Ok(None);
+        return Ok((None, track_changes));
     }
 
     registry.parts.sort_by(|left, right| {
@@ -520,7 +569,7 @@ fn build_story_registry(
             .cmp(&right.source_part)
             .then(left.kind.cmp(&right.kind))
     });
-    Ok(Some(registry))
+    Ok((Some(registry), track_changes))
 }
 
 fn blocks_with_prefix(blocks: &[SemanticBlock], prefix: &str) -> Vec<SemanticBlock> {
@@ -1084,7 +1133,7 @@ fn parse_semantic_document(
     document_id: &DocumentId,
     source_part_path: &str,
     bytes: &[u8],
-) -> Result<SemanticDocument, DocxImportError> {
+) -> Result<(SemanticDocument, Option<TrackChangesProjection>), DocxImportError> {
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     let document_digest = sha256_hex(bytes);
@@ -1584,14 +1633,29 @@ fn parse_semantic_document(
             .xml_path
             .cmp(&right.source_anchor.xml_path)
     });
-    Ok(SemanticDocument {
-        source_part: "word/document.xml".to_owned(),
-        blocks,
-        styles: None,
-        numbering: None,
-        stories: None,
-        unsupported_features,
-    })
+    let track_changes = if tracked_changes.is_empty() {
+        None
+    } else {
+        Some(TrackChangesProjection {
+            source_part: source_part_path.to_owned(),
+            changes: tracked_changes,
+            move_ranges: Vec::new(),
+            diagnostics: Vec::new(),
+            unsupported_features: Vec::new(),
+        })
+    };
+
+    Ok((
+        SemanticDocument {
+            source_part: "word/document.xml".to_owned(),
+            blocks,
+            styles: None,
+            numbering: None,
+            stories: None,
+            unsupported_features,
+        },
+        track_changes,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4203,6 +4267,25 @@ mod tests {
         path
     }
 
+    fn write_track_changes_docx(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w16du="http://schemas.microsoft.com/office/word/2018/wordml/cex"><w:body><w:p w14:paraId="11111111"><w:ins w:id="1" w:author="Alice" w:date="2026-01-01T00:00:00Z" w16du:dateUtc="2026-01-01T00:00:00Z"><w:r><w:t>inserted</w:t></w:r></w:ins><w:del w:id="2" w:author="Bob" w:date="not-a-date" w:rsidDel="00A1"><w:r><w:delText>deleted</w:delText></w:r></w:del><w:moveFrom w:id="3"><w:r><w:t>moved from</w:t></w:r></w:moveFrom><w:moveTo w:id="3"><w:r><w:t>moved to</w:t></w:r></w:moveTo></w:p><w:moveFromRangeStart w:id="9"/><w:moveToRangeStart w:id="10"/><w:moveToRangeEnd w:id="10"/><w:p><w:pPr><w:pPrChange w:id="11"><w:pPr><w:pStyle w:val="BodyText"/></w:pPr></w:pPrChange></w:pPr><w:r><w:rPrChange w:id="12"><w:rPr><w:b/></w:rPr></w:rPrChange></w:r></w:p><w:tbl><w:tr><w:trPr><w:trPrChange w:id="13"><w:trPr/></w:trPrChange></w:trPr><w:tc><w:tcPr><w:tcPrChange w:id="14"><w:tcPr/></w:tcPrChange></w:tcPr><w:p><w:r><w:t>table</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr><w:sectPrChange w:id="15"><w:sectPr/></w:sectPrChange></w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/><w:footnoteReference w:id="1"/></w:body></w:document>"#);
+        add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:ins w:id="20" w:author="Header"><w:r><w:t>header inserted</w:t></w:r></w:ins></w:p></w:hdr>"#);
+        add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:del w:id="21" w:author="Footnote"><w:r><w:delText>footnote deleted</w:delText></w:r></w:del></w:p></w:footnote></w:footnotes>"#);
+        zip.finish().unwrap();
+        path
+    }
+
     fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         for block in &document.blocks {
@@ -4272,6 +4355,56 @@ mod tests {
         let package = import_docx(&docx).unwrap();
         assert!(package.document.semantic.stories.is_none());
         let _ = fs::remove_file(docx);
+    }
+
+    #[test]
+    fn track_changes_fixture_is_projected_and_deterministic() {
+        let docx = write_track_changes_docx("track-changes");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(first.document.track_changes, second.document.track_changes);
+        let track_changes = first.document.track_changes.as_ref().unwrap();
+        assert!(track_changes
+            .changes
+            .iter()
+            .any(|change| matches!(change.kind, TrackedChangeKind::Insertion)));
+        assert!(track_changes
+            .changes
+            .iter()
+            .any(|change| matches!(change.kind, TrackedChangeKind::Deletion)));
+        assert!(track_changes
+            .changes
+            .iter()
+            .any(|change| matches!(change.kind, TrackedChangeKind::MoveFrom)));
+        assert!(track_changes
+            .changes
+            .iter()
+            .any(|change| matches!(change.kind, TrackedChangeKind::MoveTo)));
+
+        let out1 =
+            std::env::temp_dir().join(format!("tuff-cvn-track-out-1-{}", std::process::id()));
+        let out2 =
+            std::env::temp_dir().join(format!("tuff-cvn-track-out-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+        cvn_package::write_package(&out1, &first).unwrap();
+        cvn_package::write_package(&out2, &second).unwrap();
+        assert_eq!(
+            cvn_package::read_cvn_json_bytes(&out1).unwrap(),
+            cvn_package::read_cvn_json_bytes(&out2).unwrap()
+        );
+        assert_eq!(
+            cvn_package::verify_package_integrity(&out1)
+                .unwrap()
+                .root_actual,
+            cvn_package::verify_package_integrity(&out2)
+                .unwrap()
+                .root_actual
+        );
+        let _ = fs::remove_dir_all(&docx);
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
     }
 
     fn collect_block_ids(block: &SemanticBlock, ids: &mut Vec<String>) {
