@@ -3621,6 +3621,7 @@ fn parse_semantic_document(
                         || !field_stack.is_empty()
                     {
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3847,6 +3848,7 @@ fn parse_semantic_document(
                     }
                     "r" if name.is_wordprocessingml() => {
                         run_stack.push(RunBuilder {
+                            source_identifier: None,
                             anchor,
                             properties: RunPropertiesProjection::default(),
                             inlines: Vec::new(),
@@ -3876,6 +3878,7 @@ fn parse_semantic_document(
                     }
                     "tab" if name.is_wordprocessingml() => {
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3889,6 +3892,7 @@ fn parse_semantic_document(
                             .or_else(|| attrs.get("w:id").cloned())
                             .unwrap_or_default();
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3905,6 +3909,7 @@ fn parse_semantic_document(
                             .or_else(|| attrs.get("w:id").cloned())
                             .unwrap_or_default();
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3921,6 +3926,7 @@ fn parse_semantic_document(
                             .or_else(|| attrs.get("w:id").cloned())
                             .unwrap_or_default();
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3934,6 +3940,7 @@ fn parse_semantic_document(
                             .or_else(|| attrs.get("w:id").cloned())
                             .unwrap_or_default();
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3947,6 +3954,7 @@ fn parse_semantic_document(
                             .or_else(|| attrs.get("w:id").cloned())
                             .unwrap_or_default();
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -3959,6 +3967,7 @@ fn parse_semantic_document(
                     }
                     "br" | "cr" if name.is_wordprocessingml() => {
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4134,6 +4143,7 @@ fn parse_semantic_document(
                                     };
                                     let raw = instruction.raw.clone();
                                     append_inline(
+                                        &mut paragraph_stack,
                                         &mut run_stack,
                                         &mut active_change,
                                         &mut hyperlink_stack,
@@ -4176,6 +4186,7 @@ fn parse_semantic_document(
                             &mut id_set,
                         )?;
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4216,6 +4227,7 @@ fn parse_semantic_document(
                             &mut id_set,
                         )?;
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4243,6 +4255,7 @@ fn parse_semantic_document(
                         set_run_bool(&mut run_stack, "strike", &attrs)
                     }
                     "t" if name.is_wordprocessingml() => append_inline(
+                        &mut paragraph_stack,
                         &mut run_stack,
                         &mut active_change,
                         &mut hyperlink_stack,
@@ -4257,6 +4270,7 @@ fn parse_semantic_document(
                     ),
                     "tab" if name.is_wordprocessingml() => {
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4266,6 +4280,7 @@ fn parse_semantic_document(
                     }
                     "br" | "cr" if name.is_wordprocessingml() => {
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4320,6 +4335,7 @@ fn parse_semantic_document(
                 }
                 let preserve = text_preserve_stack.last().copied().unwrap_or(false);
                 append_inline(
+                    &mut paragraph_stack,
                     &mut run_stack,
                     &mut active_change,
                     &mut hyperlink_stack,
@@ -4346,6 +4362,7 @@ fn parse_semantic_document(
                 if name.local_name == "hyperlink" && name.is_wordprocessingml() {
                     if let Some(hyperlink) = hyperlink_stack.pop() {
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4369,6 +4386,7 @@ fn parse_semantic_document(
                     if let Some(field) = field_stack.pop() {
                         let raw = field.instruction_raw.clone();
                         append_inline(
+                            &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
@@ -4486,23 +4504,7 @@ fn end_element(
             if let Some(run) = run_stack.pop() {
                 if !run.inlines.is_empty() {
                     if let Some(paragraph) = paragraph_stack.last_mut() {
-                        let id = semantic_id(
-                            document_id,
-                            source_part_path,
-                            "run",
-                            None,
-                            &run.anchor.xml_path,
-                            document_digest,
-                            id_set,
-                        )?;
-                        paragraph.runs.push(SemanticRun {
-                            id,
-                            source_identifier: None,
-                            source_anchor: run.anchor,
-                            properties: run.properties,
-                            resolved_style: None,
-                            inlines: run.inlines,
-                        });
+                        paragraph.runs.push(run);
                     }
                 }
             }
@@ -4526,7 +4528,29 @@ fn end_element(
                     numbering: paragraph.numbering,
                     resolved_style: None,
                     section_story_references: paragraph.section_story_references,
-                    runs: paragraph.runs,
+                    runs: paragraph
+                        .runs
+                        .into_iter()
+                        .map(|run| {
+                            let id = semantic_id(
+                                document_id,
+                                source_part_path,
+                                "run",
+                                run.source_identifier.as_deref(),
+                                &run.anchor.xml_path,
+                                document_digest,
+                                id_set,
+                            )?;
+                            Ok(SemanticRun {
+                                id,
+                                source_identifier: run.source_identifier,
+                                source_anchor: run.anchor,
+                                properties: run.properties,
+                                resolved_style: None,
+                                inlines: run.inlines,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, DocxImportError>>()?,
                 });
                 push_block(block, table_stack, blocks);
             }
@@ -4679,6 +4703,7 @@ fn current_change_suppresses_semantic(active_change: &Option<TrackedChangeBuilde
 }
 
 fn append_inline(
+    paragraph_stack: &mut [ParagraphBuilder],
     run_stack: &mut [RunBuilder],
     active_change: &mut Option<TrackedChangeBuilder>,
     hyperlink_stack: &mut [HyperlinkBuilder],
@@ -4704,6 +4729,17 @@ fn append_inline(
     }
     if let Some(run) = run_stack.last_mut() {
         run.inlines.push(inline);
+    } else if let Some(paragraph) = paragraph_stack.last_mut() {
+        paragraph.runs.push(RunBuilder {
+            source_identifier: Some(format!(
+                "{}#paragraph-inline-{}",
+                paragraph.anchor.xml_path,
+                paragraph.runs.len()
+            )),
+            anchor: paragraph.anchor.clone(),
+            properties: RunPropertiesProjection::default(),
+            inlines: vec![inline],
+        });
     }
 }
 
@@ -4857,11 +4893,12 @@ struct ParagraphBuilder {
     properties: ParagraphPropertiesProjection,
     numbering: Option<NumberingReference>,
     section_story_references: Vec<HeaderFooterReferenceProjection>,
-    runs: Vec<SemanticRun>,
+    runs: Vec<RunBuilder>,
 }
 
 #[derive(Debug)]
 struct RunBuilder {
+    source_identifier: Option<String>,
     anchor: SourceAnchor,
     properties: RunPropertiesProjection,
     inlines: Vec<SemanticInline>,
@@ -8593,7 +8630,7 @@ mod tests {
         add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#);
         add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
         add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/><Relationship Id="rIdExt" Type="hyperlink" Target="https://example.invalid/reference?a=1&amp;b=2" TargetMode="External"/><Relationship Id="rIdInternal" Type="hyperlink" Target="footnotes.xml"/></Relationships>"#);
-        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:body><w:p><w:r><w:bookmarkStart w:id="1" w:name="BookmarkOne"/></w:r><w:r><w:t>bookmark one</w:t></w:r><w:r><w:bookmarkEnd w:id="1"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="2" w:name="DupName"/></w:r><w:r><w:t>dup a</w:t></w:r><w:r><w:bookmarkEnd w:id="2"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="3" w:name="DupName"/></w:r><w:r><w:t>dup b</w:t></w:r><w:r><w:bookmarkEnd w:id="3"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="4" w:name="MissingEnd"/></w:r><w:r><w:t>missing end</w:t></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdExt"><w:r><w:t>external link</w:t></w:r></w:hyperlink></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdInternal" w:anchor="BookmarkOne" w:tooltip="tip"><w:r><w:t>mixed link</w:t></w:r><w:ins w:id="40" w:author="Alice"><w:r><w:t> tracked insertion </w:t></w:r></w:ins><mc:AlternateContent><mc:Choice Requires="w"><w:r><w:t>mce link</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>mce fallback</w:t></w:r></mc:Fallback></mc:AlternateContent></w:hyperlink></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdMissing"><w:r><w:t>missing link</w:t></w:r></w:hyperlink></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:t>simple ref result</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" HYPERLINK &quot;javascript:alert(1)&quot; "><w:r><w:t>script result</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>complex result</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>outer </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> HYPERLINK \l &quot;BookmarkOne&quot; </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>inner</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" DDEAUTO cmd /x "><w:r><w:t>dde blocked</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" INCLUDETEXT &quot;file:///tmp/blocked.docx&quot; "><w:r><w:t>include blocked</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="41" w:author="Bob"><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>tracked field</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:t>mce field</w:t></w:r></w:fldSimple></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback field</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#);
+        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:body><w:p><w:r><w:bookmarkStart w:id="1" w:name="BookmarkOne"/></w:r><w:r><w:t>bookmark one</w:t></w:r><w:r><w:bookmarkEnd w:id="1"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="2" w:name="DupName"/></w:r><w:r><w:t>dup a</w:t></w:r><w:r><w:bookmarkEnd w:id="2"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="3" w:name="DupName"/></w:r><w:r><w:t>dup b</w:t></w:r><w:r><w:bookmarkEnd w:id="3"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="4" w:name="MissingEnd"/></w:r><w:r><w:t>missing end</w:t></w:r></w:p><w:p><w:bookmarkStart w:id="5" w:name="DirectBookmark"/><w:r><w:t>direct bookmark</w:t></w:r><w:bookmarkEnd w:id="5"/></w:p><w:p><w:r><w:hyperlink r:id="rIdExt"><w:r><w:t>external link</w:t></w:r></w:hyperlink></w:r></w:p><w:p><w:hyperlink r:id="rIdExt" w:anchor="DirectBookmark"><w:r><w:t>direct external link</w:t></w:r></w:hyperlink></w:p><w:p><w:r><w:hyperlink r:id="rIdInternal" w:anchor="BookmarkOne" w:tooltip="tip"><w:r><w:t>mixed link</w:t></w:r><w:ins w:id="40" w:author="Alice"><w:r><w:t> tracked insertion </w:t></w:r></w:ins><mc:AlternateContent><mc:Choice Requires="w"><w:r><w:t>mce link</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>mce fallback</w:t></w:r></mc:Fallback></mc:AlternateContent></w:hyperlink></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdMissing"><w:r><w:t>missing link</w:t></w:r></w:hyperlink></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:t>simple ref result</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:fldSimple w:instr=" REF DirectBookmark "><w:r><w:t>direct simple ref result</w:t></w:r></w:fldSimple></w:p><w:p><w:r><w:fldSimple w:instr=" HYPERLINK &quot;javascript:alert(1)&quot; "><w:r><w:t>script result</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>complex result</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>outer </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> HYPERLINK \l &quot;BookmarkOne&quot; </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>inner</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" DDEAUTO cmd /x "><w:r><w:t>dde blocked</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" INCLUDETEXT &quot;file:///tmp/blocked.docx&quot; "><w:r><w:t>include blocked</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="41" w:author="Bob"><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>tracked field</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:t>mce field</w:t></w:r></w:fldSimple></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback field</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#);
         add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:hyperlink w:anchor="BookmarkOne"><w:r><w:t>header link</w:t></w:r></w:hyperlink></w:r></w:p></w:hdr>"#);
         add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:bookmarkStart w:id="9" w:name="FootnoteMark"/></w:r><w:r><w:t>footnote text</w:t></w:r><w:r><w:bookmarkEnd w:id="9"/></w:r></w:p></w:footnote></w:footnotes>"#);
         zip.finish().unwrap();
@@ -8949,6 +8986,11 @@ mod tests {
                 && range.end.is_some()
         }));
         assert!(references.bookmark_ranges.iter().any(|range| {
+            range.bookmark_id == "5"
+                && range.name.as_deref() == Some("DirectBookmark")
+                && range.end.is_some()
+        }));
+        assert!(references.bookmark_ranges.iter().any(|range| {
             range.source_part == "word/footnotes.xml"
                 && range.name.as_deref() == Some("FootnoteMark")
         }));
@@ -8972,6 +9014,27 @@ mod tests {
                 .as_ref()
                 .and_then(|projection| projection.resolved_bookmark_id.as_deref()),
             Some("1")
+        );
+
+        let direct_simple_ref = references
+            .fields
+            .iter()
+            .find(|field| inline_text(&field.result.children).contains("direct simple ref result"))
+            .unwrap();
+        assert_eq!(direct_simple_ref.field_kind, FieldKind::Ref);
+        assert_eq!(
+            direct_simple_ref
+                .cross_reference
+                .as_ref()
+                .and_then(|projection| projection.target_bookmark_name.as_deref()),
+            Some("DirectBookmark")
+        );
+        assert_eq!(
+            direct_simple_ref
+                .cross_reference
+                .as_ref()
+                .and_then(|projection| projection.resolved_bookmark_id.as_deref()),
+            Some("5")
         );
 
         let hyperlink_field = references
@@ -9007,6 +9070,10 @@ mod tests {
             .fields
             .iter()
             .any(|field| inline_text(&field.result.children).contains("mce field")));
+        assert!(references.hyperlinks.iter().any(|hyperlink| {
+            hyperlink.anchor.as_deref() == Some("DirectBookmark")
+                && inline_text(&hyperlink.children).contains("direct external link")
+        }));
 
         assert!(semantic_contains_hyperlink_wrapper(
             &first.document.semantic
