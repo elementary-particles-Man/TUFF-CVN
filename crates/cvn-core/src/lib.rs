@@ -733,13 +733,22 @@ pub enum SemanticInline {
     CommentRangeEnd {
         comment_id: String,
     },
-    TrackedChange(TrackedChange),
+    TrackedChange {
+        change: Box<TrackedChange>,
+    },
     MceSelectedContent(MceSelectedContent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MceSelectedContent {
     pub projection: MceAlternateContentProjection,
+    pub projection_id: SemanticNodeId,
+    pub selected_branch_index: Option<usize>,
+    pub selected_branch_kind: MceSelection,
+    #[serde(default)]
+    pub blocks: Vec<SemanticBlock>,
+    #[serde(default)]
+    pub inlines: Vec<SemanticInline>,
 }
 
 /// Source anchor for semantic nodes.
