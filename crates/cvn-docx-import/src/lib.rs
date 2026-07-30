@@ -7,12 +7,16 @@ use std::path::Path;
 
 use base64::Engine;
 use cvn_core::{
-    AbstractNumberingProjection, CommentProjection, CommentRangeProjection, ContentTypeDefault,
-    ContentTypeOverride, ContentTypesProjection, CvnDocument, DocumentId,
-    HeaderFooterReferenceProjection, MceAlternateContentProjection, MceBranchKind,
-    MceBranchProjection, MceCapabilities, MceCompatibilityAttributes, MceNamespaceRequirement,
-    MceProjection, MceQualifiedName, MceResolutionDiagnostic, MceSelectedContent, MceSelection,
-    NoteProjection, NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
+    AbstractNumberingProjection, BookmarkBoundaryKind, BookmarkProjection, BookmarkRangeProjection,
+    CommentProjection, CommentRangeProjection, ContentTypeDefault, ContentTypeOverride,
+    ContentTypesProjection, CrossReferenceProjection, CvnDocument, DocumentId,
+    DocumentReferenceDiagnostic, DocumentReferencesProjection, FieldCharacterKind,
+    FieldCharacterKindProjection, FieldInstructionProjection, FieldKind, FieldProjection,
+    FieldResultProjection, HeaderFooterReferenceProjection, HyperlinkProjection, HyperlinkTarget,
+    HyperlinkTargetKind, MceAlternateContentProjection, MceBranchKind, MceBranchProjection,
+    MceCapabilities, MceCompatibilityAttributes, MceNamespaceRequirement, MceProjection,
+    MceQualifiedName, MceResolutionDiagnostic, MceSelectedContent, MceSelection, NoteProjection,
+    NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
     NumberingReference, NumberingRegistryProjection, NumberingResolutionDiagnostic,
     OfficeSignatureInfoProjection, OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship,
     OpcSignatureOriginProjection, OpcSignatureProjection, OpcSignatureRegistryProjection,
@@ -914,7 +918,19 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                                     return true;
                                 }
                             }
+                            SemanticInline::Hyperlink(hyperlink) => {
+                                if mce_inlines_contain_story_references(&hyperlink.children) {
+                                    return true;
+                                }
+                            }
+                            SemanticInline::Field(field) => {
+                                if mce_inlines_contain_story_references(&field.result.children) {
+                                    return true;
+                                }
+                            }
                             SemanticInline::Text(_)
+                            | SemanticInline::BookmarkStart(_)
+                            | SemanticInline::BookmarkEnd(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. } => {}
                         }
@@ -957,7 +973,17 @@ fn mce_inlines_contain_story_references(inlines: &[SemanticInline]) -> bool {
             contains_story_references(&content.blocks)
                 || mce_inlines_contain_story_references(&content.inlines)
         }
-        SemanticInline::Text(_) | SemanticInline::Tab | SemanticInline::LineBreak { .. } => false,
+        SemanticInline::Hyperlink(hyperlink) => {
+            mce_inlines_contain_story_references(&hyperlink.children)
+        }
+        SemanticInline::Field(field) => {
+            mce_inlines_contain_story_references(&field.result.children)
+        }
+        SemanticInline::Text(_)
+        | SemanticInline::BookmarkStart(_)
+        | SemanticInline::BookmarkEnd(_)
+        | SemanticInline::Tab
+        | SemanticInline::LineBreak { .. } => false,
     })
 }
 
@@ -2642,14 +2668,16 @@ fn signature_diag(code: &str, path: &str, message: &str) -> SignatureDiagnostic 
 }
 
 fn attributes(
-    _reader: &Reader<Cursor<&[u8]>>,
+    reader: &Reader<Cursor<&[u8]>>,
     event: &quick_xml::events::BytesStart<'_>,
 ) -> Result<BTreeMap<String, String>, quick_xml::Error> {
     let mut attrs = BTreeMap::new();
     for attr in event.attributes() {
         let attr = attr?;
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        let value = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+        let value = attr
+            .decode_and_unescape_value(reader.decoder())?
+            .into_owned();
         if let Some((_, local_name)) = key.split_once(':') {
             attrs.entry(local_name.to_owned()).or_insert(value.clone());
         }
@@ -2665,7 +2693,7 @@ fn namespace_declarations(
     for attr in event.attributes() {
         let attr = attr?;
         let key = String::from_utf8_lossy(attr.key.as_ref());
-        let value = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+        let value = attr.unescape_value()?.into_owned();
         if key == "xmlns" {
             declarations.insert(String::new(), value);
         } else if let Some(prefix) = key.strip_prefix("xmlns:") {
@@ -3550,7 +3578,10 @@ fn parse_semantic_document(
     let mut table_stack: Vec<TableBuilder> = Vec::new();
     let mut tracked_changes: Vec<TrackedChange> = Vec::new();
     let mut active_change: Option<TrackedChangeBuilder> = None;
+    let mut hyperlink_stack: Vec<HyperlinkBuilder> = Vec::new();
+    let mut field_stack: Vec<FieldBuilder> = Vec::new();
     let mut text_preserve_stack: Vec<bool> = Vec::new();
+    let mut instr_text_stack: Vec<()> = Vec::new();
     let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
     let mut id_set = BTreeSet::new();
     let mut section_index = 0_u64;
@@ -3585,16 +3616,17 @@ fn parse_semantic_document(
                     )?;
                     let content =
                         build_mce_selected_content(document_id, source_part_path, projection)?;
-                    if !run_stack.is_empty() {
-                        if let Some(change) = active_change.as_mut() {
-                            change
-                                .inline_items
-                                .push(SemanticInline::MceSelectedContent(content.clone()));
-                        }
-                        if let Some(run) = run_stack.last_mut() {
-                            run.inlines
-                                .push(SemanticInline::MceSelectedContent(content));
-                        }
+                    if !run_stack.is_empty()
+                        || !hyperlink_stack.is_empty()
+                        || !field_stack.is_empty()
+                    {
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::MceSelectedContent(content),
+                        );
                     } else {
                         push_block(
                             SemanticBlock::MceSelectedContent(content),
@@ -3618,6 +3650,100 @@ fn parse_semantic_document(
                             &attrs,
                             anchor.clone(),
                         ));
+                    }
+                    "hyperlink" if name.is_wordprocessingml() => {
+                        let id = semantic_id(
+                            document_id,
+                            source_part_path,
+                            "hyperlink",
+                            None,
+                            &anchor.xml_path,
+                            &document_digest,
+                            &mut id_set,
+                        )?;
+                        let target_kind =
+                            if attrs.get("r:id").is_some() || attr_named(&attrs, "id").is_some() {
+                                HyperlinkTargetKind::Unresolved
+                            } else if attrs.get("w:anchor").is_some()
+                                || attr_named(&attrs, "anchor").is_some()
+                            {
+                                HyperlinkTargetKind::InternalAnchor
+                            } else {
+                                HyperlinkTargetKind::Unresolved
+                            };
+                        hyperlink_stack.push(HyperlinkBuilder {
+                            id,
+                            anchor,
+                            relationship_id: attrs
+                                .get("r:id")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "id").cloned()),
+                            target: HyperlinkTarget {
+                                kind: target_kind,
+                                raw_target: None,
+                                resolved_part_path: None,
+                                relationship_type: None,
+                                risk_class: None,
+                            },
+                            anchor_target: attrs
+                                .get("w:anchor")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "anchor").cloned()),
+                            doc_location: attrs
+                                .get("w:docLocation")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "docLocation").cloned()),
+                            history: attrs
+                                .get("w:history")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "history").cloned()),
+                            target_frame: attrs
+                                .get("w:tgtFrame")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "tgtFrame").cloned()),
+                            tooltip: attrs
+                                .get("w:tooltip")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "tooltip").cloned()),
+                            children: Vec::new(),
+                        });
+                    }
+                    "fldSimple" if name.is_wordprocessingml() => {
+                        let id = semantic_id(
+                            document_id,
+                            source_part_path,
+                            "field",
+                            None,
+                            &anchor.xml_path,
+                            &document_digest,
+                            &mut id_set,
+                        )?;
+                        field_stack.push(FieldBuilder {
+                            id,
+                            anchor: anchor.clone(),
+                            instruction_raw: attrs
+                                .get("w:instr")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "instr").cloned())
+                                .unwrap_or_default(),
+                            result_children: Vec::new(),
+                            markers: vec![FieldCharacterKindProjection {
+                                kind: FieldCharacterKind::Simple,
+                                source_anchor: anchor,
+                            }],
+                            field_lock: attrs
+                                .get("w:fldLock")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "fldLock").cloned()),
+                            dirty: attrs
+                                .get("w:dirty")
+                                .cloned()
+                                .or_else(|| attr_named(&attrs, "dirty").cloned()),
+                            mode: FieldCaptureMode::Result,
+                        });
+                    }
+                    "instrText" if name.is_wordprocessingml() => {
+                        instr_text_stack.push(());
                     }
                     "p" if name.is_wordprocessingml() => {
                         let source_identifier = attrs.get("w14:paraId").cloned();
@@ -3749,80 +3875,98 @@ fn parse_semantic_document(
                         }
                     }
                     "tab" if name.is_wordprocessingml() => {
-                        if let Some(change) = active_change.as_mut() {
-                            change.inline_items.push(SemanticInline::Tab);
-                        }
-                        if let Some(run) = run_stack.last_mut() {
-                            run.inlines.push(SemanticInline::Tab);
-                        }
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Tab,
+                        );
                     }
                     "footnoteReference" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            let note_id = attr_named(&attrs, "id")
-                                .cloned()
-                                .or_else(|| attrs.get("w:id").cloned())
-                                .unwrap_or_default();
-                            run.inlines.push(SemanticInline::FootnoteReference {
+                        let note_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::FootnoteReference {
                                 note_id,
                                 resolved_part_path: None,
-                            });
-                        }
+                            },
+                        );
                     }
                     "endnoteReference" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            let note_id = attr_named(&attrs, "id")
-                                .cloned()
-                                .or_else(|| attrs.get("w:id").cloned())
-                                .unwrap_or_default();
-                            run.inlines.push(SemanticInline::EndnoteReference {
+                        let note_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::EndnoteReference {
                                 note_id,
                                 resolved_part_path: None,
-                            });
-                        }
+                            },
+                        );
                     }
                     "commentRangeStart" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            let comment_id = attr_named(&attrs, "id")
-                                .cloned()
-                                .or_else(|| attrs.get("w:id").cloned())
-                                .unwrap_or_default();
-                            run.inlines
-                                .push(SemanticInline::CommentRangeStart { comment_id });
-                        }
+                        let comment_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::CommentRangeStart { comment_id },
+                        );
                     }
                     "commentRangeEnd" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            let comment_id = attr_named(&attrs, "id")
-                                .cloned()
-                                .or_else(|| attrs.get("w:id").cloned())
-                                .unwrap_or_default();
-                            run.inlines
-                                .push(SemanticInline::CommentRangeEnd { comment_id });
-                        }
+                        let comment_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::CommentRangeEnd { comment_id },
+                        );
                     }
                     "commentReference" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            let comment_id = attr_named(&attrs, "id")
-                                .cloned()
-                                .or_else(|| attrs.get("w:id").cloned())
-                                .unwrap_or_default();
-                            run.inlines.push(SemanticInline::CommentReference {
+                        let comment_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::CommentReference {
                                 comment_id,
                                 resolved_part_path: None,
-                            });
-                        }
+                            },
+                        );
                     }
                     "br" | "cr" if name.is_wordprocessingml() => {
-                        if let Some(change) = active_change.as_mut() {
-                            change.inline_items.push(SemanticInline::LineBreak {
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::LineBreak {
                                 break_kind: name.local_name.clone(),
-                            });
-                        }
-                        if let Some(run) = run_stack.last_mut() {
-                            run.inlines.push(SemanticInline::LineBreak {
-                                break_kind: name.local_name.clone(),
-                            });
-                        }
+                            },
+                        );
                     }
                     "tbl" if name.is_wordprocessingml() => {
                         table_stack.push(TableBuilder {
@@ -3932,6 +4076,161 @@ fn parse_semantic_document(
                             }
                         }
                     }
+                    "fldChar" if name.is_wordprocessingml() => {
+                        let fld_type = attrs
+                            .get("w:fldCharType")
+                            .cloned()
+                            .or_else(|| attr_named(&attrs, "fldCharType").cloned())
+                            .unwrap_or_default();
+                        match fld_type.as_str() {
+                            "begin" => {
+                                let id = semantic_id(
+                                    document_id,
+                                    source_part_path,
+                                    "field",
+                                    None,
+                                    &anchor.xml_path,
+                                    &document_digest,
+                                    &mut id_set,
+                                )?;
+                                field_stack.push(FieldBuilder {
+                                    id,
+                                    anchor: anchor.clone(),
+                                    instruction_raw: String::new(),
+                                    result_children: Vec::new(),
+                                    markers: vec![FieldCharacterKindProjection {
+                                        kind: FieldCharacterKind::Begin,
+                                        source_anchor: anchor,
+                                    }],
+                                    field_lock: attrs
+                                        .get("w:fldLock")
+                                        .cloned()
+                                        .or_else(|| attr_named(&attrs, "fldLock").cloned()),
+                                    dirty: attrs
+                                        .get("w:dirty")
+                                        .cloned()
+                                        .or_else(|| attr_named(&attrs, "dirty").cloned()),
+                                    mode: FieldCaptureMode::Instruction,
+                                });
+                            }
+                            "separate" => {
+                                if let Some(field) = field_stack.last_mut() {
+                                    field.mode = FieldCaptureMode::Result;
+                                    field.markers.push(FieldCharacterKindProjection {
+                                        kind: FieldCharacterKind::Separate,
+                                        source_anchor: anchor,
+                                    });
+                                }
+                            }
+                            "end" => {
+                                if let Some(mut field) = field_stack.pop() {
+                                    field.markers.push(FieldCharacterKindProjection {
+                                        kind: FieldCharacterKind::End,
+                                        source_anchor: anchor,
+                                    });
+                                    let instruction = FieldInstructionProjection {
+                                        raw: field.instruction_raw,
+                                        tokens: Vec::new(),
+                                    };
+                                    let raw = instruction.raw.clone();
+                                    append_inline(
+                                        &mut run_stack,
+                                        &mut active_change,
+                                        &mut hyperlink_stack,
+                                        &mut field_stack,
+                                        SemanticInline::Field(FieldProjection {
+                                            id: field.id.clone(),
+                                            source_anchor: field.anchor,
+                                            field_kind: classify_field_kind(&raw),
+                                            instruction: FieldInstructionProjection {
+                                                tokens: instruction_tokens(&raw),
+                                                ..instruction
+                                            },
+                                            result: FieldResultProjection {
+                                                children: field.result_children,
+                                            },
+                                            character_markers: field.markers,
+                                            field_lock: field.field_lock,
+                                            dirty: field.dirty,
+                                            cross_reference: None,
+                                        }),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "bookmarkStart" if name.is_wordprocessingml() => {
+                        let bookmark_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        let node_key = format!("bookmark-start:{bookmark_id}");
+                        let id = semantic_id(
+                            document_id,
+                            source_part_path,
+                            "bookmark-start",
+                            Some(&node_key),
+                            &anchor.xml_path,
+                            &document_digest,
+                            &mut id_set,
+                        )?;
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::BookmarkStart(BookmarkProjection {
+                                id,
+                                source_anchor: anchor,
+                                bookmark_id,
+                                name: attrs
+                                    .get("w:name")
+                                    .cloned()
+                                    .or_else(|| attr_named(&attrs, "name").cloned()),
+                                column_first: attrs
+                                    .get("w:colFirst")
+                                    .cloned()
+                                    .or_else(|| attr_named(&attrs, "colFirst").cloned()),
+                                column_last: attrs
+                                    .get("w:colLast")
+                                    .cloned()
+                                    .or_else(|| attr_named(&attrs, "colLast").cloned()),
+                                boundary_kind: BookmarkBoundaryKind::Start,
+                            }),
+                        );
+                    }
+                    "bookmarkEnd" if name.is_wordprocessingml() => {
+                        let bookmark_id = attr_named(&attrs, "id")
+                            .cloned()
+                            .or_else(|| attrs.get("w:id").cloned())
+                            .unwrap_or_default();
+                        let node_key = format!("bookmark-end:{bookmark_id}");
+                        let id = semantic_id(
+                            document_id,
+                            source_part_path,
+                            "bookmark-end",
+                            Some(&node_key),
+                            &anchor.xml_path,
+                            &document_digest,
+                            &mut id_set,
+                        )?;
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::BookmarkEnd(BookmarkProjection {
+                                id,
+                                source_anchor: anchor,
+                                bookmark_id,
+                                name: None,
+                                column_first: None,
+                                column_last: None,
+                                boundary_kind: BookmarkBoundaryKind::End,
+                            }),
+                        );
+                    }
                     "rStyle" if name.is_wordprocessingml() => {
                         if let Some(run) = run_stack.last_mut() {
                             run.properties.run_style_id = attr_val(&attrs);
@@ -3943,25 +4242,38 @@ fn parse_semantic_document(
                     "strike" if name.is_wordprocessingml() => {
                         set_run_bool(&mut run_stack, "strike", &attrs)
                     }
-                    "t" if name.is_wordprocessingml() => push_text(
+                    "t" if name.is_wordprocessingml() => append_inline(
                         &mut run_stack,
-                        "",
-                        attrs
-                            .get("xml:space")
-                            .map(|value| value == "preserve")
-                            .unwrap_or(false),
+                        &mut active_change,
+                        &mut hyperlink_stack,
+                        &mut field_stack,
+                        SemanticInline::Text(SemanticText {
+                            value: String::new(),
+                            preserve_space: attrs
+                                .get("xml:space")
+                                .map(|value| value == "preserve")
+                                .unwrap_or(false),
+                        }),
                     ),
                     "tab" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            run.inlines.push(SemanticInline::Tab);
-                        }
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Tab,
+                        );
                     }
                     "br" | "cr" if name.is_wordprocessingml() => {
-                        if let Some(run) = run_stack.last_mut() {
-                            run.inlines.push(SemanticInline::LineBreak {
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::LineBreak {
                                 break_kind: name.local_name.clone(),
-                            });
-                        }
+                            },
+                        );
                     }
                     "gridSpan" if name.is_wordprocessingml() => {
                         if let Some(cell) = current_cell_mut(&mut table_stack) {
@@ -3999,24 +4311,24 @@ fn parse_semantic_document(
             }
             Event::Text(text) => {
                 let value = String::from_utf8_lossy(text.as_ref()).into_owned();
-                let preserve = text_preserve_stack.last().copied().unwrap_or(false);
-                if let Some(change) = active_change.as_mut() {
-                    change.inline_items.push(SemanticInline::Text(SemanticText {
-                        value: value.clone(),
-                        preserve_space: preserve,
-                    }));
-                }
-                if active_change
-                    .as_ref()
-                    .map(|change| {
-                        change.kind == TrackedChangeKind::Deletion
-                            || change.kind == TrackedChangeKind::MoveFrom
-                    })
-                    .unwrap_or(false)
-                {
+                if !instr_text_stack.is_empty() {
+                    if let Some(field) = field_stack.last_mut() {
+                        field.instruction_raw.push_str(&value);
+                    }
+                    buffer.clear();
                     continue;
                 }
-                push_text(&mut run_stack, &value, preserve);
+                let preserve = text_preserve_stack.last().copied().unwrap_or(false);
+                append_inline(
+                    &mut run_stack,
+                    &mut active_change,
+                    &mut hyperlink_stack,
+                    &mut field_stack,
+                    SemanticInline::Text(SemanticText {
+                        value,
+                        preserve_space: preserve,
+                    }),
+                );
             }
             Event::DocType(_) => {
                 return Err(DocxImportError::DoctypeNotAllowed {
@@ -4027,6 +4339,58 @@ fn parse_semantic_document(
                 let name = qname(event.name().as_ref(), &namespace_stack);
                 if name.local_name == "t" && name.is_wordprocessingml() {
                     text_preserve_stack.pop();
+                }
+                if name.local_name == "instrText" && name.is_wordprocessingml() {
+                    instr_text_stack.pop();
+                }
+                if name.local_name == "hyperlink" && name.is_wordprocessingml() {
+                    if let Some(hyperlink) = hyperlink_stack.pop() {
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Hyperlink(HyperlinkProjection {
+                                id: hyperlink.id,
+                                source_anchor: hyperlink.anchor,
+                                relationship_id: hyperlink.relationship_id,
+                                target: hyperlink.target,
+                                anchor: hyperlink.anchor_target,
+                                doc_location: hyperlink.doc_location,
+                                history: hyperlink.history,
+                                target_frame: hyperlink.target_frame,
+                                tooltip: hyperlink.tooltip,
+                                children: hyperlink.children,
+                            }),
+                        );
+                    }
+                }
+                if name.local_name == "fldSimple" && name.is_wordprocessingml() {
+                    if let Some(field) = field_stack.pop() {
+                        let raw = field.instruction_raw.clone();
+                        append_inline(
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Field(FieldProjection {
+                                id: field.id,
+                                source_anchor: field.anchor,
+                                field_kind: classify_field_kind(&raw),
+                                instruction: FieldInstructionProjection {
+                                    raw: raw.clone(),
+                                    tokens: instruction_tokens(&raw),
+                                },
+                                result: FieldResultProjection {
+                                    children: field.result_children,
+                                },
+                                character_markers: field.markers,
+                                field_lock: field.field_lock,
+                                dirty: field.dirty,
+                                cross_reference: None,
+                            }),
+                        );
+                    }
                 }
                 if matches!(
                     name.local_name.as_str(),
@@ -4096,6 +4460,7 @@ fn parse_semantic_document(
             styles: None,
             numbering: None,
             stories: None,
+            references: None,
             unsupported_features,
         },
         track_changes,
@@ -4119,24 +4484,26 @@ fn end_element(
     match local_name {
         "r" => {
             if let Some(run) = run_stack.pop() {
-                if let Some(paragraph) = paragraph_stack.last_mut() {
-                    let id = semantic_id(
-                        document_id,
-                        source_part_path,
-                        "run",
-                        None,
-                        &run.anchor.xml_path,
-                        document_digest,
-                        id_set,
-                    )?;
-                    paragraph.runs.push(SemanticRun {
-                        id,
-                        source_identifier: None,
-                        source_anchor: run.anchor,
-                        properties: run.properties,
-                        resolved_style: None,
-                        inlines: run.inlines,
-                    });
+                if !run.inlines.is_empty() {
+                    if let Some(paragraph) = paragraph_stack.last_mut() {
+                        let id = semantic_id(
+                            document_id,
+                            source_part_path,
+                            "run",
+                            None,
+                            &run.anchor.xml_path,
+                            document_digest,
+                            id_set,
+                        )?;
+                        paragraph.runs.push(SemanticRun {
+                            id,
+                            source_identifier: None,
+                            source_anchor: run.anchor,
+                            properties: run.properties,
+                            resolved_style: None,
+                            inlines: run.inlines,
+                        });
+                    }
                 }
             }
         }
@@ -4302,6 +4669,44 @@ fn attr_named<'a>(attrs: &'a BTreeMap<String, String>, name: &str) -> Option<&'a
     attrs.get(name).or_else(|| attrs.get(&format!("w:{name}")))
 }
 
+fn current_change_suppresses_semantic(active_change: &Option<TrackedChangeBuilder>) -> bool {
+    active_change
+        .as_ref()
+        .map(|change| {
+            change.kind == TrackedChangeKind::Deletion || change.kind == TrackedChangeKind::MoveFrom
+        })
+        .unwrap_or(false)
+}
+
+fn append_inline(
+    run_stack: &mut [RunBuilder],
+    active_change: &mut Option<TrackedChangeBuilder>,
+    hyperlink_stack: &mut [HyperlinkBuilder],
+    field_stack: &mut [FieldBuilder],
+    inline: SemanticInline,
+) {
+    if let Some(field) = field_stack.last_mut() {
+        if field.mode == FieldCaptureMode::Result {
+            field.result_children.push(inline);
+        }
+        return;
+    }
+    if let Some(hyperlink) = hyperlink_stack.last_mut() {
+        hyperlink.children.push(inline);
+        return;
+    }
+
+    if let Some(change) = active_change.as_mut() {
+        change.inline_items.push(inline.clone());
+    }
+    if current_change_suppresses_semantic(active_change) {
+        return;
+    }
+    if let Some(run) = run_stack.last_mut() {
+        run.inlines.push(inline);
+    }
+}
+
 fn set_run_bool(run_stack: &mut [RunBuilder], property: &str, attrs: &BTreeMap<String, String>) {
     let enabled = attrs
         .get("w:val")
@@ -4319,12 +4724,55 @@ fn set_run_bool(run_stack: &mut [RunBuilder], property: &str, attrs: &BTreeMap<S
     }
 }
 
-fn push_text(run_stack: &mut [RunBuilder], value: &str, preserve_space: bool) {
-    if let Some(run) = run_stack.last_mut() {
-        run.inlines.push(SemanticInline::Text(SemanticText {
-            value: value.to_owned(),
-            preserve_space,
-        }));
+fn instruction_tokens(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                current.push(ch);
+                quoted = !quoted;
+            }
+            ' ' | '\t' | '\r' | '\n' if !quoted => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn classify_field_kind(raw: &str) -> FieldKind {
+    let token = instruction_tokens(raw)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_ascii_uppercase();
+    match token.as_str() {
+        "REF" => FieldKind::Ref,
+        "PAGEREF" => FieldKind::Pageref,
+        "NOTEREF" => FieldKind::Noteref,
+        "HYPERLINK" => FieldKind::Hyperlink,
+        "PAGE" => FieldKind::Page,
+        "NUMPAGES" => FieldKind::Numpages,
+        "DATE" => FieldKind::Date,
+        "TIME" => FieldKind::Time,
+        "TOC" => FieldKind::Toc,
+        "SEQ" => FieldKind::Seq,
+        "SYMBOL" => FieldKind::Symbol,
+        "INCLUDETEXT" => FieldKind::IncludeText,
+        "INCLUDEPICTURE" => FieldKind::IncludePicture,
+        "LINK" => FieldKind::Link,
+        "DDE" | "DDEAUTO" => FieldKind::Dde,
+        _ => FieldKind::Unknown,
     }
 }
 
@@ -4453,6 +4901,38 @@ struct TrackedChangeBuilder {
     inline_items: Vec<SemanticInline>,
     seen_text: bool,
     anchor: SourceAnchor,
+}
+
+#[derive(Debug)]
+struct HyperlinkBuilder {
+    id: SemanticNodeId,
+    anchor: SourceAnchor,
+    relationship_id: Option<String>,
+    target: HyperlinkTarget,
+    anchor_target: Option<String>,
+    doc_location: Option<String>,
+    history: Option<String>,
+    target_frame: Option<String>,
+    tooltip: Option<String>,
+    children: Vec<SemanticInline>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldCaptureMode {
+    Instruction,
+    Result,
+}
+
+#[derive(Debug)]
+struct FieldBuilder {
+    id: SemanticNodeId,
+    anchor: SourceAnchor,
+    instruction_raw: String,
+    result_children: Vec<SemanticInline>,
+    markers: Vec<FieldCharacterKindProjection>,
+    field_lock: Option<String>,
+    dirty: Option<String>,
+    mode: FieldCaptureMode,
 }
 
 impl TrackedChangeBuilder {
@@ -5086,6 +5566,7 @@ fn resolve_semantic_references(semantic: &mut SemanticDocument, relationships: &
     if let Some(stories) = semantic.stories.as_mut() {
         resolve_story_registry(stories, &semantic.blocks, relationships);
     }
+    resolve_document_references(semantic, relationships);
 }
 
 fn resolve_block_references(
@@ -5249,9 +5730,17 @@ fn resolve_run_story_references(run: &mut SemanticRun, relationships: &[OpcRelat
                     resolve_block_references(child, None, None, relationships);
                 }
             }
+            SemanticInline::Hyperlink(hyperlink) => {
+                resolve_mce_inline_references(&mut hyperlink.children, relationships);
+            }
+            SemanticInline::Field(field) => {
+                resolve_mce_inline_references(&mut field.result.children, relationships);
+            }
             SemanticInline::CommentRangeStart { .. }
             | SemanticInline::CommentRangeEnd { .. }
             | SemanticInline::Text(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::TrackedChange { .. } => {}
@@ -5274,7 +5763,15 @@ fn resolve_mce_inline_references(
                     resolve_block_references(child, None, None, relationships);
                 }
             }
+            SemanticInline::Hyperlink(hyperlink) => {
+                resolve_mce_inline_references(&mut hyperlink.children, relationships);
+            }
+            SemanticInline::Field(field) => {
+                resolve_mce_inline_references(&mut field.result.children, relationships);
+            }
             SemanticInline::Text(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -5300,6 +5797,686 @@ fn resolve_story_part_for_comment(
     _comment_id: &str,
 ) -> Option<String> {
     Some(default_part.to_owned())
+}
+
+fn resolve_document_references(semantic: &mut SemanticDocument, relationships: &[OpcRelationship]) {
+    let mut projection = DocumentReferencesProjection {
+        source_part: semantic.source_part.clone(),
+        hyperlinks: Vec::new(),
+        bookmarks: Vec::new(),
+        bookmark_ranges: Vec::new(),
+        fields: Vec::new(),
+        cross_references: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut bookmark_starts = BTreeMap::<(String, String), BookmarkProjection>::new();
+    let mut bookmark_ends = BTreeMap::<(String, String), BookmarkProjection>::new();
+    let mut bookmark_names = BTreeMap::<(String, String), Vec<String>>::new();
+
+    collect_reference_phase_one(
+        &mut semantic.blocks,
+        relationships,
+        &mut projection,
+        &mut bookmark_starts,
+        &mut bookmark_ends,
+        &mut bookmark_names,
+    );
+    if let Some(stories) = semantic.stories.as_mut() {
+        for part in &mut stories.parts {
+            collect_reference_phase_one(
+                &mut part.blocks,
+                relationships,
+                &mut projection,
+                &mut bookmark_starts,
+                &mut bookmark_ends,
+                &mut bookmark_names,
+            );
+            for note in &mut part.notes {
+                collect_reference_phase_one(
+                    &mut note.blocks,
+                    relationships,
+                    &mut projection,
+                    &mut bookmark_starts,
+                    &mut bookmark_ends,
+                    &mut bookmark_names,
+                );
+            }
+            for comment in &mut part.comments {
+                collect_reference_phase_one(
+                    &mut comment.blocks,
+                    relationships,
+                    &mut projection,
+                    &mut bookmark_starts,
+                    &mut bookmark_ends,
+                    &mut bookmark_names,
+                );
+            }
+        }
+    }
+
+    build_bookmark_ranges(
+        &bookmark_starts,
+        &bookmark_ends,
+        &bookmark_names,
+        &mut projection,
+    );
+
+    collect_reference_phase_two(&mut semantic.blocks, &bookmark_names, &mut projection);
+    if let Some(stories) = semantic.stories.as_mut() {
+        for part in &mut stories.parts {
+            collect_reference_phase_two(&mut part.blocks, &bookmark_names, &mut projection);
+            for note in &mut part.notes {
+                collect_reference_phase_two(&mut note.blocks, &bookmark_names, &mut projection);
+            }
+            for comment in &mut part.comments {
+                collect_reference_phase_two(&mut comment.blocks, &bookmark_names, &mut projection);
+            }
+        }
+    }
+
+    projection.hyperlinks.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    projection.bookmarks.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    projection.bookmark_ranges.sort_by(|left, right| {
+        left.source_part
+            .cmp(&right.source_part)
+            .then(left.bookmark_id.cmp(&right.bookmark_id))
+    });
+    projection.fields.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    projection.cross_references.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    projection
+        .diagnostics
+        .sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    semantic.references = Some(projection);
+}
+
+fn collect_reference_phase_one(
+    blocks: &mut [SemanticBlock],
+    relationships: &[OpcRelationship],
+    projection: &mut DocumentReferencesProjection,
+    bookmark_starts: &mut BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_ends: &mut BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_names: &mut BTreeMap<(String, String), Vec<String>>,
+) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for run in &mut paragraph.runs {
+                    collect_reference_inlines_phase_one(
+                        &mut run.inlines,
+                        relationships,
+                        projection,
+                        bookmark_starts,
+                        bookmark_ends,
+                        bookmark_names,
+                    );
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        collect_reference_phase_one(
+                            &mut cell.blocks,
+                            relationships,
+                            projection,
+                            bookmark_starts,
+                            bookmark_ends,
+                            bookmark_names,
+                        );
+                    }
+                }
+            }
+            SemanticBlock::TrackedChange(change) => collect_reference_change_phase_one(
+                change,
+                relationships,
+                projection,
+                bookmark_starts,
+                bookmark_ends,
+                bookmark_names,
+            ),
+            SemanticBlock::MceSelectedContent(content) => {
+                collect_reference_phase_one(
+                    &mut content.blocks,
+                    relationships,
+                    projection,
+                    bookmark_starts,
+                    bookmark_ends,
+                    bookmark_names,
+                );
+                collect_reference_inlines_phase_one(
+                    &mut content.inlines,
+                    relationships,
+                    projection,
+                    bookmark_starts,
+                    bookmark_ends,
+                    bookmark_names,
+                );
+            }
+        }
+    }
+}
+
+fn collect_reference_change_phase_one(
+    change: &mut TrackedChange,
+    relationships: &[OpcRelationship],
+    projection: &mut DocumentReferencesProjection,
+    bookmark_starts: &mut BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_ends: &mut BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_names: &mut BTreeMap<(String, String), Vec<String>>,
+) {
+    match &mut change.content {
+        TrackedContent::Inline { items } => collect_reference_inlines_phase_one(
+            items,
+            relationships,
+            projection,
+            bookmark_starts,
+            bookmark_ends,
+            bookmark_names,
+        ),
+        TrackedContent::Block { blocks } => collect_reference_phase_one(
+            blocks,
+            relationships,
+            projection,
+            bookmark_starts,
+            bookmark_ends,
+            bookmark_names,
+        ),
+        TrackedContent::PropertyChange { .. } => {}
+    }
+}
+
+fn collect_reference_inlines_phase_one(
+    inlines: &mut [SemanticInline],
+    relationships: &[OpcRelationship],
+    projection: &mut DocumentReferencesProjection,
+    bookmark_starts: &mut BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_ends: &mut BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_names: &mut BTreeMap<(String, String), Vec<String>>,
+) {
+    for inline in inlines {
+        match inline {
+            SemanticInline::Hyperlink(hyperlink) => {
+                resolve_hyperlink(hyperlink, relationships, &mut projection.diagnostics);
+                collect_reference_inlines_phase_one(
+                    &mut hyperlink.children,
+                    relationships,
+                    projection,
+                    bookmark_starts,
+                    bookmark_ends,
+                    bookmark_names,
+                );
+                projection.hyperlinks.push(hyperlink.clone());
+            }
+            SemanticInline::BookmarkStart(bookmark) => {
+                let key = (
+                    bookmark.source_anchor.source_part_path.clone(),
+                    bookmark.bookmark_id.clone(),
+                );
+                if bookmark_starts
+                    .insert(key.clone(), bookmark.clone())
+                    .is_some()
+                {
+                    projection.diagnostics.push(reference_diag(
+                        "CVN_BOOKMARK_DUPLICATE_START",
+                        &bookmark.source_anchor.xml_path,
+                        format!("bookmark start `{}` is duplicated", bookmark.bookmark_id),
+                    ));
+                }
+                if let Some(name) = bookmark.name.as_ref() {
+                    bookmark_names
+                        .entry((
+                            bookmark.source_anchor.source_part_path.clone(),
+                            name.clone(),
+                        ))
+                        .or_default()
+                        .push(bookmark.bookmark_id.clone());
+                }
+                projection.bookmarks.push(bookmark.clone());
+            }
+            SemanticInline::BookmarkEnd(bookmark) => {
+                let key = (
+                    bookmark.source_anchor.source_part_path.clone(),
+                    bookmark.bookmark_id.clone(),
+                );
+                if bookmark_ends.insert(key, bookmark.clone()).is_some() {
+                    projection.diagnostics.push(reference_diag(
+                        "CVN_BOOKMARK_DUPLICATE_END",
+                        &bookmark.source_anchor.xml_path,
+                        format!("bookmark end `{}` is duplicated", bookmark.bookmark_id),
+                    ));
+                }
+                projection.bookmarks.push(bookmark.clone());
+            }
+            SemanticInline::Field(field) => {
+                collect_reference_inlines_phase_one(
+                    &mut field.result.children,
+                    relationships,
+                    projection,
+                    bookmark_starts,
+                    bookmark_ends,
+                    bookmark_names,
+                );
+            }
+            SemanticInline::TrackedChange { change } => collect_reference_change_phase_one(
+                change,
+                relationships,
+                projection,
+                bookmark_starts,
+                bookmark_ends,
+                bookmark_names,
+            ),
+            SemanticInline::MceSelectedContent(content) => {
+                collect_reference_phase_one(
+                    &mut content.blocks,
+                    relationships,
+                    projection,
+                    bookmark_starts,
+                    bookmark_ends,
+                    bookmark_names,
+                );
+                collect_reference_inlines_phase_one(
+                    &mut content.inlines,
+                    relationships,
+                    projection,
+                    bookmark_starts,
+                    bookmark_ends,
+                    bookmark_names,
+                );
+            }
+            SemanticInline::Text(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. }
+            | SemanticInline::FootnoteReference { .. }
+            | SemanticInline::EndnoteReference { .. }
+            | SemanticInline::CommentReference { .. }
+            | SemanticInline::CommentRangeStart { .. }
+            | SemanticInline::CommentRangeEnd { .. } => {}
+        }
+    }
+}
+
+fn build_bookmark_ranges(
+    bookmark_starts: &BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_ends: &BTreeMap<(String, String), BookmarkProjection>,
+    bookmark_names: &BTreeMap<(String, String), Vec<String>>,
+    projection: &mut DocumentReferencesProjection,
+) {
+    for ((part, bookmark_id), start) in bookmark_starts {
+        let end = bookmark_ends.get(&(part.clone(), bookmark_id.clone()));
+        if end.is_none() {
+            projection.diagnostics.push(reference_diag(
+                "CVN_BOOKMARK_END_MISSING",
+                &start.source_anchor.xml_path,
+                format!("bookmark `{bookmark_id}` has no matching end"),
+            ));
+        }
+        projection.bookmark_ranges.push(BookmarkRangeProjection {
+            source_part: part.clone(),
+            bookmark_id: bookmark_id.clone(),
+            name: start.name.clone(),
+            start: Some(start.source_anchor.clone()),
+            end: end.map(|value| value.source_anchor.clone()),
+            markers: end
+                .map(|value| vec![start.id.clone(), value.id.clone()])
+                .unwrap_or_else(|| vec![start.id.clone()]),
+        });
+    }
+    for ((_, bookmark_id), end) in bookmark_ends {
+        if !bookmark_starts.contains_key(&(
+            end.source_anchor.source_part_path.clone(),
+            bookmark_id.clone(),
+        )) {
+            projection.diagnostics.push(reference_diag(
+                "CVN_BOOKMARK_START_MISSING",
+                &end.source_anchor.xml_path,
+                format!("bookmark `{bookmark_id}` has no matching start"),
+            ));
+        }
+    }
+    for ((part, name), ids) in bookmark_names {
+        if ids.len() > 1 {
+            projection.diagnostics.push(reference_diag(
+                "CVN_BOOKMARK_NAME_AMBIGUOUS",
+                part,
+                format!("bookmark name `{name}` is defined {} times", ids.len()),
+            ));
+        }
+    }
+}
+
+fn collect_reference_phase_two(
+    blocks: &mut [SemanticBlock],
+    bookmark_names: &BTreeMap<(String, String), Vec<String>>,
+    projection: &mut DocumentReferencesProjection,
+) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for run in &mut paragraph.runs {
+                    collect_reference_inlines_phase_two(
+                        &mut run.inlines,
+                        bookmark_names,
+                        projection,
+                    );
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        collect_reference_phase_two(&mut cell.blocks, bookmark_names, projection);
+                    }
+                }
+            }
+            SemanticBlock::TrackedChange(change) => match &mut change.content {
+                TrackedContent::Inline { items } => {
+                    collect_reference_inlines_phase_two(items, bookmark_names, projection)
+                }
+                TrackedContent::Block { blocks } => {
+                    collect_reference_phase_two(blocks, bookmark_names, projection)
+                }
+                TrackedContent::PropertyChange { .. } => {}
+            },
+            SemanticBlock::MceSelectedContent(content) => {
+                collect_reference_phase_two(&mut content.blocks, bookmark_names, projection);
+                collect_reference_inlines_phase_two(
+                    &mut content.inlines,
+                    bookmark_names,
+                    projection,
+                );
+            }
+        }
+    }
+}
+
+fn collect_reference_inlines_phase_two(
+    inlines: &mut [SemanticInline],
+    bookmark_names: &BTreeMap<(String, String), Vec<String>>,
+    projection: &mut DocumentReferencesProjection,
+) {
+    for inline in inlines {
+        match inline {
+            SemanticInline::Hyperlink(hyperlink) => {
+                collect_reference_inlines_phase_two(
+                    &mut hyperlink.children,
+                    bookmark_names,
+                    projection,
+                );
+            }
+            SemanticInline::Field(field) => {
+                collect_reference_inlines_phase_two(
+                    &mut field.result.children,
+                    bookmark_names,
+                    projection,
+                );
+                if field.instruction.raw.trim().is_empty() {
+                    projection.diagnostics.push(reference_diag(
+                        "CVN_FIELD_INSTRUCTION_MISSING",
+                        &field.source_anchor.xml_path,
+                        "field instruction is empty",
+                    ));
+                }
+                if matches!(
+                    field.field_kind,
+                    FieldKind::Dde
+                        | FieldKind::IncludeText
+                        | FieldKind::IncludePicture
+                        | FieldKind::Link
+                ) {
+                    projection.diagnostics.push(reference_diag(
+                        "CVN_FIELD_EXECUTION_BLOCKED",
+                        &field.source_anchor.xml_path,
+                        "field execution is blocked and not evaluated",
+                    ));
+                }
+                field.cross_reference = resolve_field_cross_reference(
+                    field,
+                    bookmark_names,
+                    &mut projection.diagnostics,
+                );
+                projection.fields.push(field.clone());
+                if let Some(cross_reference) = field.cross_reference.clone() {
+                    projection.cross_references.push(cross_reference);
+                }
+            }
+            SemanticInline::TrackedChange { change } => match &mut change.content {
+                TrackedContent::Inline { items } => {
+                    collect_reference_inlines_phase_two(items, bookmark_names, projection)
+                }
+                TrackedContent::Block { blocks } => {
+                    collect_reference_phase_two(blocks, bookmark_names, projection)
+                }
+                TrackedContent::PropertyChange { .. } => {}
+            },
+            SemanticInline::MceSelectedContent(content) => {
+                collect_reference_phase_two(&mut content.blocks, bookmark_names, projection);
+                collect_reference_inlines_phase_two(
+                    &mut content.inlines,
+                    bookmark_names,
+                    projection,
+                );
+            }
+            SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Text(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. }
+            | SemanticInline::FootnoteReference { .. }
+            | SemanticInline::EndnoteReference { .. }
+            | SemanticInline::CommentReference { .. }
+            | SemanticInline::CommentRangeStart { .. }
+            | SemanticInline::CommentRangeEnd { .. } => {}
+        }
+    }
+}
+
+fn resolve_hyperlink(
+    hyperlink: &mut HyperlinkProjection,
+    relationships: &[OpcRelationship],
+    diagnostics: &mut Vec<DocumentReferenceDiagnostic>,
+) {
+    if let Some(relationship_id) = hyperlink.relationship_id.as_ref() {
+        if let Some(relationship) = relationships.iter().find(|relationship| {
+            relationship.source_part.as_deref()
+                == Some(hyperlink.source_anchor.source_part_path.as_str())
+                && relationship.relationship_id == *relationship_id
+        }) {
+            hyperlink.target.relationship_type = Some(relationship.relationship_type.clone());
+            hyperlink.target.raw_target = Some(relationship.target.clone());
+            match relationship.target_mode {
+                TargetMode::External => {
+                    hyperlink.target.kind = HyperlinkTargetKind::ExternalRelationship;
+                    hyperlink.target.risk_class =
+                        classify_hyperlink_risk(relationship.target.as_str());
+                    diagnostics.push(reference_diag(
+                        "CVN_HYPERLINK_EXTERNAL_TARGET_INERT",
+                        &hyperlink.source_anchor.xml_path,
+                        "external hyperlink target is preserved inertly",
+                    ));
+                    if matches!(
+                        hyperlink.target.risk_class.as_deref(),
+                        Some("active_or_script_scheme" | "office_protocol" | "data_uri")
+                    ) {
+                        diagnostics.push(reference_diag(
+                            "CVN_HYPERLINK_ACTIVE_SCHEME_INERT",
+                            &hyperlink.source_anchor.xml_path,
+                            "active hyperlink scheme is preserved inertly",
+                        ));
+                    }
+                }
+                TargetMode::Internal => {
+                    hyperlink.target.kind = HyperlinkTargetKind::InternalPart;
+                    hyperlink.target.resolved_part_path = resolve_internal_target_path(
+                        &hyperlink.source_anchor.source_part_path,
+                        &relationship.target,
+                    );
+                }
+            }
+        } else {
+            diagnostics.push(reference_diag(
+                "CVN_HYPERLINK_RELATIONSHIP_MISSING",
+                &hyperlink.source_anchor.xml_path,
+                format!("relationship `{relationship_id}` is not defined"),
+            ));
+            hyperlink.target.kind = HyperlinkTargetKind::Unresolved;
+        }
+    } else if hyperlink.anchor.is_some() {
+        hyperlink.target.kind = HyperlinkTargetKind::InternalAnchor;
+    }
+}
+
+fn classify_hyperlink_risk(value: &str) -> Option<String> {
+    let scheme = value
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let risk = match scheme.as_str() {
+        "http" | "https" | "mailto" => "ordinary_web",
+        "file" => "file_or_local_resource",
+        "javascript" | "vbscript" | "shell" => "active_or_script_scheme",
+        "ms-word" | "ms-excel" | "ms-powerpoint" => "office_protocol",
+        "data" => "data_uri",
+        "" => return None,
+        _ => "unknown_scheme",
+    };
+    Some(risk.to_owned())
+}
+
+fn resolve_field_cross_reference(
+    field: &mut FieldProjection,
+    bookmark_names: &BTreeMap<(String, String), Vec<String>>,
+    diagnostics: &mut Vec<DocumentReferenceDiagnostic>,
+) -> Option<CrossReferenceProjection> {
+    let tokens = if field.instruction.tokens.is_empty() {
+        instruction_tokens(&field.instruction.raw)
+    } else {
+        field.instruction.tokens.clone()
+    };
+    let mut projection = CrossReferenceProjection {
+        field_id: field.id.clone(),
+        field_kind: field.field_kind,
+        target_bookmark_name: None,
+        resolved_bookmark_id: None,
+        hyperlink_target: None,
+        source_anchor: field.source_anchor.clone(),
+    };
+    match field.field_kind {
+        FieldKind::Ref | FieldKind::Pageref | FieldKind::Noteref => {
+            let target = tokens
+                .get(1)
+                .map(|value| value.trim_matches('"').to_owned());
+            projection.target_bookmark_name = target.clone();
+            if let Some(target) = target {
+                match bookmark_names
+                    .get(&(field.source_anchor.source_part_path.clone(), target.clone()))
+                {
+                    Some(ids) if ids.len() == 1 => {
+                        projection.resolved_bookmark_id = ids.first().cloned();
+                    }
+                    Some(ids) if ids.len() > 1 => diagnostics.push(reference_diag(
+                        "CVN_REFERENCE_BOOKMARK_AMBIGUOUS",
+                        &field.source_anchor.xml_path,
+                        format!("bookmark `{target}` resolves to {} candidates", ids.len()),
+                    )),
+                    _ => diagnostics.push(reference_diag(
+                        "CVN_REFERENCE_BOOKMARK_MISSING",
+                        &field.source_anchor.xml_path,
+                        format!("bookmark `{target}` is not defined"),
+                    )),
+                }
+            }
+            Some(projection)
+        }
+        FieldKind::Hyperlink => {
+            let mut target = None;
+            let mut local_anchor = None;
+            let mut index = 1;
+            while index < tokens.len() {
+                if tokens[index].eq_ignore_ascii_case("\\l") {
+                    local_anchor = tokens
+                        .get(index + 1)
+                        .map(|value| value.trim_matches('"').to_owned());
+                    index += 2;
+                    continue;
+                }
+                if !tokens[index].starts_with('\\') && target.is_none() {
+                    target = Some(tokens[index].trim_matches('"').to_owned());
+                }
+                index += 1;
+            }
+            projection.target_bookmark_name = local_anchor.clone();
+            projection.hyperlink_target = Some(if let Some(anchor) = local_anchor {
+                HyperlinkTarget {
+                    kind: HyperlinkTargetKind::InternalAnchor,
+                    raw_target: Some(anchor),
+                    resolved_part_path: None,
+                    relationship_type: None,
+                    risk_class: None,
+                }
+            } else {
+                let raw = target.clone();
+                HyperlinkTarget {
+                    kind: raw
+                        .as_ref()
+                        .map(|_| HyperlinkTargetKind::ExternalRelationship)
+                        .unwrap_or(HyperlinkTargetKind::Unresolved),
+                    raw_target: raw.clone(),
+                    resolved_part_path: None,
+                    relationship_type: None,
+                    risk_class: raw.as_deref().and_then(classify_hyperlink_risk),
+                }
+            });
+            Some(projection)
+        }
+        _ => None,
+    }
+}
+
+fn reference_diag(
+    code: &str,
+    path: &str,
+    message: impl Into<String>,
+) -> DocumentReferenceDiagnostic {
+    DocumentReferenceDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+    }
 }
 
 fn resolve_story_references(
@@ -5634,7 +6811,15 @@ fn collect_track_change_story_references(
                         collect_story_references(&content.blocks, references);
                         collect_mce_inline_story_references(&content.inlines, references);
                     }
+                    SemanticInline::Hyperlink(hyperlink) => {
+                        collect_mce_inline_story_references(&hyperlink.children, references);
+                    }
+                    SemanticInline::Field(field) => {
+                        collect_mce_inline_story_references(&field.result.children, references);
+                    }
                     SemanticInline::Text(_)
+                    | SemanticInline::BookmarkStart(_)
+                    | SemanticInline::BookmarkEnd(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
                     | SemanticInline::TrackedChange { .. } => {}
@@ -5708,7 +6893,17 @@ fn collect_run_story_references(run: &SemanticRun, references: &mut Vec<StoryRef
                 target_mode: None,
                 resolved_part_path: None,
             }),
-            SemanticInline::Text(_) | SemanticInline::Tab | SemanticInline::LineBreak { .. } => {}
+            SemanticInline::Hyperlink(hyperlink) => {
+                collect_mce_inline_story_references(&hyperlink.children, references);
+            }
+            SemanticInline::Field(field) => {
+                collect_mce_inline_story_references(&field.result.children, references);
+            }
+            SemanticInline::Text(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. } => {}
             SemanticInline::TrackedChange { change } => {
                 collect_track_change_story_references(change, references)
             }
@@ -5776,7 +6971,21 @@ fn collect_comment_ranges(
                                     ranges_by_comment,
                                 );
                             }
+                            SemanticInline::Hyperlink(hyperlink) => {
+                                collect_mce_inline_comment_ranges(
+                                    &hyperlink.children,
+                                    ranges_by_comment,
+                                );
+                            }
+                            SemanticInline::Field(field) => {
+                                collect_mce_inline_comment_ranges(
+                                    &field.result.children,
+                                    ranges_by_comment,
+                                );
+                            }
                             SemanticInline::Text(_)
+                            | SemanticInline::BookmarkStart(_)
+                            | SemanticInline::BookmarkEnd(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. }
                             | SemanticInline::FootnoteReference { .. }
@@ -5837,7 +7046,18 @@ fn collect_track_change_comment_ranges(
                         collect_comment_ranges(&content.blocks, ranges_by_comment);
                         collect_mce_inline_comment_ranges(&content.inlines, ranges_by_comment);
                     }
+                    SemanticInline::Hyperlink(hyperlink) => {
+                        collect_mce_inline_comment_ranges(&hyperlink.children, ranges_by_comment);
+                    }
+                    SemanticInline::Field(field) => {
+                        collect_mce_inline_comment_ranges(
+                            &field.result.children,
+                            ranges_by_comment,
+                        );
+                    }
                     SemanticInline::Text(_)
+                    | SemanticInline::BookmarkStart(_)
+                    | SemanticInline::BookmarkEnd(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
                     | SemanticInline::FootnoteReference { .. }
@@ -5893,7 +7113,15 @@ fn collect_mce_inline_comment_ranges(
                 collect_comment_ranges(&content.blocks, ranges_by_comment);
                 collect_mce_inline_comment_ranges(&content.inlines, ranges_by_comment);
             }
+            SemanticInline::Hyperlink(hyperlink) => {
+                collect_mce_inline_comment_ranges(&hyperlink.children, ranges_by_comment);
+            }
+            SemanticInline::Field(field) => {
+                collect_mce_inline_comment_ranges(&field.result.children, ranges_by_comment);
+            }
             SemanticInline::Text(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -6448,7 +7676,7 @@ mod tests {
             .relationships
             .iter()
             .any(|rel| rel.target_mode == TargetMode::External
-                && rel.target == "https://example.invalid/image?a=1&amp;b=2"));
+                && rel.target == "https://example.invalid/image?a=1&b=2"));
 
         let document_part = package
             .document
@@ -7354,6 +8582,24 @@ mod tests {
         path
     }
 
+    fn write_references_docx(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/><Relationship Id="rIdExt" Type="hyperlink" Target="https://example.invalid/reference?a=1&amp;b=2" TargetMode="External"/><Relationship Id="rIdInternal" Type="hyperlink" Target="footnotes.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:body><w:p><w:r><w:bookmarkStart w:id="1" w:name="BookmarkOne"/></w:r><w:r><w:t>bookmark one</w:t></w:r><w:r><w:bookmarkEnd w:id="1"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="2" w:name="DupName"/></w:r><w:r><w:t>dup a</w:t></w:r><w:r><w:bookmarkEnd w:id="2"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="3" w:name="DupName"/></w:r><w:r><w:t>dup b</w:t></w:r><w:r><w:bookmarkEnd w:id="3"/></w:r></w:p><w:p><w:r><w:bookmarkStart w:id="4" w:name="MissingEnd"/></w:r><w:r><w:t>missing end</w:t></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdExt"><w:r><w:t>external link</w:t></w:r></w:hyperlink></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdInternal" w:anchor="BookmarkOne" w:tooltip="tip"><w:r><w:t>mixed link</w:t></w:r><w:ins w:id="40" w:author="Alice"><w:r><w:t> tracked insertion </w:t></w:r></w:ins><mc:AlternateContent><mc:Choice Requires="w"><w:r><w:t>mce link</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>mce fallback</w:t></w:r></mc:Fallback></mc:AlternateContent></w:hyperlink></w:r></w:p><w:p><w:r><w:hyperlink r:id="rIdMissing"><w:r><w:t>missing link</w:t></w:r></w:hyperlink></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:t>simple ref result</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" HYPERLINK &quot;javascript:alert(1)&quot; "><w:r><w:t>script result</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>complex result</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>outer </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> HYPERLINK \l &quot;BookmarkOne&quot; </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>inner</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" DDEAUTO cmd /x "><w:r><w:t>dde blocked</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" INCLUDETEXT &quot;file:///tmp/blocked.docx&quot; "><w:r><w:t>include blocked</w:t></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="41" w:author="Bob"><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF BookmarkOne </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>tracked field</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:t>mce field</w:t></w:r></w:fldSimple></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback field</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#);
+        add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:hyperlink w:anchor="BookmarkOne"><w:r><w:t>header link</w:t></w:r></w:hyperlink></w:r></w:p></w:hdr>"#);
+        add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:bookmarkStart w:id="9" w:name="FootnoteMark"/></w:r><w:r><w:t>footnote text</w:t></w:r><w:r><w:bookmarkEnd w:id="9"/></w:r></w:p></w:footnote></w:footnotes>"#);
+        zip.finish().unwrap();
+        path
+    }
+
     fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         for block in &document.blocks {
@@ -7648,6 +8894,151 @@ mod tests {
         let _ = fs::remove_dir_all(&out2);
     }
 
+    #[test]
+    fn document_references_projection_is_deterministic_and_connected() {
+        let docx = write_references_docx("references");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(
+            first.document.semantic.references,
+            second.document.semantic.references
+        );
+        let ids_first = collect_reference_semantic_ids(&first.document.semantic);
+        let ids_second = collect_reference_semantic_ids(&second.document.semantic);
+        assert_eq!(ids_first, ids_second);
+
+        let references = first.document.semantic.references.as_ref().unwrap();
+        assert!(references.hyperlinks.iter().any(|hyperlink| {
+            hyperlink.relationship_id.as_deref() == Some("rIdExt")
+                && hyperlink.target.raw_target.as_deref()
+                    == Some("https://example.invalid/reference?a=1&b=2")
+                && hyperlink.target.risk_class.as_deref() == Some("ordinary_web")
+        }));
+        assert!(references.hyperlinks.iter().any(|hyperlink| {
+            hyperlink.relationship_id.as_deref() == Some("rIdInternal")
+                && hyperlink.anchor.as_deref() == Some("BookmarkOne")
+                && hyperlink.tooltip.as_deref() == Some("tip")
+                && inline_text(&hyperlink.children).contains("tracked insertion")
+                && inline_text(&hyperlink.children).contains("mce link")
+        }));
+        assert!(references
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_HYPERLINK_RELATIONSHIP_MISSING"));
+        assert!(references
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_HYPERLINK_EXTERNAL_TARGET_INERT"));
+        assert!(references
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_BOOKMARK_END_MISSING"));
+        assert!(references
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_BOOKMARK_NAME_AMBIGUOUS"));
+        assert!(references
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_FIELD_EXECUTION_BLOCKED"));
+
+        assert!(references.bookmark_ranges.iter().any(|range| {
+            range.bookmark_id == "1"
+                && range.name.as_deref() == Some("BookmarkOne")
+                && range.end.is_some()
+        }));
+        assert!(references.bookmark_ranges.iter().any(|range| {
+            range.source_part == "word/footnotes.xml"
+                && range.name.as_deref() == Some("FootnoteMark")
+        }));
+
+        let simple_ref = references
+            .fields
+            .iter()
+            .find(|field| inline_text(&field.result.children).contains("simple ref result"))
+            .unwrap();
+        assert_eq!(simple_ref.field_kind, FieldKind::Ref);
+        assert_eq!(
+            simple_ref
+                .cross_reference
+                .as_ref()
+                .and_then(|projection| projection.target_bookmark_name.as_deref()),
+            Some("BookmarkOne")
+        );
+        assert_eq!(
+            simple_ref
+                .cross_reference
+                .as_ref()
+                .and_then(|projection| projection.resolved_bookmark_id.as_deref()),
+            Some("1")
+        );
+
+        let hyperlink_field = references
+            .fields
+            .iter()
+            .find(|field| inline_text(&field.result.children).contains("script result"))
+            .unwrap();
+        assert_eq!(hyperlink_field.field_kind, FieldKind::Hyperlink);
+        assert_eq!(
+            hyperlink_field
+                .cross_reference
+                .as_ref()
+                .and_then(|projection| projection.hyperlink_target.as_ref())
+                .and_then(|target| target.risk_class.as_deref()),
+            Some("active_or_script_scheme")
+        );
+
+        let nested_field = references
+            .fields
+            .iter()
+            .find(|field| inline_text(&field.result.children).contains("outer"))
+            .unwrap();
+        assert!(nested_field
+            .result
+            .children
+            .iter()
+            .any(|inline| matches!(inline, SemanticInline::Field(_))));
+        assert!(references
+            .fields
+            .iter()
+            .any(|field| inline_text(&field.result.children).contains("tracked field")));
+        assert!(references
+            .fields
+            .iter()
+            .any(|field| inline_text(&field.result.children).contains("mce field")));
+
+        assert!(semantic_contains_hyperlink_wrapper(
+            &first.document.semantic
+        ));
+        assert!(semantic_contains_field_wrapper(&first.document.semantic));
+
+        let out1 =
+            std::env::temp_dir().join(format!("tuff-cvn-references-out-1-{}", std::process::id()));
+        let out2 =
+            std::env::temp_dir().join(format!("tuff-cvn-references-out-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+        cvn_package::write_package(&out1, &first).unwrap();
+        cvn_package::write_package(&out2, &second).unwrap();
+        assert_eq!(
+            cvn_package::read_cvn_json_bytes(&out1).unwrap(),
+            cvn_package::read_cvn_json_bytes(&out2).unwrap()
+        );
+        assert_eq!(
+            cvn_package::verify_package_integrity(&out1)
+                .unwrap()
+                .root_actual,
+            cvn_package::verify_package_integrity(&out2)
+                .unwrap()
+                .root_actual
+        );
+
+        let _ = fs::remove_file(&docx);
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+    }
+
     fn collect_block_ids(block: &SemanticBlock, ids: &mut Vec<String>) {
         match block {
             SemanticBlock::Paragraph(paragraph) => {
@@ -7683,6 +9074,236 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn collect_reference_semantic_ids(document: &SemanticDocument) -> Vec<String> {
+        let mut ids = Vec::new();
+        collect_reference_ids_from_blocks(&document.blocks, &mut ids);
+        if let Some(stories) = document.stories.as_ref() {
+            for part in &stories.parts {
+                collect_reference_ids_from_blocks(&part.blocks, &mut ids);
+                for note in &part.notes {
+                    collect_reference_ids_from_blocks(&note.blocks, &mut ids);
+                }
+                for comment in &part.comments {
+                    collect_reference_ids_from_blocks(&comment.blocks, &mut ids);
+                }
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    fn collect_reference_ids_from_blocks(blocks: &[SemanticBlock], ids: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                SemanticBlock::Paragraph(paragraph) => {
+                    for run in &paragraph.runs {
+                        collect_reference_ids_from_inlines(&run.inlines, ids);
+                    }
+                }
+                SemanticBlock::Table(table) => {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            collect_reference_ids_from_blocks(&cell.blocks, ids);
+                        }
+                    }
+                }
+                SemanticBlock::TrackedChange(change) => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_reference_ids_from_inlines(items, ids);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        collect_reference_ids_from_blocks(blocks, ids);
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticBlock::MceSelectedContent(content) => {
+                    collect_reference_ids_from_blocks(&content.blocks, ids);
+                    collect_reference_ids_from_inlines(&content.inlines, ids);
+                }
+            }
+        }
+    }
+
+    fn collect_reference_ids_from_inlines(inlines: &[SemanticInline], ids: &mut Vec<String>) {
+        for inline in inlines {
+            match inline {
+                SemanticInline::Hyperlink(hyperlink) => {
+                    ids.push(hyperlink.id.as_str().to_owned());
+                    collect_reference_ids_from_inlines(&hyperlink.children, ids);
+                }
+                SemanticInline::BookmarkStart(bookmark) | SemanticInline::BookmarkEnd(bookmark) => {
+                    ids.push(bookmark.id.as_str().to_owned());
+                }
+                SemanticInline::Field(field) => {
+                    ids.push(field.id.as_str().to_owned());
+                    collect_reference_ids_from_inlines(&field.result.children, ids);
+                }
+                SemanticInline::TrackedChange { change } => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_reference_ids_from_inlines(items, ids);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        collect_reference_ids_from_blocks(blocks, ids);
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticInline::MceSelectedContent(content) => {
+                    collect_reference_ids_from_blocks(&content.blocks, ids);
+                    collect_reference_ids_from_inlines(&content.inlines, ids);
+                }
+                SemanticInline::Text(_)
+                | SemanticInline::Tab
+                | SemanticInline::LineBreak { .. }
+                | SemanticInline::FootnoteReference { .. }
+                | SemanticInline::EndnoteReference { .. }
+                | SemanticInline::CommentReference { .. }
+                | SemanticInline::CommentRangeStart { .. }
+                | SemanticInline::CommentRangeEnd { .. } => {}
+            }
+        }
+    }
+
+    fn semantic_contains_hyperlink_wrapper(document: &SemanticDocument) -> bool {
+        contains_inline_wrapper(&document.blocks, |inline| {
+            matches!(inline, SemanticInline::Hyperlink(_))
+        }) || document.stories.as_ref().is_some_and(|stories| {
+            stories.parts.iter().any(|part| {
+                contains_inline_wrapper(&part.blocks, |inline| {
+                    matches!(inline, SemanticInline::Hyperlink(_))
+                }) || part.notes.iter().any(|note| {
+                    contains_inline_wrapper(&note.blocks, |inline| {
+                        matches!(inline, SemanticInline::Hyperlink(_))
+                    })
+                }) || part.comments.iter().any(|comment| {
+                    contains_inline_wrapper(&comment.blocks, |inline| {
+                        matches!(inline, SemanticInline::Hyperlink(_))
+                    })
+                })
+            })
+        })
+    }
+
+    fn semantic_contains_field_wrapper(document: &SemanticDocument) -> bool {
+        contains_inline_wrapper(&document.blocks, |inline| {
+            matches!(inline, SemanticInline::Field(_))
+        }) || document.stories.as_ref().is_some_and(|stories| {
+            stories.parts.iter().any(|part| {
+                contains_inline_wrapper(&part.blocks, |inline| {
+                    matches!(inline, SemanticInline::Field(_))
+                }) || part.notes.iter().any(|note| {
+                    contains_inline_wrapper(&note.blocks, |inline| {
+                        matches!(inline, SemanticInline::Field(_))
+                    })
+                }) || part.comments.iter().any(|comment| {
+                    contains_inline_wrapper(&comment.blocks, |inline| {
+                        matches!(inline, SemanticInline::Field(_))
+                    })
+                })
+            })
+        })
+    }
+
+    fn contains_inline_wrapper(
+        blocks: &[SemanticBlock],
+        predicate: impl Copy + Fn(&SemanticInline) -> bool,
+    ) -> bool {
+        for block in blocks {
+            match block {
+                SemanticBlock::Paragraph(paragraph) => {
+                    for run in &paragraph.runs {
+                        if contains_inline_wrapper_in_inlines(&run.inlines, predicate) {
+                            return true;
+                        }
+                    }
+                }
+                SemanticBlock::Table(table) => {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            if contains_inline_wrapper(&cell.blocks, predicate) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                SemanticBlock::TrackedChange(change) => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        if contains_inline_wrapper_in_inlines(items, predicate) {
+                            return true;
+                        }
+                    }
+                    TrackedContent::Block { blocks } => {
+                        if contains_inline_wrapper(blocks, predicate) {
+                            return true;
+                        }
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticBlock::MceSelectedContent(content) => {
+                    if contains_inline_wrapper(&content.blocks, predicate)
+                        || contains_inline_wrapper_in_inlines(&content.inlines, predicate)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn contains_inline_wrapper_in_inlines(
+        inlines: &[SemanticInline],
+        predicate: impl Copy + Fn(&SemanticInline) -> bool,
+    ) -> bool {
+        for inline in inlines {
+            if predicate(inline) {
+                return true;
+            }
+            match inline {
+                SemanticInline::Hyperlink(hyperlink) => {
+                    if contains_inline_wrapper_in_inlines(&hyperlink.children, predicate) {
+                        return true;
+                    }
+                }
+                SemanticInline::Field(field) => {
+                    if contains_inline_wrapper_in_inlines(&field.result.children, predicate) {
+                        return true;
+                    }
+                }
+                SemanticInline::TrackedChange { change } => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        if contains_inline_wrapper_in_inlines(items, predicate) {
+                            return true;
+                        }
+                    }
+                    TrackedContent::Block { blocks } => {
+                        if contains_inline_wrapper(blocks, predicate) {
+                            return true;
+                        }
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticInline::MceSelectedContent(content) => {
+                    if contains_inline_wrapper(&content.blocks, predicate)
+                        || contains_inline_wrapper_in_inlines(&content.inlines, predicate)
+                    {
+                        return true;
+                    }
+                }
+                SemanticInline::BookmarkStart(_)
+                | SemanticInline::BookmarkEnd(_)
+                | SemanticInline::Text(_)
+                | SemanticInline::Tab
+                | SemanticInline::LineBreak { .. }
+                | SemanticInline::FootnoteReference { .. }
+                | SemanticInline::EndnoteReference { .. }
+                | SemanticInline::CommentReference { .. }
+                | SemanticInline::CommentRangeStart { .. }
+                | SemanticInline::CommentRangeEnd { .. } => {}
+            }
+        }
+        false
     }
 
     fn semantic_text(document: &SemanticDocument) -> String {
@@ -7754,6 +9375,16 @@ mod tests {
     fn collect_inline_text(inline: &SemanticInline, text: &mut String) {
         match inline {
             SemanticInline::Text(value) => text.push_str(&value.value),
+            SemanticInline::Hyperlink(hyperlink) => {
+                for child in &hyperlink.children {
+                    collect_inline_text(child, text);
+                }
+            }
+            SemanticInline::Field(field) => {
+                for child in &field.result.children {
+                    collect_inline_text(child, text);
+                }
+            }
             SemanticInline::TrackedChange { change } => {
                 if let TrackedContent::Inline { items } = &change.content {
                     for inline in items {
@@ -7769,6 +9400,7 @@ mod tests {
                     collect_inline_text(inline, text);
                 }
             }
+            SemanticInline::BookmarkStart(_) | SemanticInline::BookmarkEnd(_) => {}
             SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -7872,7 +9504,15 @@ mod tests {
                         collect_mce_inline_wrappers_from_inlines(items, wrappers);
                     }
                 }
+                SemanticInline::Hyperlink(hyperlink) => {
+                    collect_mce_inline_wrappers_from_inlines(&hyperlink.children, wrappers);
+                }
+                SemanticInline::Field(field) => {
+                    collect_mce_inline_wrappers_from_inlines(&field.result.children, wrappers);
+                }
                 SemanticInline::Text(_)
+                | SemanticInline::BookmarkStart(_)
+                | SemanticInline::BookmarkEnd(_)
                 | SemanticInline::Tab
                 | SemanticInline::LineBreak { .. }
                 | SemanticInline::FootnoteReference { .. }

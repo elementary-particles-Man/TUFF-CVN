@@ -440,7 +440,158 @@ pub struct SemanticDocument {
     pub numbering: Option<NumberingRegistryProjection>,
     #[serde(default)]
     pub stories: Option<StoryRegistryProjection>,
+    #[serde(default)]
+    pub references: Option<DocumentReferencesProjection>,
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
+}
+
+/// Read-only projection of DOCX hyperlinks, bookmarks, fields, and cross-references.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentReferencesProjection {
+    pub source_part: String,
+    pub hyperlinks: Vec<HyperlinkProjection>,
+    pub bookmarks: Vec<BookmarkProjection>,
+    pub bookmark_ranges: Vec<BookmarkRangeProjection>,
+    pub fields: Vec<FieldProjection>,
+    pub cross_references: Vec<CrossReferenceProjection>,
+    pub diagnostics: Vec<DocumentReferenceDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HyperlinkProjection {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub relationship_id: Option<String>,
+    pub target: HyperlinkTarget,
+    pub anchor: Option<String>,
+    pub doc_location: Option<String>,
+    pub history: Option<String>,
+    pub target_frame: Option<String>,
+    pub tooltip: Option<String>,
+    pub children: Vec<SemanticInline>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HyperlinkTarget {
+    pub kind: HyperlinkTargetKind,
+    pub raw_target: Option<String>,
+    pub resolved_part_path: Option<String>,
+    pub relationship_type: Option<String>,
+    pub risk_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HyperlinkTargetKind {
+    ExternalRelationship,
+    InternalAnchor,
+    InternalPart,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookmarkProjection {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub bookmark_id: String,
+    pub name: Option<String>,
+    pub column_first: Option<String>,
+    pub column_last: Option<String>,
+    pub boundary_kind: BookmarkBoundaryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkBoundaryKind {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookmarkRangeProjection {
+    pub source_part: String,
+    pub bookmark_id: String,
+    pub name: Option<String>,
+    pub start: Option<SourceAnchor>,
+    pub end: Option<SourceAnchor>,
+    pub markers: Vec<SemanticNodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldProjection {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub field_kind: FieldKind,
+    pub instruction: FieldInstructionProjection,
+    pub result: FieldResultProjection,
+    pub character_markers: Vec<FieldCharacterKindProjection>,
+    pub field_lock: Option<String>,
+    pub dirty: Option<String>,
+    pub cross_reference: Option<CrossReferenceProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldKind {
+    Ref,
+    Pageref,
+    Noteref,
+    Hyperlink,
+    Page,
+    Numpages,
+    Date,
+    Time,
+    Toc,
+    Seq,
+    Symbol,
+    IncludeText,
+    IncludePicture,
+    Link,
+    Dde,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldInstructionProjection {
+    pub raw: String,
+    pub tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldResultProjection {
+    pub children: Vec<SemanticInline>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldCharacterKind {
+    Begin,
+    Separate,
+    End,
+    Simple,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldCharacterKindProjection {
+    pub kind: FieldCharacterKind,
+    pub source_anchor: SourceAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossReferenceProjection {
+    pub field_id: SemanticNodeId,
+    pub field_kind: FieldKind,
+    pub target_bookmark_name: Option<String>,
+    pub resolved_bookmark_id: Option<String>,
+    pub hyperlink_target: Option<HyperlinkTarget>,
+    pub source_anchor: SourceAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentReferenceDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
 }
 
 /// Read-only projection of MCE AlternateContent and compatibility metadata.
@@ -862,6 +1013,10 @@ pub struct SemanticTableCell {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SemanticInline {
     Text(SemanticText),
+    Hyperlink(HyperlinkProjection),
+    BookmarkStart(BookmarkProjection),
+    BookmarkEnd(BookmarkProjection),
+    Field(FieldProjection),
     Tab,
     LineBreak {
         break_kind: String,
@@ -1246,6 +1401,7 @@ pub enum IntegrityNodeKind {
     TrackChangesProjection,
     MceProjection,
     OpcSignatureProjection,
+    DocumentReferencesProjection,
     Objects,
 }
 
@@ -1264,6 +1420,7 @@ impl IntegrityNodeKind {
             Self::TrackChangesProjection => "track_changes_projection",
             Self::MceProjection => "mce_projection",
             Self::OpcSignatureProjection => "opc_signature_projection",
+            Self::DocumentReferencesProjection => "document_references_projection",
             Self::Objects => "objects",
         }
     }
