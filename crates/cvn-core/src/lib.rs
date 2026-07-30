@@ -603,6 +603,8 @@ pub struct X509CertificateProjection {
     pub not_before: Option<String>,
     pub not_after: Option<String>,
     pub public_key_algorithm: Option<String>,
+    #[serde(default)]
+    pub rsa_public_key: Option<RsaKeyValueProjection>,
     pub malformed: bool,
 }
 
@@ -622,10 +624,23 @@ pub struct SignatureVerificationReport {
     pub cryptographic_validity: SignatureVerificationStatus,
     pub certificate_trust: SignatureVerificationStatus,
     pub signature_value_status: SignatureVerificationStatus,
+    #[serde(default)]
+    pub key_source: Option<SignatureKeySource>,
+    #[serde(default)]
+    pub certificate_index: Option<usize>,
+    #[serde(default)]
+    pub public_key_fingerprint: Option<String>,
     pub key_fingerprint: Option<String>,
     pub signed_info_digest: Option<String>,
     pub references: Vec<SignatureReferenceVerification>,
     pub diagnostics: Vec<SignatureDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureKeySource {
+    RsaKeyValue,
+    X509Certificate,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

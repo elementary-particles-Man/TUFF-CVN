@@ -189,11 +189,26 @@ fn print_signature_report(report: &cvn_verify::OpcSignatureVerificationReport) {
     );
     for signature in &report.projection.signatures {
         println!(
-            "  signature_part={} cryptographic_validity={:?} certificate_trust={:?} signature_value={:?}",
+            "  signature_part={} cryptographic_validity={:?} certificate_trust={:?} signature_value={:?} key_source={} certificate_index={} public_key_fingerprint={}",
             signature.signature_part_path,
             signature.verification.cryptographic_validity,
             signature.verification.certificate_trust,
-            signature.verification.signature_value_status
+            signature.verification.signature_value_status,
+            signature
+                .verification
+                .key_source
+                .map(|source| format!("{source:?}"))
+                .unwrap_or_else(|| "<none>".to_owned()),
+            signature
+                .verification
+                .certificate_index
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "<none>".to_owned()),
+            signature
+                .verification
+                .public_key_fingerprint
+                .as_deref()
+                .unwrap_or("<none>")
         );
         for reference in &signature.verification.references {
             println!(

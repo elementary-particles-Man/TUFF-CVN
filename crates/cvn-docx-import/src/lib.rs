@@ -20,15 +20,15 @@ use cvn_core::{
     RsaKeyValueProjection, RunPropertiesProjection, SemanticBlock, SemanticDocument,
     SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable,
     SemanticTableCell, SemanticTableRow, SemanticText, SignatureDiagnostic,
-    SignatureKeyInfoProjection, SignatureReferenceProjection, SignatureReferenceVerification,
-    SignatureTransformProjection, SignatureVerificationReport, SignatureVerificationStatus,
-    SignedInfoProjection, SourceAnchor, SourceDescriptor, SourceFormat, StoryPartKind,
-    StoryPartProjection, StoryReference, StoryReferenceKind, StoryRegistryProjection,
-    StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference, StyleRegistryProjection,
-    StyleResolutionDiagnostic, StyleType, TargetMode, TrackChangesProjection, TrackedChange,
-    TrackedChangeId, TrackedChangeKind, TrackedChangeMetadata, TrackedContent,
-    UnsupportedFeatureHandling, UnsupportedSemanticFeature, X509CertificateProjection,
-    ZipEntryMetadata,
+    SignatureKeyInfoProjection, SignatureKeySource, SignatureReferenceProjection,
+    SignatureReferenceVerification, SignatureTransformProjection, SignatureVerificationReport,
+    SignatureVerificationStatus, SignedInfoProjection, SourceAnchor, SourceDescriptor,
+    SourceFormat, StoryPartKind, StoryPartProjection, StoryReference, StoryReferenceKind,
+    StoryRegistryProjection, StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference,
+    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
+    TrackChangesProjection, TrackedChange, TrackedChangeId, TrackedChangeKind,
+    TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling, UnsupportedSemanticFeature,
+    X509CertificateProjection, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
 use quick_xml::events::{BytesStart, Event};
@@ -41,6 +41,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
+use x509_parser::public_key::PublicKey;
 use zip::read::ZipArchive;
 
 /// DOCX import limits.
@@ -1690,16 +1691,23 @@ fn parse_x509_certificate_projection(
     };
     let der_sha256 = sha256_hex(&der);
     match X509Certificate::from_der(&der) {
-        Ok((_, certificate)) => X509CertificateProjection {
-            der_sha256,
-            subject: Some(certificate.subject().to_string()),
-            issuer: Some(certificate.issuer().to_string()),
-            serial: Some(certificate.raw_serial_as_string()),
-            not_before: certificate.validity().not_before.to_rfc2822().ok(),
-            not_after: certificate.validity().not_after.to_rfc2822().ok(),
-            public_key_algorithm: Some(certificate.public_key().algorithm.algorithm.to_string()),
-            malformed: false,
-        },
+        Ok((_, certificate)) => {
+            let rsa_public_key =
+                x509_rsa_public_key_projection(&certificate, source_part_path, diagnostics);
+            X509CertificateProjection {
+                der_sha256,
+                subject: Some(certificate.subject().to_string()),
+                issuer: Some(certificate.issuer().to_string()),
+                serial: Some(certificate.raw_serial_as_string()),
+                not_before: certificate.validity().not_before.to_rfc2822().ok(),
+                not_after: certificate.validity().not_after.to_rfc2822().ok(),
+                public_key_algorithm: Some(
+                    certificate.public_key().algorithm.algorithm.to_string(),
+                ),
+                rsa_public_key,
+                malformed: false,
+            }
+        }
         Err(_) => {
             diagnostics.push(signature_diag(
                 "CVN_SIGNATURE_CERTIFICATE_MALFORMED",
@@ -1722,8 +1730,89 @@ fn malformed_certificate() -> X509CertificateProjection {
         not_before: None,
         not_after: None,
         public_key_algorithm: None,
+        rsa_public_key: None,
         malformed: true,
     }
+}
+
+fn x509_rsa_public_key_projection(
+    certificate: &X509Certificate<'_>,
+    source_part_path: &str,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> Option<RsaKeyValueProjection> {
+    let spki = certificate.public_key();
+    let algorithm = spki.algorithm.algorithm.to_string();
+    if algorithm != "1.2.840.113549.1.1.1" {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_CERTIFICATE_KEY_ALGORITHM_UNSUPPORTED",
+            source_part_path,
+            "X.509 SubjectPublicKeyInfo algorithm is not rsaEncryption",
+        ));
+        return None;
+    }
+    match spki.parsed() {
+        Ok(PublicKey::RSA(rsa_key)) => {
+            let modulus = unsigned_integer_bytes(rsa_key.modulus)?;
+            let exponent = unsigned_integer_bytes(rsa_key.exponent)?;
+            let exponent_value = rsa_key.try_exponent().ok();
+            if exponent_value.is_none_or(|value| value <= 1 || value % 2 == 0) {
+                diagnostics.push(signature_diag(
+                    "CVN_SIGNATURE_CERTIFICATE_RSA_EXPONENT_INVALID",
+                    source_part_path,
+                    "X.509 RSA public exponent is invalid",
+                ));
+                return None;
+            }
+            if modulus.is_empty() || exponent.is_empty() {
+                diagnostics.push(signature_diag(
+                    "CVN_SIGNATURE_CERTIFICATE_RSA_KEY_MALFORMED",
+                    source_part_path,
+                    "X.509 RSA public key has empty modulus or exponent",
+                ));
+                return None;
+            }
+            let modulus_b64 = base64::engine::general_purpose::STANDARD.encode(&modulus);
+            let exponent_b64 = base64::engine::general_purpose::STANDARD.encode(&exponent);
+            let fingerprint = sha256_hex(format!("{modulus_b64}:{exponent_b64}").as_bytes());
+            Some(RsaKeyValueProjection {
+                modulus_b64,
+                exponent_b64,
+                fingerprint,
+            })
+        }
+        Ok(_) => {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_CERTIFICATE_KEY_ALGORITHM_UNSUPPORTED",
+                source_part_path,
+                "X.509 SubjectPublicKeyInfo parsed as a non-RSA key",
+            ));
+            None
+        }
+        Err(_) => {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_CERTIFICATE_RSA_KEY_MALFORMED",
+                source_part_path,
+                "X.509 RSA SubjectPublicKeyInfo is malformed",
+            ));
+            None
+        }
+    }
+}
+
+fn unsigned_integer_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = bytes;
+    if value[0] == 0 {
+        value = &value[1..];
+    } else if value[0] & 0x80 != 0 {
+        return None;
+    }
+    if value.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some(value.to_vec())
 }
 
 fn parse_office_signature_info(
@@ -1798,7 +1887,7 @@ fn verify_xml_signature(
     } else {
         Some(sha256_hex(&signed_info_bytes))
     };
-    let (signature_value_status, key_fingerprint) = verify_signature_value(
+    let signature_value_result = verify_signature_value(
         &xml_signature.signed_info.signature_method,
         &signed_info_bytes,
         &xml_signature.signature_value,
@@ -1806,6 +1895,7 @@ fn verify_xml_signature(
         signature_part_path,
         &mut diagnostics,
     );
+    let signature_value_status = signature_value_result.status;
     if signature_value_status != SignatureVerificationStatus::Valid {
         overall_status = combine_signature_status(overall_status, signature_value_status);
     }
@@ -1833,7 +1923,10 @@ fn verify_xml_signature(
         cryptographic_validity: overall_status,
         certificate_trust: SignatureVerificationStatus::UnassessedTrust,
         signature_value_status,
-        key_fingerprint,
+        key_source: signature_value_result.key_source,
+        certificate_index: signature_value_result.certificate_index,
+        public_key_fingerprint: signature_value_result.fingerprint.clone(),
+        key_fingerprint: signature_value_result.fingerprint,
         signed_info_digest,
         references,
         diagnostics,
@@ -2092,9 +2185,9 @@ fn verify_signature_value(
     key_info: &SignatureKeyInfoProjection,
     signature_part_path: &str,
     diagnostics: &mut Vec<SignatureDiagnostic>,
-) -> (SignatureVerificationStatus, Option<String>) {
+) -> SignatureValueVerificationResult {
     if signed_info_bytes.is_empty() {
-        return (SignatureVerificationStatus::Malformed, None);
+        return SignatureValueVerificationResult::status(SignatureVerificationStatus::Malformed);
     }
     if signature_digest_for_method(signature_method).is_none() {
         diagnostics.push(signature_diag(
@@ -2102,7 +2195,9 @@ fn verify_signature_value(
             signature_part_path,
             "SignatureMethod is unsupported",
         ));
-        return (SignatureVerificationStatus::UnsupportedAlgorithm, None);
+        return SignatureValueVerificationResult::status(
+            SignatureVerificationStatus::UnsupportedAlgorithm,
+        );
     }
     let signature_bytes = match base64::engine::general_purpose::STANDARD.decode(
         signature_value
@@ -2117,18 +2212,25 @@ fn verify_signature_value(
                 signature_part_path,
                 "SignatureValue is not valid base64",
             ));
-            return (SignatureVerificationStatus::Invalid, None);
+            return SignatureValueVerificationResult::status(SignatureVerificationStatus::Invalid);
         }
     };
-    let Some((public_key, fingerprint)) =
-        public_key_from_key_info(key_info, diagnostics, signature_part_path)
-    else {
+    let candidates =
+        public_key_candidates_from_key_info(key_info, diagnostics, signature_part_path);
+    if candidates.is_empty() {
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CVN_SIGNATURE_CERTIFICATE_KEY_ALGORITHM_UNSUPPORTED"
+        }) {
+            return SignatureValueVerificationResult::status(
+                SignatureVerificationStatus::UnsupportedAlgorithm,
+            );
+        }
         diagnostics.push(signature_diag(
             "CVN_SIGNATURE_KEY_MISSING",
             signature_part_path,
             "no supported RSA public key is available",
         ));
-        return (SignatureVerificationStatus::MissingKey, None);
+        return SignatureValueVerificationResult::status(SignatureVerificationStatus::MissingKey);
     };
     let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_bytes.as_slice()) else {
         diagnostics.push(signature_diag(
@@ -2136,77 +2238,155 @@ fn verify_signature_value(
             signature_part_path,
             "SignatureValue length is invalid for RSA",
         ));
-        return (SignatureVerificationStatus::Invalid, Some(fingerprint));
+        return SignatureValueVerificationResult::status(SignatureVerificationStatus::Invalid);
     };
-    let verified = match signature_method {
-        RSA_SHA1 => VerifyingKey::<Sha1>::new(public_key).verify(signed_info_bytes, &signature),
-        RSA_SHA256 => VerifyingKey::<Sha256>::new(public_key).verify(signed_info_bytes, &signature),
-        RSA_SHA384 => VerifyingKey::<Sha384>::new(public_key).verify(signed_info_bytes, &signature),
-        RSA_SHA512 => VerifyingKey::<Sha512>::new(public_key).verify(signed_info_bytes, &signature),
-        _ => unreachable!("checked earlier"),
-    };
-    if verified.is_ok() {
-        (SignatureVerificationStatus::Valid, Some(fingerprint))
-    } else {
-        diagnostics.push(signature_diag(
-            "CVN_SIGNATURE_VALUE_MISMATCH",
-            signature_part_path,
-            "SignatureValue does not verify against SignedInfo and KeyInfo",
-        ));
-        (SignatureVerificationStatus::Invalid, Some(fingerprint))
+    let mut last_fingerprint = None;
+    for candidate in candidates {
+        last_fingerprint = Some(candidate.fingerprint.clone());
+        let verified = match signature_method {
+            RSA_SHA1 => VerifyingKey::<Sha1>::new(candidate.public_key)
+                .verify(signed_info_bytes, &signature),
+            RSA_SHA256 => VerifyingKey::<Sha256>::new(candidate.public_key)
+                .verify(signed_info_bytes, &signature),
+            RSA_SHA384 => VerifyingKey::<Sha384>::new(candidate.public_key)
+                .verify(signed_info_bytes, &signature),
+            RSA_SHA512 => VerifyingKey::<Sha512>::new(candidate.public_key)
+                .verify(signed_info_bytes, &signature),
+            _ => unreachable!("checked earlier"),
+        };
+        if verified.is_ok() {
+            return SignatureValueVerificationResult {
+                status: SignatureVerificationStatus::Valid,
+                key_source: Some(candidate.source),
+                certificate_index: candidate.certificate_index,
+                fingerprint: Some(candidate.fingerprint),
+            };
+        }
+    }
+    diagnostics.push(signature_diag(
+        "CVN_SIGNATURE_VALUE_MISMATCH",
+        signature_part_path,
+        "SignatureValue does not verify against any KeyInfo public key candidate",
+    ));
+    diagnostics.push(signature_diag(
+        "CVN_SIGNATURE_KEY_CANDIDATES_EXHAUSTED",
+        signature_part_path,
+        "all supported KeyInfo public key candidates were tried",
+    ));
+    SignatureValueVerificationResult {
+        status: SignatureVerificationStatus::Invalid,
+        key_source: None,
+        certificate_index: None,
+        fingerprint: last_fingerprint,
     }
 }
 
-fn public_key_from_key_info(
+struct SignatureValueVerificationResult {
+    status: SignatureVerificationStatus,
+    key_source: Option<SignatureKeySource>,
+    certificate_index: Option<usize>,
+    fingerprint: Option<String>,
+}
+
+impl SignatureValueVerificationResult {
+    fn status(status: SignatureVerificationStatus) -> Self {
+        Self {
+            status,
+            key_source: None,
+            certificate_index: None,
+            fingerprint: None,
+        }
+    }
+}
+
+struct PublicKeyCandidate {
+    public_key: RsaPublicKey,
+    fingerprint: String,
+    source: SignatureKeySource,
+    certificate_index: Option<usize>,
+}
+
+fn public_key_candidates_from_key_info(
     key_info: &SignatureKeyInfoProjection,
     diagnostics: &mut Vec<SignatureDiagnostic>,
     signature_part_path: &str,
-) -> Option<(RsaPublicKey, String)> {
+) -> Vec<PublicKeyCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen_fingerprints = BTreeSet::new();
     if let Some(key_value) = &key_info.key_value_rsa {
-        let modulus = base64::engine::general_purpose::STANDARD
-            .decode(
-                key_value
-                    .modulus_b64
-                    .split_whitespace()
-                    .collect::<String>()
-                    .as_bytes(),
-            )
-            .ok()?;
-        let exponent = base64::engine::general_purpose::STANDARD
-            .decode(
-                key_value
-                    .exponent_b64
-                    .split_whitespace()
-                    .collect::<String>()
-                    .as_bytes(),
-            )
-            .ok()?;
-        let key = RsaPublicKey::new(
-            BigUint::from_bytes_be(&modulus),
-            BigUint::from_bytes_be(&exponent),
-        )
-        .ok()?;
-        return Some((key, key_value.fingerprint.clone()));
+        if let Some(key) = rsa_public_key_from_projection(key_value) {
+            if seen_fingerprints.insert(key_value.fingerprint.clone()) {
+                candidates.push(PublicKeyCandidate {
+                    public_key: key,
+                    fingerprint: key_value.fingerprint.clone(),
+                    source: SignatureKeySource::RsaKeyValue,
+                    certificate_index: None,
+                });
+            }
+        } else {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_CERTIFICATE_RSA_KEY_MALFORMED",
+                signature_part_path,
+                "RSAKeyValue public key is malformed",
+            ));
+        }
     }
-    for certificate in &key_info.x509_certificates {
+    for (index, certificate) in key_info.x509_certificates.iter().enumerate() {
         if certificate.malformed {
             continue;
         }
-        let Ok(der) =
-            base64::engine::general_purpose::STANDARD.decode(certificate.der_sha256.as_bytes())
-        else {
+        let Some(key_value) = certificate.rsa_public_key.as_ref() else {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_CERTIFICATE_PUBLIC_KEY_MISSING",
+                signature_part_path,
+                "X.509 certificate has no supported RSA public key candidate",
+            ));
             continue;
         };
-        let _ = der;
+        let Some(key) = rsa_public_key_from_projection(key_value) else {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_CERTIFICATE_RSA_KEY_MALFORMED",
+                signature_part_path,
+                "X.509 RSA public key projection is malformed",
+            ));
+            continue;
+        };
+        if seen_fingerprints.insert(key_value.fingerprint.clone()) {
+            candidates.push(PublicKeyCandidate {
+                public_key: key,
+                fingerprint: key_value.fingerprint.clone(),
+                source: SignatureKeySource::X509Certificate,
+                certificate_index: Some(index),
+            });
+        }
     }
-    if !key_info.x509_certificates.is_empty() {
-        diagnostics.push(signature_diag(
-            "CVN_SIGNATURE_KEY_MISSING",
-            signature_part_path,
-            "X.509 metadata was projected, but RSA public key extraction is unavailable without KeyValue",
-        ));
-    }
-    None
+    candidates
+}
+
+fn rsa_public_key_from_projection(key_value: &RsaKeyValueProjection) -> Option<RsaPublicKey> {
+    let modulus = base64::engine::general_purpose::STANDARD
+        .decode(
+            key_value
+                .modulus_b64
+                .split_whitespace()
+                .collect::<String>()
+                .as_bytes(),
+        )
+        .ok()?;
+    let exponent = base64::engine::general_purpose::STANDARD
+        .decode(
+            key_value
+                .exponent_b64
+                .split_whitespace()
+                .collect::<String>()
+                .as_bytes(),
+        )
+        .ok()?;
+    RsaPublicKey::new(
+        BigUint::from_bytes_be(&modulus),
+        BigUint::from_bytes_be(&exponent),
+    )
+    .ok()
 }
 
 fn signed_info_canonical_bytes(
@@ -6240,6 +6420,7 @@ mod tests {
 
     use base64::Engine;
     use rsa::pkcs1v15::SigningKey;
+    use rsa::pkcs8::DecodePrivateKey;
     use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
     use rsa::RsaPrivateKey;
@@ -6381,6 +6562,122 @@ mod tests {
         path
     }
 
+    enum X509FixtureKeyInfo<'a> {
+        X509Only {
+            certificates: Vec<&'a str>,
+        },
+        RsaKeyValueAndX509 {
+            certificates: Vec<&'a str>,
+            bad_rsa_key_value: bool,
+        },
+    }
+
+    fn write_x509_signed_docx(
+        name: &str,
+        key_info: X509FixtureKeyInfo<'_>,
+        tamper_signature_value: bool,
+    ) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+        let document_bytes = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>x509 signed</w:t></w:r></w:p></w:body></w:document>".to_vec();
+        let digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&document_bytes));
+        let private_der = base64::engine::general_purpose::STANDARD
+            .decode(RSA1_PKCS8_B64)
+            .unwrap();
+        let private_key = RsaPrivateKey::from_pkcs8_der(&private_der).unwrap();
+        let public_key = private_key.to_public_key();
+        let signed_info = format!(
+            "<ds:SignedInfo xmlns:ds=\"{DSIG_NAMESPACE}\"><ds:CanonicalizationMethod Algorithm=\"{C14N_10}\"/><ds:SignatureMethod Algorithm=\"{RSA_SHA256}\"/><ds:Reference URI=\"/word/document.xml\"><ds:DigestMethod Algorithm=\"{SHA256_DIGEST}\"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"
+        );
+        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let mut signature_value = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(signed_info.as_bytes()).to_vec());
+        if tamper_signature_value {
+            signature_value.replace_range(
+                0..1,
+                if signature_value.starts_with('A') {
+                    "B"
+                } else {
+                    "A"
+                },
+            );
+        }
+        let key_info_xml = x509_fixture_key_info_xml(key_info, &public_key);
+        let signature_xml = format!(
+            "<ds:Signature xmlns:ds=\"{DSIG_NAMESPACE}\">{signed_info}<ds:SignatureValue>{signature_value}</ds:SignatureValue>{key_info_xml}<ds:Object Id=\"idOfficeObject\"><SignatureInfoV1><SetupID>setup</SetupID><SignatureComments>x509 fixture</SignatureComments><SignatureType>1</SignatureType></SignatureInfoV1></ds:Object></ds:Signature>"
+        );
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        add(&mut zip, options, "[Content_Types].xml", br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/_xmlsignatures/origin.sigs" ContentType="application/vnd.openxmlformats-package.digital-signature-origin"/><Override PartName="/_xmlsignatures/sig1.xml" ContentType="application/vnd.openxmlformats-package.digital-signature-xmlsignature+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDoc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rSigOrigin" Type="http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin" Target="_xmlsignatures/origin.sigs"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", &document_bytes);
+        add(&mut zip, options, "_xmlsignatures/origin.sigs", b"");
+        add(&mut zip, options, "_xmlsignatures/_rels/origin.sigs.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rSig1" Type="http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/signature" Target="sig1.xml"/></Relationships>"#);
+        add(
+            &mut zip,
+            options,
+            "_xmlsignatures/sig1.xml",
+            signature_xml.as_bytes(),
+        );
+        zip.finish().unwrap();
+        path
+    }
+
+    fn x509_fixture_key_info_xml(
+        key_info: X509FixtureKeyInfo<'_>,
+        valid_public_key: &rsa::RsaPublicKey,
+    ) -> String {
+        let mut xml = String::from("<ds:KeyInfo>");
+        match key_info {
+            X509FixtureKeyInfo::X509Only { certificates } => {
+                push_x509_data(&mut xml, certificates);
+            }
+            X509FixtureKeyInfo::RsaKeyValueAndX509 {
+                certificates,
+                bad_rsa_key_value,
+            } => {
+                let (modulus, exponent) = if bad_rsa_key_value {
+                    let mut rng = rsa::rand_core::OsRng;
+                    let bad_key = RsaPrivateKey::new(&mut rng, 2048).unwrap().to_public_key();
+                    (bad_key.n().to_bytes_be(), bad_key.e().to_bytes_be())
+                } else {
+                    (
+                        valid_public_key.n().to_bytes_be(),
+                        valid_public_key.e().to_bytes_be(),
+                    )
+                };
+                xml.push_str("<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>");
+                xml.push_str(&base64::engine::general_purpose::STANDARD.encode(modulus));
+                xml.push_str("</ds:Modulus><ds:Exponent>");
+                xml.push_str(&base64::engine::general_purpose::STANDARD.encode(exponent));
+                xml.push_str("</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>");
+                push_x509_data(&mut xml, certificates);
+            }
+        }
+        xml.push_str("</ds:KeyInfo>");
+        xml
+    }
+
+    fn push_x509_data(xml: &mut String, certificates: Vec<&str>) {
+        xml.push_str("<ds:X509Data>");
+        for certificate in certificates {
+            xml.push_str("<ds:X509Certificate>");
+            xml.push_str(certificate);
+            xml.push_str("</ds:X509Certificate>");
+        }
+        xml.push_str("</ds:X509Data>");
+    }
+
+    const RSA1_PKCS8_B64: &str = "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDMf7EATZAVhQv7/88hdEpP0hD4LZKEyv+8fismtMkqaAfqRLserz6ljCf9kgeCQTgti53peBtH/yckPdcV3dbDRwTY+sINEzn1C7pA7j2RPd+oCMr6S19xngMofDZeiJ8WjWni3zdf5UZG/9jOPlYE7UFijfucbpfRccsAf5TEJu8lWgU/Vm5VUqmLJm/ViGynfAs6VIbvXY01ctQp+DtkKzZ3hN0/QWSHrr0LvMUZ58I3keirrky1TOFzDZctwcqJWb0xrByVBvDzISWL/E6J+mV0/WGuWI/vXGWokFduk8TVLhw9HxRgmwe/WdmYMj5oKVCtvXLpYu9Rw50QCRFhAgMBAAECggEAATElWPkaw+VYoollLa692CVDUA8D8Z41S2X43mrjWUnt8eGgrZcb6F8exI2bWZkDuNA9hWTb09ma4s0xecEnRVAeqR0dEHJyPglpdoNs/HG94f7bIAZccg8XuZ6vunFVbA469cWTTw3JERTgsKMQYUr4vJhTRSAn5mKhaklUFqiYxK2VX8KFmwZU4gHpV8c4bcZtQn1ZvrMPXo2yYJXQc1oS1oM1zC6z76uUTeOcDUZYCN8+5gKxjwP5HT8NjH+wv5cNiZsWodXD+uq4Q9vsVCA6glOjsWWVuLS0CzP+DxUNba94PI0eIGDshK+WgU7AeA1NMtlDuHGcFIKnwqqOAQKBgQDvrY/mlOB9SRyGnw+ET8l7A5DWqSUGvdmWQtOeYutEcI09WYgBKzlj/g5B5eRaoPCA5G0NDIc3WroxpOf/iO0XwjDpHNALGkP9olEuGSZQ6Z9N8uLD/uaP2XSpYxluJ1PGLusdNlY1oF1Bwig4lCSp/1e80SrItbudTo4Vz56ZcQKBgQDabNTOr+RFypQFNUZEMO23VvKNwQciVoE85y9XGK5y0cIIzuCBWA1Iqh582Co28qtR7xpKBqFXOWECFmlqX6TzmGG00BWK1EvJTwDEIPNaEz/cKYswbOnhEEJf2jcSG515dr+ynVUmIAo9idsM+ys3Y5x3nUSLkeyqZI8l3QV+8QKBgDxxCXv9iUsu98mfLRuRv16NPKZVi2fS0p9JBPLJQUlGFOgmvtyEmPl1ZQULQ3XzZhMrB7Eluqej8pZ4XqUbU6cNKqZuxKw4GHNKzqwQXZBECg9vM+53Ro96KChbPFuCAWdWB6abQExPv5TIsLnr6f8QzIBqQx7QbZqy57PqYrWRAoGBAKzlIL5KdILaC7jjpq8rm79YT77tYFxJ5Rr0VIC4xL2WU+Ts/MDllf5Cysc/xIqiJAJDJaga/3MvtB4W53KQKt23bP/XBnZR/Xtn0c9t1bMjMZVwPQEj9S111VRSQu1OdqRC3xLffxsimXiEuqPX3SmG67+y+SMRayilWLo77bHBAoGBAMIbMu7LAymVwuMUwCyWBhZv09XacDdnZ59hb7kAlQtyqmqnrXyOAd8ESz1r2xONA5AkAXpkZFdxFyvQ4TeIDG4b1WeVeC2YtV9cqjNI/oIB/XTuTEEttpn3UjFPTK/5zS93B9mPXsxzzVNI83CcEAL1p2miOIdXsdMCBzsE9gM3";
+    const RSA1_CERT_B64: &str = "MIICyjCCAbKgAwIBAgIUEY9fqe5jyxGm1tqMPwNuhuPePXAwDQYJKoZIhvcNAQELBQAwHzEdMBsGA1UEAwwUVFVGRi1DVk4gUlNBIGZpeHR1cmUwHhcNMjYwMTAxMDAwMDAwWhcNMjcwMTAxMDAwMDAwWjAfMR0wGwYDVQQDDBRUVUZGLUNWTiBSU0EgZml4dHVyZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMx/sQBNkBWFC/v/zyF0Sk/SEPgtkoTK/7x+Kya0ySpoB+pEux6vPqWMJ/2SB4JBOC2Lnel4G0f/JyQ91xXd1sNHBNj6wg0TOfULukDuPZE936gIyvpLX3GeAyh8Nl6InxaNaeLfN1/lRkb/2M4+VgTtQWKN+5xul9FxywB/lMQm7yVaBT9WblVSqYsmb9WIbKd8CzpUhu9djTVy1Cn4O2QrNneE3T9BZIeuvQu8xRnnwjeR6KuuTLVM4XMNly3ByolZvTGsHJUG8PMhJYv8Ton6ZXT9Ya5Yj+9cZaiQV26TxNUuHD0fFGCbB79Z2ZgyPmgpUK29culi71HDnRAJEWECAwEAATANBgkqhkiG9w0BAQsFAAOCAQEAn/s463UQRE2dFK8XCPGC/kn5Xc3bLho7UsphclGgpjTUJA1Ysv0yHwNxavWECaKFORMP7ZSOVFojIKlbF/jdglJuySvZ0yd35qvdnaIL/Jm+niWfmARUMzMeRI0NSes9vyGDbWoouxcCea9d6h/Ncxy4/xQzyfr4VEm6IbRiKA7fvLE3dte98zAsSidcZ8CivBakApJ6bxyevUd+eOWKhD/0+gOWrEdrZVA1Blvna+2BBp5ZKAg2WnQ9ZlS5a5xfbvitjL6lIG2WkvlQG3smJ5y/o3/6UtE+c5bxf1Ba/t6/X3nqWTeePgEhwjy0uXMhrVYL7fbHk1Y0pryZaVQNZw==";
+    const RSA2_CERT_B64: &str = "MIIC1jCCAb6gAwIBAgIULc1xT5RKtySzZNEt8SQdWxAjUKowDQYJKoZIhvcNAQELBQAwJTEjMCEGA1UEAwwaVFVGRi1DVk4gb3RoZXIgUlNBIGZpeHR1cmUwHhcNMjYwMTAxMDAwMDAwWhcNMjcwMTAxMDAwMDAwWjAlMSMwIQYDVQQDDBpUVUZGLUNWTiBvdGhlciBSU0EgZml4dHVyZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANK8UBCGj5m2VEe06bdG7AfsJD+51qznbQLF8MZl4csNayWu30M4X5hRRLop3O9kT1hno2sjLISISGvJEwOEXzxJ6JLF/hS9WEQX8Uo5E1K4a2OJCDAicyK8KB9waRm2oHha3GERORnPr3Oob78vr3IentcRzeFfpnfzSLlZ4T+vhA3eiU6G8/HDyotumPqpYkgrhC8b/7LRmF+JkTPc0Ytfe2Mj4MgpUhtaok6yknrJ+atISz0EL/d4AthkJVjQnGrJXfpVIhVI5dwmNN0b+DideIDGNvXzW03yjipC+E+GmNy36rH6keqcpa7Uj/cazUOOS2w2+mTOfoIezTSP/Y8CAwEAATANBgkqhkiG9w0BAQsFAAOCAQEAHRpXGS/SgBlBFhCQoG8CUCGpvQED3aF8gd7kie76IHyaf1UEvzw1d2X7+uOfidjQ/YldhqGrPrBv6gE2VshQX+SJFLKk07rOzx7e5ELGx2bbedyW4UOTC/5zUqrK5z7KvYiLJ7IrP4P4n11UHnT1kK3KP0qDMYkGKVbv8mVoW1AFVDk5sY56pUO1Qet3OTaEmc3oBwLZyfQIbp2IZtL4qIxwzZQfzDcAyjZkRag/0+q2agKg2TBjb+zVquzAdkv25psKExmuvWA1yzQe3gKsQCcUElxcC0xR2cEM+iSgbzClDRjKjdFM3hWQL4epj9mShuZ7/LM1s5ppP5sF3IhOtA==";
+    const EC_CERT_B64: &str = "MIIBPDCB4qADAgECAhRQY9nW63QiYQ+KTw+hRRka/wOk/zAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNUVUZGLUNWTiBFQyBmaXh0dXJlMB4XDTI2MDEwMTAwMDAwMFoXDTI3MDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTVFVGRi1DVk4gRUMgZml4dHVyZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOydcTcN3lLwlHKuzRe6vI/SE26bWc0YrTTTsO1lJOOnCaD9vX955H7WnwMsIvtwUaR9+fa0b3jL1vfi0tv0WycwCgYIKoZIzj0EAwIDSQAwRgIhAMTTpVulPEPL+PScdgY6nclr05C6TGtC+0ZmEs/S4kvAAiEAqfSnUrSczbsP7uxJGVmGIfOgjUvkQMFwCgU7IPXHC08=";
+
     #[test]
     fn signature_reference_digest_mismatch_is_reported() {
         let docx = write_signed_docx("signature-reference-tamper", true, false);
@@ -6416,6 +6713,219 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.code == "CVN_SIGNATURE_VALUE_MISMATCH"));
 
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn x509_only_signature_verifies_with_certificate_public_key() {
+        let docx = write_x509_signed_docx(
+            "x509-only-valid",
+            X509FixtureKeyInfo::X509Only {
+                certificates: vec![RSA1_CERT_B64],
+            },
+            false,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.cryptographic_validity,
+            SignatureVerificationStatus::Valid
+        );
+        assert_eq!(
+            signature.verification.key_source,
+            Some(SignatureKeySource::X509Certificate)
+        );
+        assert_eq!(signature.verification.certificate_index, Some(0));
+        assert!(signature.verification.public_key_fingerprint.is_some());
+        assert_eq!(
+            signature.verification.certificate_trust,
+            SignatureVerificationStatus::UnassessedTrust
+        );
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn rsa_key_value_is_preferred_when_it_matches_x509_key() {
+        let docx = write_x509_signed_docx(
+            "rsa-key-value-and-x509",
+            X509FixtureKeyInfo::RsaKeyValueAndX509 {
+                certificates: vec![RSA1_CERT_B64],
+                bad_rsa_key_value: false,
+            },
+            false,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.status,
+            SignatureVerificationStatus::Valid
+        );
+        assert_eq!(
+            signature.verification.key_source,
+            Some(SignatureKeySource::RsaKeyValue)
+        );
+        assert_eq!(signature.verification.certificate_index, None);
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn bad_rsa_key_value_falls_back_to_valid_x509_key() {
+        let docx = write_x509_signed_docx(
+            "bad-rsa-key-value-valid-x509",
+            X509FixtureKeyInfo::RsaKeyValueAndX509 {
+                certificates: vec![RSA1_CERT_B64],
+                bad_rsa_key_value: true,
+            },
+            false,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.status,
+            SignatureVerificationStatus::Valid
+        );
+        assert_eq!(
+            signature.verification.key_source,
+            Some(SignatureKeySource::X509Certificate)
+        );
+        assert_eq!(signature.verification.certificate_index, Some(0));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn multiple_x509_certificates_select_matching_certificate_index() {
+        let docx = write_x509_signed_docx(
+            "multiple-x509",
+            X509FixtureKeyInfo::X509Only {
+                certificates: vec![RSA2_CERT_B64, RSA1_CERT_B64],
+            },
+            false,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.status,
+            SignatureVerificationStatus::Valid
+        );
+        assert_eq!(
+            signature.verification.key_source,
+            Some(SignatureKeySource::X509Certificate)
+        );
+        assert_eq!(signature.verification.certificate_index, Some(1));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn x509_non_rsa_certificate_is_unsupported_algorithm() {
+        let docx = write_x509_signed_docx(
+            "x509-non-rsa",
+            X509FixtureKeyInfo::X509Only {
+                certificates: vec![EC_CERT_B64],
+            },
+            false,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.status,
+            SignatureVerificationStatus::UnsupportedAlgorithm
+        );
+        assert!(signature.verification.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CVN_SIGNATURE_CERTIFICATE_KEY_ALGORITHM_UNSUPPORTED"
+        }));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn x509_public_key_tamper_causes_signature_value_mismatch() {
+        let docx = write_x509_signed_docx(
+            "x509-public-key-tamper",
+            X509FixtureKeyInfo::X509Only {
+                certificates: vec![RSA2_CERT_B64],
+            },
+            false,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.signature_value_status,
+            SignatureVerificationStatus::Invalid
+        );
+        assert!(signature
+            .verification
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_SIGNATURE_VALUE_MISMATCH"));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn x509_only_signature_value_tamper_is_detected() {
+        let docx = write_x509_signed_docx(
+            "x509-signature-value-tamper",
+            X509FixtureKeyInfo::X509Only {
+                certificates: vec![RSA1_CERT_B64],
+            },
+            true,
+        );
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.signature_value_status,
+            SignatureVerificationStatus::Invalid
+        );
+        assert!(signature
+            .verification
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_SIGNATURE_VALUE_MISMATCH"));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn x509_only_signature_import_is_deterministic() {
+        let docx = write_x509_signed_docx(
+            "x509-deterministic",
+            X509FixtureKeyInfo::X509Only {
+                certificates: vec![RSA1_CERT_B64],
+            },
+            false,
+        );
+        let package_a = import_docx(&docx).unwrap();
+        let package_b = import_docx(&docx).unwrap();
+        assert_eq!(package_a.document.signatures, package_b.document.signatures);
+
+        let out_a = std::env::temp_dir().join(format!(
+            "tuff-cvn-x509-deterministic-a-{}",
+            std::process::id()
+        ));
+        let out_b = std::env::temp_dir().join(format!(
+            "tuff-cvn-x509-deterministic-b-{}",
+            std::process::id()
+        ));
+        cleanup_dir(&out_a);
+        cleanup_dir(&out_b);
+        write_package(&out_a, &package_a).unwrap();
+        write_package(&out_b, &package_b).unwrap();
+        let cvn_a = fs::read(out_a.join(cvn_package::MANIFEST_FILE)).unwrap();
+        let cvn_b = fs::read(out_b.join(cvn_package::MANIFEST_FILE)).unwrap();
+        assert_eq!(cvn_a, cvn_b);
+        cleanup_dir(&out_a);
+        cleanup_dir(&out_b);
         std::fs::remove_file(docx).unwrap();
     }
 
@@ -7398,5 +7908,11 @@ mod tests {
     ) {
         zip.start_file(path, options).unwrap();
         zip.write_all(bytes).unwrap();
+    }
+
+    fn cleanup_dir(path: &std::path::Path) {
+        if path.exists() {
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 }
