@@ -170,6 +170,8 @@ pub struct CvnDocument {
     pub semantic: SemanticDocument,
     #[serde(default)]
     pub track_changes: Option<TrackChangesProjection>,
+    #[serde(default)]
+    pub mce: Option<MceProjection>,
     pub warnings: Vec<CvnWarning>,
     pub checksums: Vec<ChecksumEntry>,
 }
@@ -190,6 +192,7 @@ impl CvnDocument {
             opc: OpcPackageProjection::default(),
             semantic: SemanticDocument::default(),
             track_changes: None,
+            mce: None,
             warnings: Vec::new(),
             checksums: Vec::new(),
         }
@@ -437,6 +440,87 @@ pub struct SemanticDocument {
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
 }
 
+/// Read-only projection of MCE AlternateContent and compatibility metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceProjection {
+    pub source_part: String,
+    pub capability_version: String,
+    pub capabilities: MceCapabilities,
+    pub alternate_contents: Vec<MceAlternateContentProjection>,
+    pub diagnostics: Vec<MceResolutionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceCapabilities {
+    pub version: String,
+    pub supported_namespaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceAlternateContentProjection {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    pub branch_kind: MceSelection,
+    pub branches: Vec<MceBranchProjection>,
+    pub compatibility: Option<MceCompatibilityAttributes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceBranchProjection {
+    pub kind: MceBranchKind,
+    pub requires_raw: Option<String>,
+    pub requires: Vec<MceNamespaceRequirement>,
+    pub selected: bool,
+    pub raw_digest: String,
+    pub raw_content: String,
+    pub content: Vec<SemanticBlock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MceBranchKind {
+    Choice,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MceSelection {
+    SelectedChoice,
+    SelectedFallback,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceNamespaceRequirement {
+    pub prefix: String,
+    pub namespace_uri: Option<String>,
+    pub supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceCompatibilityAttributes {
+    pub ignorable_raw: Option<String>,
+    pub ignorable_namespaces: Vec<String>,
+    pub process_content: Vec<MceQualifiedName>,
+    pub preserve_elements: Vec<MceQualifiedName>,
+    pub preserve_attributes: Vec<MceQualifiedName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceQualifiedName {
+    pub raw: String,
+    pub namespace_uri: Option<String>,
+    pub local_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
 /// Read-only projection of tracked changes across a DOCX story part.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackChangesProjection {
@@ -558,6 +642,7 @@ pub enum SemanticBlock {
     Paragraph(SemanticParagraph),
     Table(SemanticTable),
     TrackedChange(TrackedChange),
+    MceSelectedContent(MceSelectedContent),
 }
 
 /// Semantic paragraph.
@@ -649,6 +734,12 @@ pub enum SemanticInline {
         comment_id: String,
     },
     TrackedChange(TrackedChange),
+    MceSelectedContent(MceSelectedContent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MceSelectedContent {
+    pub projection: MceAlternateContentProjection,
 }
 
 /// Source anchor for semantic nodes.
@@ -993,6 +1084,7 @@ pub enum IntegrityNodeKind {
     NumberingProjection,
     StoryProjection,
     TrackChangesProjection,
+    MceProjection,
     Objects,
 }
 
@@ -1009,6 +1101,7 @@ impl IntegrityNodeKind {
             Self::NumberingProjection => "numbering_projection",
             Self::StoryProjection => "story_projection",
             Self::TrackChangesProjection => "track_changes_projection",
+            Self::MceProjection => "mce_projection",
             Self::Objects => "objects",
         }
     }

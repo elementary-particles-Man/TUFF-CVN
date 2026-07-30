@@ -22,7 +22,7 @@ pub const MANIFEST_FILE: &str = "cvn.json";
 
 /// Content-addressed object prefix inside a CVN preservation package.
 pub const SHA256_OBJECT_PREFIX: &str = "objects/sha256";
-pub const INTEGRITY_VERSION: &str = "cvn-integrity-v6-track-changes";
+pub const INTEGRITY_VERSION: &str = "cvn-integrity-v7-mce";
 
 const DOMAIN_PAYLOAD: &[u8] = b"TUFF-CVN\0payload\0";
 const DOMAIN_PART_MAP: &[u8] = b"TUFF-CVN\0part-map\0";
@@ -33,6 +33,7 @@ const DOMAIN_STYLES: &[u8] = b"TUFF-CVN\0styles\0";
 const DOMAIN_NUMBERING: &[u8] = b"TUFF-CVN\0numbering\0";
 const DOMAIN_STORIES: &[u8] = b"TUFF-CVN\0stories\0";
 const DOMAIN_TRACK_CHANGES: &[u8] = b"TUFF-CVN\0track-changes\0";
+const DOMAIN_MCE: &[u8] = b"TUFF-CVN\0mce\0";
 const DOMAIN_OBJECTS: &[u8] = b"TUFF-CVN\0objects\0";
 const DOMAIN_ROOT: &[u8] = b"TUFF-CVN\0root\0";
 
@@ -405,6 +406,11 @@ fn calculate_integrity_nodes(
             to_canonical_bytes(&document.track_changes)?,
         ),
         (
+            IntegrityNodeKind::MceProjection,
+            DOMAIN_MCE,
+            to_canonical_bytes(&document.mce)?,
+        ),
+        (
             IntegrityNodeKind::Objects,
             DOMAIN_OBJECTS,
             to_canonical_bytes(&object_inventory_projection(objects))?,
@@ -445,7 +451,7 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn integrity_node_order() -> [IntegrityNodeKind; 10] {
+fn integrity_node_order() -> [IntegrityNodeKind; 11] {
     [
         IntegrityNodeKind::CanonicalPayload,
         IntegrityNodeKind::PartMap,
@@ -456,6 +462,7 @@ fn integrity_node_order() -> [IntegrityNodeKind; 10] {
         IntegrityNodeKind::NumberingProjection,
         IntegrityNodeKind::StoryProjection,
         IntegrityNodeKind::TrackChangesProjection,
+        IntegrityNodeKind::MceProjection,
         IntegrityNodeKind::Objects,
     ]
 }
@@ -471,6 +478,7 @@ fn mismatch_code(kind: IntegrityNodeKind) -> &'static str {
         IntegrityNodeKind::NumberingProjection => "CVN_NUMBERING_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::StoryProjection => "CVN_STORY_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::TrackChangesProjection => "CVN_TRACK_CHANGES_PROJECTION_DIGEST_MISMATCH",
+        IntegrityNodeKind::MceProjection => "CVN_MCE_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::Objects => "CVN_OBJECT_INVENTORY_DIGEST_MISMATCH",
     }
 }
@@ -652,8 +660,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use cvn_core::{
-        ContentTypesProjection, DocumentId, OpaqueEntry, OpcPackageProjection, OpcPart,
-        OpcRelationship, PreservationMode, TargetMode, ZipEntryMetadata,
+        ContentTypesProjection, DocumentId, MceCapabilities, MceProjection, OpaqueEntry,
+        OpcPackageProjection, OpcPart, OpcRelationship, PreservationMode, TargetMode,
+        ZipEntryMetadata,
     };
 
     use super::*;
@@ -898,6 +907,28 @@ mod tests {
     }
 
     #[test]
+    fn mce_projection_change_is_detected() {
+        let temp = write_integrity_fixture("mce-change");
+        let path = temp.join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["payload"]["mce"]["capability_version"] =
+            serde_json::Value::String("tampered".to_owned());
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let report = verify_package_integrity(&temp).unwrap();
+
+        assert!(!report.passed);
+        assert!(has_package_failure(
+            &report,
+            "CVN_MCE_PROJECTION_DIGEST_MISMATCH"
+        ));
+        assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
+
+        cleanup(&temp);
+    }
+
+    #[test]
     fn object_blob_change_is_detected() {
         let temp = write_integrity_fixture("object-change");
         let digest = package_with_one_object().objects[0].digest.clone();
@@ -958,6 +989,19 @@ mod tests {
         let bytes = b"payload bytes".to_vec();
         let digest = sha256_hex(&bytes);
         let mut document = CvnDocument::minimal(DocumentId::new("doc-1").unwrap());
+        document.mce = Some(MceProjection {
+            source_part: "docx-mce".to_owned(),
+            capability_version: "cvn-mce-capabilities-v1".to_owned(),
+            capabilities: MceCapabilities {
+                version: "cvn-mce-capabilities-v1".to_owned(),
+                supported_namespaces: vec![
+                    "http://purl.oclc.org/ooxml/wordprocessingml/main".to_owned(),
+                    "http://schemas.openxmlformats.org/wordprocessingml/2006/main".to_owned(),
+                ],
+            },
+            alternate_contents: Vec::new(),
+            diagnostics: Vec::new(),
+        });
         document.opaque.push(OpaqueEntry {
             id: cvn_core::OpaqueId::new(format!("sha256:{digest}")).unwrap(),
             media_type: "application/octet-stream".to_owned(),

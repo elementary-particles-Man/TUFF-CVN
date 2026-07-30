@@ -8,23 +8,26 @@ use std::path::Path;
 use cvn_core::{
     AbstractNumberingProjection, CommentProjection, CommentRangeProjection, ContentTypeDefault,
     ContentTypeOverride, ContentTypesProjection, CvnDocument, DocumentId,
-    HeaderFooterReferenceProjection, NoteProjection, NumberFormatProjection,
-    NumberingInstanceProjection, NumberingLevelProjection, NumberingReference,
-    NumberingRegistryProjection, NumberingResolutionDiagnostic, OpaqueEntry, OpcPackageProjection,
-    OpcPart, OpcRelationship, ParagraphPropertiesProjection, PreservationMode,
-    ResolvedStyleProjection, RunPropertiesProjection, SemanticBlock, SemanticDocument,
-    SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable,
-    SemanticTableCell, SemanticTableRow, SemanticText, SourceAnchor, SourceDescriptor,
-    SourceFormat, StoryPartKind, StoryPartProjection, StoryReference, StoryReferenceKind,
-    StoryRegistryProjection, StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference,
-    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
-    TrackChangesProjection, TrackedChange, TrackedChangeId, TrackedChangeKind,
-    TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling, UnsupportedSemanticFeature,
-    ZipEntryMetadata,
+    HeaderFooterReferenceProjection, MceAlternateContentProjection, MceBranchKind,
+    MceBranchProjection, MceCapabilities, MceCompatibilityAttributes, MceNamespaceRequirement,
+    MceProjection, MceQualifiedName, MceResolutionDiagnostic, MceSelection, NoteProjection,
+    NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
+    NumberingReference, NumberingRegistryProjection, NumberingResolutionDiagnostic, OpaqueEntry,
+    OpcPackageProjection, OpcPart, OpcRelationship, ParagraphPropertiesProjection,
+    PreservationMode, ResolvedStyleProjection, RunPropertiesProjection, SemanticBlock,
+    SemanticDocument, SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun,
+    SemanticTable, SemanticTableCell, SemanticTableRow, SemanticText, SourceAnchor,
+    SourceDescriptor, SourceFormat, StoryPartKind, StoryPartProjection, StoryReference,
+    StoryReferenceKind, StoryRegistryProjection, StoryResolutionDiagnostic,
+    StyleDefinitionProjection, StyleReference, StyleRegistryProjection, StyleResolutionDiagnostic,
+    StyleType, TargetMode, TrackChangesProjection, TrackedChange, TrackedChangeId,
+    TrackedChangeKind, TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling,
+    UnsupportedSemanticFeature, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use quick_xml::Writer;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::read::ZipArchive;
@@ -85,6 +88,22 @@ pub enum DocxImportError {
 /// Returns whether DOCX import is implemented.
 pub fn is_implemented() -> bool {
     true
+}
+
+const MCE_CAPABILITY_VERSION: &str = "cvn-mce-capabilities-v1";
+const MC_NAMESPACE: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+const WML_TRANSITIONAL_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const WML_STRICT_NAMESPACE: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
+
+fn mce_capabilities() -> MceCapabilities {
+    MceCapabilities {
+        version: MCE_CAPABILITY_VERSION.to_owned(),
+        supported_namespaces: vec![
+            WML_STRICT_NAMESPACE.to_owned(),
+            WML_TRANSITIONAL_NAMESPACE.to_owned(),
+        ],
+    }
 }
 
 /// Imports a DOCX into an in-memory CVN preservation package.
@@ -255,10 +274,13 @@ pub fn import_docx_with_limits(
         content_types,
         relationships,
     };
+    let mce_projection =
+        build_mce_projection(&document.document_id, &raw_parts, &objects_by_digest)?;
     if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/document.xml")
     {
+        let bytes = select_mce_branches(bytes)?;
         let (semantic, track_changes) =
-            parse_semantic_document(&document.document_id, "word/document.xml", bytes)?;
+            parse_semantic_document(&document.document_id, "word/document.xml", &bytes)?;
         document.semantic = semantic;
         document.track_changes = track_changes;
     }
@@ -276,6 +298,7 @@ pub fn import_docx_with_limits(
         &document.semantic.blocks,
     )?;
     document.semantic.stories = stories;
+    document.mce = Some(mce_projection);
     if let Some(mut projection) = document.track_changes.take() {
         for child in story_track_changes {
             projection.changes.extend(child.changes);
@@ -357,8 +380,9 @@ fn build_story_registry(
                 | StoryPartKind::FooterEven => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let bytes = select_mce_branches(bytes)?;
                         let (semantic, track_change) =
-                            parse_semantic_document(document_id, &part.path, bytes)?;
+                            parse_semantic_document(document_id, &part.path, &bytes)?;
                         if let Some(track_change) = track_change {
                             track_changes.push(track_change);
                         }
@@ -393,15 +417,16 @@ fn build_story_registry(
                 StoryPartKind::Footnotes => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let bytes = select_mce_branches(bytes)?;
                         let (semantic, track_change) =
-                            parse_semantic_document(document_id, &part.path, bytes)?;
+                            parse_semantic_document(document_id, &part.path, &bytes)?;
                         if let Some(track_change) = track_change {
                             track_changes.push(track_change);
                         }
                         let items = collect_note_items(
                             document_id,
                             &part.path,
-                            bytes,
+                            &bytes,
                             "footnote",
                             "CVN_FOOTNOTE_DUPLICATE_ID",
                             &mut diagnostics,
@@ -448,15 +473,16 @@ fn build_story_registry(
                 StoryPartKind::Endnotes => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let bytes = select_mce_branches(bytes)?;
                         let (semantic, track_change) =
-                            parse_semantic_document(document_id, &part.path, bytes)?;
+                            parse_semantic_document(document_id, &part.path, &bytes)?;
                         if let Some(track_change) = track_change {
                             track_changes.push(track_change);
                         }
                         let items = collect_note_items(
                             document_id,
                             &part.path,
-                            bytes,
+                            &bytes,
                             "endnote",
                             "CVN_ENDNOTE_DUPLICATE_ID",
                             &mut diagnostics,
@@ -503,15 +529,16 @@ fn build_story_registry(
                 StoryPartKind::Comments => {
                     has_candidates = true;
                     if let Some(bytes) = objects_by_digest.get(&part.digest) {
+                        let bytes = select_mce_branches(bytes)?;
                         let (semantic, track_change) =
-                            parse_semantic_document(document_id, &part.path, bytes)?;
+                            parse_semantic_document(document_id, &part.path, &bytes)?;
                         if let Some(track_change) = track_change {
                             track_changes.push(track_change);
                         }
                         let items = collect_comment_items(
                             document_id,
                             &part.path,
-                            bytes,
+                            &bytes,
                             &mut diagnostics,
                         )?;
                         let id = semantic_id(
@@ -585,6 +612,11 @@ fn story_block_has_prefix(block: &SemanticBlock, prefix: &str) -> bool {
         SemanticBlock::Paragraph(paragraph) => paragraph.source_anchor.xml_path.starts_with(prefix),
         SemanticBlock::Table(table) => table.source_anchor.xml_path.starts_with(prefix),
         SemanticBlock::TrackedChange(change) => change.source_anchor.xml_path.starts_with(prefix),
+        SemanticBlock::MceSelectedContent(content) => content
+            .projection
+            .source_anchor
+            .xml_path
+            .starts_with(prefix),
     }
 }
 
@@ -838,6 +870,7 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                                     return true;
                                 }
                             }
+                            SemanticInline::MceSelectedContent(_) => {}
                             SemanticInline::Text(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. } => {}
@@ -851,6 +884,7 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                 }
             }
             SemanticBlock::TrackedChange(_) => {}
+            SemanticBlock::MceSelectedContent(_) => {}
         }
     }
     false
@@ -1127,6 +1161,649 @@ fn resolve_content_type(content_types: &ContentTypesProjection, path: &str) -> O
         .iter()
         .find(|default| default.extension == extension)
         .map(|default| default.content_type.clone())
+}
+
+fn build_mce_projection(
+    document_id: &DocumentId,
+    parts: &[RawPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+) -> Result<MceProjection, DocxImportError> {
+    let mut alternate_contents = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut id_set = BTreeSet::new();
+    for part in parts
+        .iter()
+        .filter(|part| part.path == "word/document.xml" || is_story_xml_part(&part.path))
+    {
+        if let Some(bytes) = objects.get(&part.digest) {
+            scan_mce_part(
+                document_id,
+                &part.path,
+                bytes,
+                &mut alternate_contents,
+                &mut diagnostics,
+                &mut id_set,
+            )?;
+        }
+    }
+    alternate_contents.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    diagnostics.sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    Ok(MceProjection {
+        source_part: "docx-mce".to_owned(),
+        capability_version: MCE_CAPABILITY_VERSION.to_owned(),
+        capabilities: mce_capabilities(),
+        alternate_contents,
+        diagnostics,
+    })
+}
+
+fn is_story_xml_part(path: &str) -> bool {
+    path.starts_with("word/")
+        && path.ends_with(".xml")
+        && (path.contains("header")
+            || path.contains("footer")
+            || path.contains("footnote")
+            || path.contains("endnote")
+            || path.contains("comment"))
+}
+
+fn scan_mce_part(
+    document_id: &DocumentId,
+    source_part_path: &str,
+    bytes: &[u8],
+    alternate_contents: &mut Vec<MceAlternateContentProjection>,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+    id_set: &mut BTreeSet<String>,
+) -> Result<(), DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let document_digest = sha256_hex(bytes);
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                let path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                if name.namespace_uri.as_deref() == Some(MC_NAMESPACE)
+                    && name.local_name == "AlternateContent"
+                {
+                    let anchor = SourceAnchor {
+                        source_part_path: source_part_path.to_owned(),
+                        xml_path: path.clone(),
+                        byte_start: Some(reader.buffer_position()),
+                    };
+                    let projection = read_alternate_content(
+                        document_id,
+                        source_part_path,
+                        &document_digest,
+                        anchor,
+                        &attrs,
+                        &namespace_context(&namespace_stack),
+                        &mut reader,
+                        diagnostics,
+                        id_set,
+                    )?;
+                    alternate_contents.push(projection);
+                    path_stack.pop();
+                    child_counts.pop();
+                    namespace_stack.pop();
+                }
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let _path = next_path(&mut path_stack, &mut child_counts, &name.local_name);
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::End(_) => {
+                path_stack.pop();
+                child_counts.pop();
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(())
+}
+
+fn select_mce_branches(bytes: &[u8]) -> Result<Vec<u8>, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut id_set = BTreeSet::new();
+    let mut alternate_content_index = 0_u64;
+    let document_id = DocumentId::new("docx-preservation").expect("valid id");
+    let document_digest = sha256_hex(bytes);
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                if name.namespace_uri.as_deref() == Some(MC_NAMESPACE)
+                    && name.local_name == "AlternateContent"
+                {
+                    alternate_content_index = alternate_content_index.saturating_add(1);
+                    let projection = read_alternate_content(
+                        &document_id,
+                        "mce-selected",
+                        &document_digest,
+                        SourceAnchor {
+                            source_part_path: "mce-selected".to_owned(),
+                            xml_path: format!("/AlternateContent[{alternate_content_index}]"),
+                            byte_start: Some(reader.buffer_position()),
+                        },
+                        &attrs,
+                        &namespace_context(&namespace_stack),
+                        &mut reader,
+                        &mut diagnostics,
+                        &mut id_set,
+                    )?;
+                    if let Some(raw) = selected_branch_raw(&projection) {
+                        writer.get_mut().extend_from_slice(raw.as_bytes());
+                    }
+                    namespace_stack.pop();
+                } else {
+                    writer.write_event(Event::Start(event.into_owned()))?;
+                }
+            }
+            Event::Empty(event) => writer.write_event(Event::Empty(event.into_owned()))?,
+            Event::End(event) => {
+                writer.write_event(Event::End(event.into_owned()))?;
+                namespace_stack.pop();
+            }
+            Event::Text(event) => writer.write_event(Event::Text(event.into_owned()))?,
+            Event::CData(event) => writer.write_event(Event::CData(event.into_owned()))?,
+            Event::Comment(event) => writer.write_event(Event::Comment(event.into_owned()))?,
+            Event::Decl(event) => writer.write_event(Event::Decl(event.into_owned()))?,
+            Event::PI(event) => writer.write_event(Event::PI(event.into_owned()))?,
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: "mce-selected".to_owned(),
+                });
+            }
+            Event::Eof => break,
+            event => writer.write_event(event.into_owned())?,
+        }
+        buffer.clear();
+    }
+    Ok(writer.into_inner())
+}
+
+fn selected_branch_raw(projection: &MceAlternateContentProjection) -> Option<&str> {
+    projection
+        .branches
+        .iter()
+        .find(|branch| branch.selected)
+        .map(|branch| branch.raw_content.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_alternate_content(
+    document_id: &DocumentId,
+    source_part_path: &str,
+    document_digest: &str,
+    anchor: SourceAnchor,
+    attrs: &BTreeMap<String, String>,
+    ac_scope: &BTreeMap<String, String>,
+    reader: &mut Reader<Cursor<&[u8]>>,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+    id_set: &mut BTreeSet<String>,
+) -> Result<MceAlternateContentProjection, DocxImportError> {
+    let mut buffer = Vec::new();
+    let mut branches = Vec::new();
+    let mut saw_fallback = false;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                let mut branch_scope = ac_scope.clone();
+                branch_scope.extend(namespace_declarations(&event)?);
+                let name = qname_from_scope(event.name().as_ref(), &branch_scope);
+                if name.namespace_uri.as_deref() == Some(MC_NAMESPACE)
+                    && matches!(name.local_name.as_str(), "Choice" | "Fallback")
+                {
+                    if name.local_name == "Choice" && saw_fallback {
+                        diagnostics.push(mce_diag(
+                            "CVN_MCE_CHOICE_AFTER_FALLBACK",
+                            &anchor.source_anchor_path(),
+                            "mc:Choice appears after mc:Fallback",
+                        ));
+                    }
+                    if name.local_name == "Fallback" {
+                        if saw_fallback {
+                            diagnostics.push(mce_diag(
+                                "CVN_MCE_MULTIPLE_FALLBACK",
+                                &anchor.source_anchor_path(),
+                                "multiple mc:Fallback branches are present",
+                            ));
+                        }
+                        saw_fallback = true;
+                    }
+                    let branch_attrs = attributes(reader, &event)?;
+                    let raw_name = String::from_utf8_lossy(event.name().as_ref()).into_owned();
+                    let raw = format!(
+                        "{}{}{raw_name_end}",
+                        start_event_xml(&event)?,
+                        read_branch_xml(reader, &name.local_name)?,
+                        raw_name_end = format!("</{raw_name}>")
+                    );
+                    branches.push(build_mce_branch(
+                        if name.local_name == "Choice" {
+                            MceBranchKind::Choice
+                        } else {
+                            MceBranchKind::Fallback
+                        },
+                        &branch_attrs,
+                        &branch_scope,
+                        &raw,
+                        &anchor,
+                        diagnostics,
+                    ));
+                } else {
+                    skip_element(reader, &name.local_name)?;
+                    diagnostics.push(mce_diag(
+                        "CVN_MCE_INVALID_BRANCH_ORDER",
+                        &anchor.source_anchor_path(),
+                        "mc:AlternateContent contains a non-branch child",
+                    ));
+                }
+            }
+            Event::Empty(event) => {
+                let mut branch_scope = ac_scope.clone();
+                branch_scope.extend(namespace_declarations(&event)?);
+                let name = qname_from_scope(event.name().as_ref(), &branch_scope);
+                if name.namespace_uri.as_deref() == Some(MC_NAMESPACE)
+                    && matches!(name.local_name.as_str(), "Choice" | "Fallback")
+                {
+                    let branch_attrs = attributes(reader, &event)?;
+                    let raw = empty_event_xml(&event)?;
+                    branches.push(build_mce_branch(
+                        if name.local_name == "Choice" {
+                            MceBranchKind::Choice
+                        } else {
+                            MceBranchKind::Fallback
+                        },
+                        &branch_attrs,
+                        &branch_scope,
+                        &raw,
+                        &anchor,
+                        diagnostics,
+                    ));
+                    if name.local_name == "Fallback" {
+                        if saw_fallback {
+                            diagnostics.push(mce_diag(
+                                "CVN_MCE_MULTIPLE_FALLBACK",
+                                &anchor.source_anchor_path(),
+                                "multiple mc:Fallback branches are present",
+                            ));
+                        }
+                        saw_fallback = true;
+                    }
+                }
+            }
+            Event::End(event) => {
+                let name = qname_from_scope(event.name().as_ref(), ac_scope);
+                if name.namespace_uri.as_deref() == Some(MC_NAMESPACE)
+                    && name.local_name == "AlternateContent"
+                {
+                    break;
+                }
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    select_branch(&mut branches, &anchor, diagnostics);
+    let branch_kind = if branches
+        .iter()
+        .any(|branch| branch.selected && branch.kind == MceBranchKind::Choice)
+    {
+        MceSelection::SelectedChoice
+    } else if branches
+        .iter()
+        .any(|branch| branch.selected && branch.kind == MceBranchKind::Fallback)
+    {
+        MceSelection::SelectedFallback
+    } else {
+        MceSelection::Unresolved
+    };
+    let id = semantic_id(
+        document_id,
+        source_part_path,
+        "mce",
+        None,
+        &anchor.xml_path,
+        document_digest,
+        id_set,
+    )?;
+    Ok(MceAlternateContentProjection {
+        id,
+        source_anchor: anchor.clone(),
+        branch_kind,
+        branches,
+        compatibility: parse_mce_compatibility(attrs, ac_scope, &anchor, diagnostics),
+    })
+}
+
+fn build_mce_branch(
+    kind: MceBranchKind,
+    attrs: &BTreeMap<String, String>,
+    scope: &BTreeMap<String, String>,
+    raw_xml: &str,
+    anchor: &SourceAnchor,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+) -> MceBranchProjection {
+    let requires_raw = attrs.get("Requires").cloned();
+    let requires = requires_raw
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|prefix| resolve_requirement(prefix, scope, anchor, diagnostics))
+        .collect::<Vec<_>>();
+    MceBranchProjection {
+        kind,
+        requires_raw,
+        requires,
+        selected: false,
+        raw_digest: sha256_hex(raw_xml.as_bytes()),
+        raw_content: raw_xml.to_owned(),
+        content: Vec::new(),
+    }
+}
+
+fn resolve_requirement(
+    prefix: &str,
+    scope: &BTreeMap<String, String>,
+    anchor: &SourceAnchor,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+) -> MceNamespaceRequirement {
+    let namespace_uri = scope.get(prefix).cloned();
+    let supported = namespace_uri
+        .as_ref()
+        .map(|uri| {
+            mce_capabilities()
+                .supported_namespaces
+                .iter()
+                .any(|supported| supported == uri)
+        })
+        .unwrap_or(false);
+    if namespace_uri.is_none() {
+        diagnostics.push(mce_diag(
+            "CVN_MCE_REQUIRES_PREFIX_UNRESOLVED",
+            &anchor.source_anchor_path(),
+            &format!("Requires prefix `{prefix}` is not defined"),
+        ));
+    } else if !supported {
+        diagnostics.push(mce_diag(
+            "CVN_MCE_REQUIRES_NAMESPACE_UNSUPPORTED",
+            &anchor.source_anchor_path(),
+            &format!("Requires namespace for prefix `{prefix}` is not supported"),
+        ));
+    }
+    MceNamespaceRequirement {
+        prefix: prefix.to_owned(),
+        namespace_uri,
+        supported,
+    }
+}
+
+fn select_branch(
+    branches: &mut [MceBranchProjection],
+    anchor: &SourceAnchor,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+) {
+    if let Some(index) = branches.iter().position(|branch| {
+        branch.kind == MceBranchKind::Choice
+            && !branch.requires.is_empty()
+            && branch
+                .requires
+                .iter()
+                .all(|requirement| requirement.supported)
+    }) {
+        branches[index].selected = true;
+        return;
+    }
+    if let Some(index) = branches
+        .iter()
+        .position(|branch| branch.kind == MceBranchKind::Fallback)
+    {
+        branches[index].selected = true;
+    } else {
+        diagnostics.push(mce_diag(
+            "CVN_MCE_FALLBACK_MISSING",
+            &anchor.source_anchor_path(),
+            "no supported mc:Choice and no mc:Fallback branch",
+        ));
+    }
+}
+
+fn parse_mce_compatibility(
+    attrs: &BTreeMap<String, String>,
+    scope: &BTreeMap<String, String>,
+    anchor: &SourceAnchor,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+) -> Option<MceCompatibilityAttributes> {
+    let ignorable_raw = attrs.get("Ignorable").cloned();
+    let process_content = qname_list(attrs.get("ProcessContent"), scope, anchor, diagnostics);
+    let preserve_elements = qname_list(attrs.get("PreserveElements"), scope, anchor, diagnostics);
+    let preserve_attributes =
+        qname_list(attrs.get("PreserveAttributes"), scope, anchor, diagnostics);
+    let ignorable_namespaces = ignorable_raw
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .filter_map(|prefix| {
+            let namespace = scope.get(prefix).cloned();
+            if namespace.is_none() {
+                diagnostics.push(mce_diag(
+                    "CVN_MCE_QNAME_UNRESOLVED",
+                    &anchor.source_anchor_path(),
+                    &format!("Ignorable prefix `{prefix}` is not defined"),
+                ));
+            }
+            namespace
+        })
+        .collect::<Vec<_>>();
+    if ignorable_raw.is_none()
+        && process_content.is_empty()
+        && preserve_elements.is_empty()
+        && preserve_attributes.is_empty()
+    {
+        return None;
+    }
+    Some(MceCompatibilityAttributes {
+        ignorable_raw,
+        ignorable_namespaces,
+        process_content,
+        preserve_elements,
+        preserve_attributes,
+    })
+}
+
+fn qname_list(
+    raw: Option<&String>,
+    scope: &BTreeMap<String, String>,
+    anchor: &SourceAnchor,
+    diagnostics: &mut Vec<MceResolutionDiagnostic>,
+) -> Vec<MceQualifiedName> {
+    raw.map(|value| {
+        value
+            .split_whitespace()
+            .map(|qname| {
+                let (prefix, local_name) = qname
+                    .split_once(':')
+                    .map(|(prefix, local)| (prefix, local))
+                    .unwrap_or(("", qname));
+                let namespace_uri = scope.get(prefix).cloned();
+                if namespace_uri.is_none() && !prefix.is_empty() {
+                    diagnostics.push(mce_diag(
+                        "CVN_MCE_QNAME_UNRESOLVED",
+                        &anchor.source_anchor_path(),
+                        &format!("QName prefix `{prefix}` is not defined"),
+                    ));
+                }
+                MceQualifiedName {
+                    raw: qname.to_owned(),
+                    namespace_uri,
+                    local_name: local_name.to_owned(),
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn read_branch_xml(
+    reader: &mut Reader<Cursor<&[u8]>>,
+    branch_local_name: &str,
+) -> Result<String, DocxImportError> {
+    let mut writer = Writer::new(Vec::new());
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                depth += 1;
+                writer.write_event(Event::Start(event.into_owned()))?;
+            }
+            Event::Empty(event) => writer.write_event(Event::Empty(event.into_owned()))?,
+            Event::End(event) => {
+                let raw = String::from_utf8_lossy(event.name().as_ref()).into_owned();
+                let local = raw.rsplit(':').next().unwrap_or(raw.as_str());
+                if depth == 0 && local == branch_local_name {
+                    break;
+                }
+                depth = depth.saturating_sub(1);
+                writer.write_event(Event::End(event.into_owned()))?;
+            }
+            Event::Text(event) => writer.write_event(Event::Text(event.into_owned()))?,
+            Event::CData(event) => writer.write_event(Event::CData(event.into_owned()))?,
+            Event::Comment(event) => writer.write_event(Event::Comment(event.into_owned()))?,
+            Event::PI(event) => writer.write_event(Event::PI(event.into_owned()))?,
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: "mce-branch".to_owned(),
+                });
+            }
+            Event::Eof => break,
+            event => writer.write_event(event.into_owned())?,
+        }
+        buffer.clear();
+    }
+    Ok(String::from_utf8_lossy(&writer.into_inner()).into_owned())
+}
+
+fn start_event_xml(event: &BytesStart<'_>) -> Result<String, DocxImportError> {
+    let mut writer = Writer::new(Vec::new());
+    writer.write_event(Event::Start(event.to_owned()))?;
+    Ok(String::from_utf8_lossy(&writer.into_inner()).into_owned())
+}
+
+fn empty_event_xml(event: &BytesStart<'_>) -> Result<String, DocxImportError> {
+    let mut writer = Writer::new(Vec::new());
+    writer.write_event(Event::Empty(event.to_owned()))?;
+    Ok(String::from_utf8_lossy(&writer.into_inner()).into_owned())
+}
+
+fn skip_element(
+    reader: &mut Reader<Cursor<&[u8]>>,
+    local_name: &str,
+) -> Result<(), DocxImportError> {
+    let mut buffer = Vec::new();
+    let mut depth = 0_usize;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(_) => depth += 1,
+            Event::End(event) => {
+                let raw = String::from_utf8_lossy(event.name().as_ref()).into_owned();
+                let local = raw.rsplit(':').next().unwrap_or(raw.as_str());
+                if depth == 0 && local == local_name {
+                    break;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::Eof => break,
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: "mce-skip".to_owned(),
+                });
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(())
+}
+
+fn namespace_context(namespace_stack: &[BTreeMap<String, String>]) -> BTreeMap<String, String> {
+    let mut context = BTreeMap::new();
+    for scope in namespace_stack {
+        context.extend(scope.clone());
+    }
+    context
+}
+
+fn qname_from_scope(name: &[u8], scope: &BTreeMap<String, String>) -> XmlName {
+    let raw = String::from_utf8_lossy(name);
+    let (prefix, local_name) = raw
+        .split_once(':')
+        .map(|(prefix, local)| (prefix, local))
+        .unwrap_or(("", raw.as_ref()));
+    XmlName {
+        local_name: local_name.to_owned(),
+        namespace_uri: scope.get(prefix).cloned(),
+    }
+}
+
+fn mce_diag(code: &str, path: &str, message: &str) -> MceResolutionDiagnostic {
+    MceResolutionDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+trait SourceAnchorPath {
+    fn source_anchor_path(&self) -> String;
+}
+
+impl SourceAnchorPath for SourceAnchor {
+    fn source_anchor_path(&self) -> String {
+        format!("{}{}", self.source_part_path, self.xml_path)
+    }
 }
 
 fn parse_semantic_document(
@@ -1647,7 +2324,7 @@ fn parse_semantic_document(
 
     Ok((
         SemanticDocument {
-            source_part: "word/document.xml".to_owned(),
+            source_part: source_part_path.to_owned(),
             blocks,
             styles: None,
             numbering: None,
@@ -2674,6 +3351,7 @@ fn resolve_block_references(
         SemanticBlock::TrackedChange(change) => {
             resolve_tracked_change_references(change, styles, numbering, relationships);
         }
+        SemanticBlock::MceSelectedContent(_) => {}
     }
 }
 
@@ -2798,7 +3476,8 @@ fn resolve_run_story_references(run: &mut SemanticRun, relationships: &[OpcRelat
             | SemanticInline::Text(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
-            | SemanticInline::TrackedChange(_) => {}
+            | SemanticInline::TrackedChange(_)
+            | SemanticInline::MceSelectedContent(_) => {}
         }
     }
 }
@@ -3068,6 +3747,7 @@ fn collect_story_references(blocks: &[SemanticBlock], references: &mut Vec<Story
             SemanticBlock::TrackedChange(change) => {
                 collect_track_change_story_references(change, references)
             }
+            SemanticBlock::MceSelectedContent(_) => {}
         }
     }
 }
@@ -3146,7 +3826,8 @@ fn collect_track_change_story_references(
                     SemanticInline::Text(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
-                    | SemanticInline::TrackedChange(_) => {}
+                    | SemanticInline::TrackedChange(_)
+                    | SemanticInline::MceSelectedContent(_) => {}
                 }
             }
         }
@@ -3221,6 +3902,7 @@ fn collect_run_story_references(run: &SemanticRun, references: &mut Vec<StoryRef
             SemanticInline::TrackedChange(change) => {
                 collect_track_change_story_references(change, references)
             }
+            SemanticInline::MceSelectedContent(_) => {}
         }
     }
 }
@@ -3261,7 +3943,8 @@ fn collect_comment_ranges(
                             | SemanticInline::FootnoteReference { .. }
                             | SemanticInline::EndnoteReference { .. }
                             | SemanticInline::CommentReference { .. }
-                            | SemanticInline::TrackedChange(_) => {}
+                            | SemanticInline::TrackedChange(_)
+                            | SemanticInline::MceSelectedContent(_) => {}
                         }
                     }
                 }
@@ -3276,6 +3959,7 @@ fn collect_comment_ranges(
             SemanticBlock::TrackedChange(change) => {
                 collect_track_change_comment_ranges(change, ranges_by_comment)
             }
+            SemanticBlock::MceSelectedContent(_) => {}
         }
     }
 }
@@ -3314,7 +3998,8 @@ fn collect_track_change_comment_ranges(
                     | SemanticInline::FootnoteReference { .. }
                     | SemanticInline::EndnoteReference { .. }
                     | SemanticInline::CommentReference { .. }
-                    | SemanticInline::TrackedChange(_) => {}
+                    | SemanticInline::TrackedChange(_)
+                    | SemanticInline::MceSelectedContent(_) => {}
                 }
             }
         }
@@ -3474,6 +4159,7 @@ fn collect_numbering_reference_diagnostics(
                     collect_numbering_reference_diagnostics(blocks, numbering, diagnostics);
                 }
             }
+            SemanticBlock::MceSelectedContent(_) => {}
         }
     }
 }
@@ -4286,6 +4972,24 @@ mod tests {
         path
     }
 
+    fn write_mce_docx(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wStrict="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:cx="urn:unsupported" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" mc:Ignorable="cx" mc:ProcessContent="cx:wrapper" mc:PreserveElements="cx:keep" mc:PreserveAttributes="cx:attr"><w:body><mc:AlternateContent mc:Ignorable="cx" mc:ProcessContent="cx:wrapper" mc:PreserveElements="cx:keep" mc:PreserveAttributes="cx:attr"><mc:Choice Requires="cx"><w:p><w:r><w:t>unsupported choice</w:t></w:r></w:p></mc:Choice><mc:Choice Requires="w wStrict"><w:p><w:r><w:t>supported second choice</w:t></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback not selected</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:r><mc:AlternateContent><mc:Choice Requires="cx"><w:t>bad inline</w:t></mc:Choice><mc:Fallback><w:t>inline fallback</w:t></mc:Fallback></mc:AlternateContent></w:r></w:p><w:tbl><w:tr><w:tc><mc:AlternateContent><mc:Choice Requires="missing"><w:p><w:r><w:t>bad table</w:t></w:r></w:p></mc:Choice></mc:AlternateContent></w:tc></w:tr></w:tbl><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#);
+        add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:t>header choice</w:t></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>header fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent></w:hdr>"#);
+        add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:footnote w:id="1"><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:t>footnote choice</w:t></w:r></w:p></mc:Choice></mc:AlternateContent></w:footnote></w:footnotes>"#);
+        zip.finish().unwrap();
+        path
+    }
+
     fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         for block in &document.blocks {
@@ -4407,6 +5111,85 @@ mod tests {
         let _ = fs::remove_dir_all(&out2);
     }
 
+    #[test]
+    fn mce_alternate_content_is_projected_selected_and_deterministic() {
+        let docx = write_mce_docx("mce");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(first.document.mce, second.document.mce);
+        assert_eq!(first.document.semantic, second.document.semantic);
+        let mce = first.document.mce.as_ref().unwrap();
+        assert_eq!(mce.capability_version, MCE_CAPABILITY_VERSION);
+        assert!(mce.alternate_contents.len() >= 5);
+        assert!(mce.alternate_contents.iter().any(|ac| ac.branch_kind
+            == MceSelection::SelectedChoice
+            && ac.branches.iter().any(|branch| branch.selected
+                && branch
+                    .requires
+                    .iter()
+                    .all(|requirement| requirement.supported))));
+        assert!(mce
+            .alternate_contents
+            .iter()
+            .any(|ac| ac.branch_kind == MceSelection::SelectedFallback));
+        assert!(mce
+            .alternate_contents
+            .iter()
+            .any(|ac| ac.branch_kind == MceSelection::Unresolved));
+        assert!(mce
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_MCE_REQUIRES_NAMESPACE_UNSUPPORTED"));
+        assert!(mce
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_MCE_REQUIRES_PREFIX_UNRESOLVED"));
+        assert!(mce
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_MCE_FALLBACK_MISSING"));
+        assert!(mce.alternate_contents.iter().any(|ac| ac
+            .compatibility
+            .as_ref()
+            .map(|compat| {
+                compat.ignorable_namespaces == vec!["urn:unsupported".to_owned()]
+                    && compat.process_content.len() == 1
+                    && compat.preserve_elements.len() == 1
+                    && compat.preserve_attributes.len() == 1
+            })
+            .unwrap_or(false)));
+
+        let text = semantic_text(&first.document.semantic);
+        assert!(text.contains("supported second choice"));
+        assert!(text.contains("inline fallback"));
+        assert!(!text.contains("unsupported choice"));
+        assert!(!text.contains("fallback not selected"));
+
+        let out1 = std::env::temp_dir().join(format!("tuff-cvn-mce-out-1-{}", std::process::id()));
+        let out2 = std::env::temp_dir().join(format!("tuff-cvn-mce-out-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+        cvn_package::write_package(&out1, &first).unwrap();
+        cvn_package::write_package(&out2, &second).unwrap();
+        assert_eq!(
+            cvn_package::read_cvn_json_bytes(&out1).unwrap(),
+            cvn_package::read_cvn_json_bytes(&out2).unwrap()
+        );
+        assert!(cvn_package::verify_package_integrity(&out1).unwrap().passed);
+        assert_eq!(
+            cvn_package::verify_package_integrity(&out1)
+                .unwrap()
+                .root_actual,
+            cvn_package::verify_package_integrity(&out2)
+                .unwrap()
+                .root_actual
+        );
+        let _ = fs::remove_file(&docx);
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+    }
+
     fn collect_block_ids(block: &SemanticBlock, ids: &mut Vec<String>) {
         match block {
             SemanticBlock::Paragraph(paragraph) => {
@@ -4435,6 +5218,41 @@ mod tests {
                     }
                 }
             }
+            SemanticBlock::MceSelectedContent(content) => {
+                ids.push(content.projection.id.as_str().to_owned());
+            }
+        }
+    }
+
+    fn semantic_text(document: &SemanticDocument) -> String {
+        let mut text = String::new();
+        for block in &document.blocks {
+            collect_block_text(block, &mut text);
+        }
+        text
+    }
+
+    fn collect_block_text(block: &SemanticBlock, text: &mut String) {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for run in &paragraph.runs {
+                    for inline in &run.inlines {
+                        if let SemanticInline::Text(value) = inline {
+                            text.push_str(&value.value);
+                        }
+                    }
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for block in &cell.blocks {
+                            collect_block_text(block, text);
+                        }
+                    }
+                }
+            }
+            SemanticBlock::TrackedChange(_) | SemanticBlock::MceSelectedContent(_) => {}
         }
     }
 

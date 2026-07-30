@@ -105,18 +105,18 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
 fn inspect_command(args: &[String]) -> Result<(), CliError> {
     if args.len() < 2 {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes]".to_owned(),
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce]".to_owned(),
         ));
     }
     let flags = &args[1..];
     if flags.iter().any(|flag| {
         !matches!(
             flag.as_str(),
-            "--semantic" | "--styles" | "--numbering" | "--stories" | "--changes"
+            "--semantic" | "--styles" | "--numbering" | "--stories" | "--changes" | "--mce"
         )
     }) {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes]"
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce]"
                 .to_owned(),
         ));
     }
@@ -147,6 +147,7 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
                 "{}",
                 serde_json::to_string_pretty(&cvn_json.payload.track_changes)?
             ),
+            "--mce" => println!("{}", serde_json::to_string_pretty(&cvn_json.payload.mce)?),
             _ => unreachable!("validated inspect flag"),
         }
     }
@@ -245,7 +246,7 @@ Commands:
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
-  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes]
+  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce]
       Print read-only projections from cvn.json.
 
   tcvn diff <left.cvn> <right.cvn>
