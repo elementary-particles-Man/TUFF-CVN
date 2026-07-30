@@ -172,6 +172,8 @@ pub struct CvnDocument {
     pub track_changes: Option<TrackChangesProjection>,
     #[serde(default)]
     pub mce: Option<MceProjection>,
+    #[serde(default)]
+    pub signatures: Option<OpcSignatureRegistryProjection>,
     pub warnings: Vec<CvnWarning>,
     pub checksums: Vec<ChecksumEntry>,
 }
@@ -193,6 +195,7 @@ impl CvnDocument {
             semantic: SemanticDocument::default(),
             track_changes: None,
             mce: None,
+            signatures: None,
             warnings: Vec::new(),
             checksums: Vec::new(),
         }
@@ -516,6 +519,139 @@ pub struct MceQualifiedName {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MceResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcSignatureRegistryProjection {
+    pub source_part: String,
+    pub origins: Vec<OpcSignatureOriginProjection>,
+    pub signatures: Vec<OpcSignatureProjection>,
+    pub diagnostics: Vec<SignatureDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcSignatureOriginProjection {
+    pub relationship_id: String,
+    pub origin_part_path: String,
+    pub source_anchor: SourceAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpcSignatureProjection {
+    pub signature_part_path: String,
+    pub origin_part_path: String,
+    pub relationship_id: String,
+    pub xml_signature: XmlSignatureProjection,
+    pub verification: SignatureVerificationReport,
+    pub source_anchor: SourceAnchor,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XmlSignatureProjection {
+    pub signed_info: SignedInfoProjection,
+    pub signature_value: String,
+    pub key_info: SignatureKeyInfoProjection,
+    pub office_info: Option<OfficeSignatureInfoProjection>,
+    pub object_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedInfoProjection {
+    pub canonicalization_method: String,
+    pub signature_method: String,
+    pub canonicalized_digest: Option<String>,
+    pub references: Vec<SignatureReferenceProjection>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureReferenceProjection {
+    pub uri: String,
+    pub digest_method: String,
+    pub digest_value: String,
+    pub transforms: Vec<SignatureTransformProjection>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureTransformProjection {
+    pub algorithm: String,
+    pub relationship_references: Vec<String>,
+    pub relationship_group_references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureKeyInfoProjection {
+    pub key_value_rsa: Option<RsaKeyValueProjection>,
+    pub x509_certificates: Vec<X509CertificateProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RsaKeyValueProjection {
+    pub modulus_b64: String,
+    pub exponent_b64: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct X509CertificateProjection {
+    pub der_sha256: String,
+    pub subject: Option<String>,
+    pub issuer: Option<String>,
+    pub serial: Option<String>,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+    pub public_key_algorithm: Option<String>,
+    pub malformed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficeSignatureInfoProjection {
+    pub setup_id: Option<String>,
+    pub signature_comments: Option<String>,
+    pub signature_provider_id: Option<String>,
+    pub signature_provider_url: Option<String>,
+    pub signature_type: Option<String>,
+    pub unknown_object_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureVerificationReport {
+    pub status: SignatureVerificationStatus,
+    pub cryptographic_validity: SignatureVerificationStatus,
+    pub certificate_trust: SignatureVerificationStatus,
+    pub signature_value_status: SignatureVerificationStatus,
+    pub key_fingerprint: Option<String>,
+    pub signed_info_digest: Option<String>,
+    pub references: Vec<SignatureReferenceVerification>,
+    pub diagnostics: Vec<SignatureDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureVerificationStatus {
+    Valid,
+    Invalid,
+    UnsupportedAlgorithm,
+    UnsupportedTransform,
+    MissingKey,
+    Malformed,
+    #[default]
+    UnassessedTrust,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureReferenceVerification {
+    pub uri: String,
+    pub status: SignatureVerificationStatus,
+    pub expected_digest: String,
+    pub actual_digest: Option<String>,
+    pub target_part_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureDiagnostic {
     pub code: String,
     pub path: String,
     pub message: String,
@@ -1094,6 +1230,7 @@ pub enum IntegrityNodeKind {
     StoryProjection,
     TrackChangesProjection,
     MceProjection,
+    OpcSignatureProjection,
     Objects,
 }
 
@@ -1111,6 +1248,7 @@ impl IntegrityNodeKind {
             Self::StoryProjection => "story_projection",
             Self::TrackChangesProjection => "track_changes_projection",
             Self::MceProjection => "mce_projection",
+            Self::OpcSignatureProjection => "opc_signature_projection",
             Self::Objects => "objects",
         }
     }

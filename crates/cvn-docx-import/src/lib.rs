@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
+use base64::Engine;
 use cvn_core::{
     AbstractNumberingProjection, CommentProjection, CommentRangeProjection, ContentTypeDefault,
     ContentTypeOverride, ContentTypesProjection, CvnDocument, DocumentId,
@@ -12,24 +13,34 @@ use cvn_core::{
     MceBranchProjection, MceCapabilities, MceCompatibilityAttributes, MceNamespaceRequirement,
     MceProjection, MceQualifiedName, MceResolutionDiagnostic, MceSelectedContent, MceSelection,
     NoteProjection, NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
-    NumberingReference, NumberingRegistryProjection, NumberingResolutionDiagnostic, OpaqueEntry,
-    OpcPackageProjection, OpcPart, OpcRelationship, ParagraphPropertiesProjection,
-    PreservationMode, ResolvedStyleProjection, RunPropertiesProjection, SemanticBlock,
-    SemanticDocument, SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun,
-    SemanticTable, SemanticTableCell, SemanticTableRow, SemanticText, SourceAnchor,
-    SourceDescriptor, SourceFormat, StoryPartKind, StoryPartProjection, StoryReference,
-    StoryReferenceKind, StoryRegistryProjection, StoryResolutionDiagnostic,
-    StyleDefinitionProjection, StyleReference, StyleRegistryProjection, StyleResolutionDiagnostic,
-    StyleType, TargetMode, TrackChangesProjection, TrackedChange, TrackedChangeId,
-    TrackedChangeKind, TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling,
-    UnsupportedSemanticFeature, ZipEntryMetadata,
+    NumberingReference, NumberingRegistryProjection, NumberingResolutionDiagnostic,
+    OfficeSignatureInfoProjection, OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship,
+    OpcSignatureOriginProjection, OpcSignatureProjection, OpcSignatureRegistryProjection,
+    ParagraphPropertiesProjection, PreservationMode, ResolvedStyleProjection,
+    RsaKeyValueProjection, RunPropertiesProjection, SemanticBlock, SemanticDocument,
+    SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable,
+    SemanticTableCell, SemanticTableRow, SemanticText, SignatureDiagnostic,
+    SignatureKeyInfoProjection, SignatureReferenceProjection, SignatureReferenceVerification,
+    SignatureTransformProjection, SignatureVerificationReport, SignatureVerificationStatus,
+    SignedInfoProjection, SourceAnchor, SourceDescriptor, SourceFormat, StoryPartKind,
+    StoryPartProjection, StoryReference, StoryReferenceKind, StoryRegistryProjection,
+    StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference, StyleRegistryProjection,
+    StyleResolutionDiagnostic, StyleType, TargetMode, TrackChangesProjection, TrackedChange,
+    TrackedChangeId, TrackedChangeKind, TrackedChangeMetadata, TrackedContent,
+    UnsupportedFeatureHandling, UnsupportedSemanticFeature, X509CertificateProjection,
+    ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use quick_xml::Writer;
-use sha2::{Digest, Sha256};
+use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey};
+use rsa::signature::Verifier;
+use rsa::{BigUint, RsaPublicKey};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use thiserror::Error;
+use x509_parser::prelude::{FromDer, X509Certificate};
 use zip::read::ZipArchive;
 
 /// DOCX import limits.
@@ -274,6 +285,11 @@ pub fn import_docx_with_limits(
         content_types,
         relationships,
     };
+    document.signatures = Some(build_signature_registry_projection(
+        &document.opc,
+        &raw_parts,
+        &objects_by_digest,
+    )?);
     let mce_projection =
         build_mce_projection(&document.document_id, &raw_parts, &objects_by_digest)?;
     if let Some(bytes) = object_bytes_for_part(&raw_parts, &objects_by_digest, "word/document.xml")
@@ -342,6 +358,31 @@ struct RawPart {
     original_size: u64,
     digest: String,
     metadata: ZipEntryMetadata,
+}
+
+/// Rebuilds the read-only OPC XML signature projection from a CVN document and
+/// its content-addressed objects. This is used by verification to avoid trusting
+/// the stored projection.
+pub fn rebuild_signature_registry_projection(
+    document: &CvnDocument,
+    objects: &[PackageObject],
+) -> Result<OpcSignatureRegistryProjection, DocxImportError> {
+    let raw_parts = document
+        .opc
+        .parts
+        .iter()
+        .map(|part| RawPart {
+            path: part.original_path.clone(),
+            original_size: part.original_size,
+            digest: part.content_digest.clone(),
+            metadata: part.compression.clone(),
+        })
+        .collect::<Vec<_>>();
+    let objects_by_digest = objects
+        .iter()
+        .map(|object| (object.digest.clone(), object.bytes.clone()))
+        .collect::<BTreeMap<_, _>>();
+    build_signature_registry_projection(&document.opc, &raw_parts, &objects_by_digest)
 }
 
 fn object_bytes_for_part<'a>(
@@ -638,7 +679,7 @@ fn collect_note_items(
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
-    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = vec![dsig_scope()];
     let mut path_stack: Vec<String> = Vec::new();
     let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
     let mut seen = BTreeSet::new();
@@ -746,7 +787,7 @@ fn collect_comment_items(
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
-    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = vec![dsig_scope()];
     let mut path_stack: Vec<String> = Vec::new();
     let mut child_counts: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
     let mut seen = BTreeSet::new();
@@ -1131,6 +1172,1293 @@ fn parse_relationships(
     }
 
     Ok(relationships)
+}
+
+const DSIG_NAMESPACE: &str = "http://www.w3.org/2000/09/xmldsig#";
+const OPC_SIGNATURE_ORIGIN_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin";
+const OPC_SIGNATURE_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/signature";
+const RELATIONSHIP_TRANSFORM: &str =
+    "http://schemas.openxmlformats.org/package/2006/RelationshipTransform";
+const CONTENT_TYPE_TRANSFORM: &str =
+    "http://schemas.openxmlformats.org/package/2006/ContentTypeTransform";
+const C14N_10: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+const C14N_10_COMMENTS: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+const EXCLUSIVE_C14N_10: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+const SHA1_DIGEST: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+const SHA256_DIGEST: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+const SHA384_DIGEST: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+const SHA512_DIGEST: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
+const RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+const RSA_SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
+const RSA_SHA512: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
+
+fn build_signature_registry_projection(
+    opc: &OpcPackageProjection,
+    parts: &[RawPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+) -> Result<OpcSignatureRegistryProjection, DocxImportError> {
+    let mut origins = Vec::new();
+    let mut signatures = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for relationship in opc.relationships.iter().filter(|relationship| {
+        relationship.source_part.is_none()
+            && relationship.relationship_type == OPC_SIGNATURE_ORIGIN_REL_TYPE
+    }) {
+        if relationship.target_mode == TargetMode::External {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_ORIGIN_RELATIONSHIP_INVALID",
+                "$.opc.relationships",
+                "signature origin relationship target is external",
+            ));
+            continue;
+        }
+        let origin_part_path = match resolve_relationship_target(None, &relationship.target) {
+            Some(path) => path,
+            None => {
+                diagnostics.push(signature_diag(
+                    "CVN_SIGNATURE_ORIGIN_RELATIONSHIP_INVALID",
+                    "$.opc.relationships",
+                    "signature origin relationship target is not a valid package part",
+                ));
+                continue;
+            }
+        };
+        if object_bytes_for_part(parts, objects, &origin_part_path).is_none() {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_ORIGIN_MISSING",
+                &origin_part_path,
+                "signature origin part is missing",
+            ));
+        }
+        origins.push(OpcSignatureOriginProjection {
+            relationship_id: relationship.relationship_id.clone(),
+            origin_part_path: origin_part_path.clone(),
+            source_anchor: SourceAnchor {
+                source_part_path: "_rels/.rels".to_owned(),
+                xml_path: format!(
+                    "/Relationships/Relationship[@Id='{}']",
+                    relationship.relationship_id
+                ),
+                byte_start: None,
+            },
+        });
+
+        let mut signature_relationships = opc
+            .relationships
+            .iter()
+            .filter(|candidate| {
+                candidate.source_part.as_deref() == Some(origin_part_path.as_str())
+                    && candidate.relationship_type == OPC_SIGNATURE_REL_TYPE
+            })
+            .collect::<Vec<_>>();
+        signature_relationships
+            .sort_by(|left, right| left.relationship_id.cmp(&right.relationship_id));
+        for signature_relationship in signature_relationships {
+            if signature_relationship.target_mode == TargetMode::External {
+                diagnostics.push(signature_diag(
+                    "CVN_SIGNATURE_PART_MISSING",
+                    &origin_part_path,
+                    "external signature target is not resolved",
+                ));
+                continue;
+            }
+            let Some(signature_part_path) = resolve_relationship_target(
+                Some(&origin_part_path),
+                &signature_relationship.target,
+            ) else {
+                diagnostics.push(signature_diag(
+                    "CVN_SIGNATURE_PART_MISSING",
+                    &origin_part_path,
+                    "signature relationship target is not a valid package part",
+                ));
+                continue;
+            };
+            let Some(signature_bytes) = object_bytes_for_part(parts, objects, &signature_part_path)
+            else {
+                diagnostics.push(signature_diag(
+                    "CVN_SIGNATURE_PART_MISSING",
+                    &signature_part_path,
+                    "signature part is missing",
+                ));
+                continue;
+            };
+            let mut signature_diagnostics = Vec::new();
+            let xml_signature = parse_xml_signature(
+                &signature_part_path,
+                signature_bytes,
+                &mut signature_diagnostics,
+            )?;
+            let verification = verify_xml_signature(
+                opc,
+                parts,
+                objects,
+                &signature_part_path,
+                signature_bytes,
+                &xml_signature,
+                signature_diagnostics.clone(),
+            );
+            diagnostics.extend(signature_diagnostics);
+            signatures.push(OpcSignatureProjection {
+                signature_part_path: signature_part_path.clone(),
+                origin_part_path: origin_part_path.clone(),
+                relationship_id: signature_relationship.relationship_id.clone(),
+                xml_signature,
+                verification,
+                source_anchor: SourceAnchor {
+                    source_part_path: signature_part_path,
+                    xml_path: "/Signature[1]".to_owned(),
+                    byte_start: Some(0),
+                },
+            });
+        }
+    }
+
+    origins.sort_by(|left, right| {
+        left.origin_part_path
+            .cmp(&right.origin_part_path)
+            .then(left.relationship_id.cmp(&right.relationship_id))
+    });
+    signatures.sort_by(|left, right| {
+        left.signature_part_path
+            .cmp(&right.signature_part_path)
+            .then(left.relationship_id.cmp(&right.relationship_id))
+    });
+    diagnostics.sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    Ok(OpcSignatureRegistryProjection {
+        source_part: "opc-signature-registry".to_owned(),
+        origins,
+        signatures,
+        diagnostics,
+    })
+}
+
+fn parse_xml_signature(
+    source_part_path: &str,
+    bytes: &[u8],
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> Result<cvn_core::XmlSignatureProjection, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = vec![dsig_scope()];
+    let mut signed_info = SignedInfoProjection::default();
+    let mut signature_value = String::new();
+    let mut key_info = SignatureKeyInfoProjection::default();
+    let mut office_info = None;
+    let mut object_digests = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "SignedInfo") => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                signed_info = parse_signed_info(source_part_path, &mut reader, diagnostics)?;
+                namespace_stack.pop();
+            }
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "SignatureValue") => {
+                signature_value = read_text_until(&mut reader, "SignatureValue", source_part_path)?;
+            }
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "KeyInfo") => {
+                let key_info_xml = read_element_xml(&event, &mut reader, source_part_path)?;
+                key_info = parse_key_info_xml(&key_info_xml, source_part_path, diagnostics);
+            }
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "Object") => {
+                let object_xml = read_element_xml(&event, &mut reader, source_part_path)?;
+                object_digests.push(sha256_hex(object_xml.as_bytes()));
+                if office_info.is_none() {
+                    office_info = parse_office_signature_info(&object_xml)?;
+                }
+            }
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+            }
+            Event::Empty(event) if is_ds_event(&event, &namespace_stack, "Object") => {
+                let object_xml = empty_event_xml(&event)?;
+                object_digests.push(sha256_hex(object_xml.as_bytes()));
+            }
+            Event::End(_) => {
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    Ok(cvn_core::XmlSignatureProjection {
+        signed_info,
+        signature_value,
+        key_info,
+        office_info,
+        object_digests,
+    })
+}
+
+fn parse_signed_info(
+    source_part_path: &str,
+    reader: &mut Reader<Cursor<&[u8]>>,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> Result<SignedInfoProjection, DocxImportError> {
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = vec![dsig_scope()];
+    let mut signed_info = SignedInfoProjection::default();
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Empty(event) | Event::Start(event)
+                if is_ds_event(&event, &namespace_stack, "CanonicalizationMethod") =>
+            {
+                let attrs = attributes(reader, &event)?;
+                signed_info.canonicalization_method =
+                    attrs.get("Algorithm").cloned().unwrap_or_default();
+                if !is_supported_canonicalization(&signed_info.canonicalization_method) {
+                    diagnostics.push(signature_diag(
+                        "CVN_SIGNATURE_CANONICALIZATION_UNSUPPORTED",
+                        source_part_path,
+                        "SignedInfo canonicalization method is not supported",
+                    ));
+                }
+            }
+            Event::Empty(event) | Event::Start(event)
+                if is_ds_event(&event, &namespace_stack, "SignatureMethod") =>
+            {
+                let attrs = attributes(reader, &event)?;
+                signed_info.signature_method = attrs.get("Algorithm").cloned().unwrap_or_default();
+                if signature_digest_for_method(&signed_info.signature_method).is_none() {
+                    diagnostics.push(signature_diag(
+                        "CVN_SIGNATURE_METHOD_UNSUPPORTED",
+                        source_part_path,
+                        "SignatureMethod algorithm is not supported",
+                    ));
+                }
+            }
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "Reference") => {
+                signed_info.references.push(parse_signature_reference(
+                    source_part_path,
+                    reader,
+                    &event,
+                    diagnostics,
+                )?);
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if name.namespace_uri.as_deref() == Some(DSIG_NAMESPACE)
+                    && name.local_name == "SignedInfo"
+                {
+                    break;
+                }
+                namespace_stack.pop();
+            }
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(signed_info)
+}
+
+fn parse_signature_reference(
+    source_part_path: &str,
+    reader: &mut Reader<Cursor<&[u8]>>,
+    event: &BytesStart<'_>,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> Result<SignatureReferenceProjection, DocxImportError> {
+    let attrs = attributes(reader, event)?;
+    let mut reference = SignatureReferenceProjection {
+        uri: attrs.get("URI").cloned().unwrap_or_default(),
+        ..SignatureReferenceProjection::default()
+    };
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = vec![dsig_scope()];
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "Transforms") => {
+                reference.transforms = parse_signature_transforms(source_part_path, reader)?;
+            }
+            Event::Empty(event) | Event::Start(event)
+                if is_ds_event(&event, &namespace_stack, "DigestMethod") =>
+            {
+                let attrs = attributes(reader, &event)?;
+                reference.digest_method = attrs.get("Algorithm").cloned().unwrap_or_default();
+                if digest_bytes_for_method(&reference.digest_method, b"").is_none() {
+                    diagnostics.push(signature_diag(
+                        "CVN_SIGNATURE_DIGEST_ALGORITHM_UNSUPPORTED",
+                        source_part_path,
+                        "DigestMethod algorithm is not supported",
+                    ));
+                }
+            }
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "DigestValue") => {
+                reference.digest_value = read_text_until(reader, "DigestValue", source_part_path)?;
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if name.namespace_uri.as_deref() == Some(DSIG_NAMESPACE)
+                    && name.local_name == "Reference"
+                {
+                    break;
+                }
+                namespace_stack.pop();
+            }
+            Event::Start(event) => namespace_stack.push(namespace_declarations(&event)?),
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(reference)
+}
+
+fn parse_signature_transforms(
+    source_part_path: &str,
+    reader: &mut Reader<Cursor<&[u8]>>,
+) -> Result<Vec<SignatureTransformProjection>, DocxImportError> {
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut transforms = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Empty(event) if is_ds_event(&event, &namespace_stack, "Transform") => {
+                let attrs = attributes(reader, &event)?;
+                transforms.push(SignatureTransformProjection {
+                    algorithm: attrs.get("Algorithm").cloned().unwrap_or_default(),
+                    ..SignatureTransformProjection::default()
+                });
+            }
+            Event::Start(event) if is_ds_event(&event, &namespace_stack, "Transform") => {
+                let attrs = attributes(reader, &event)?;
+                let mut transform = SignatureTransformProjection {
+                    algorithm: attrs.get("Algorithm").cloned().unwrap_or_default(),
+                    ..SignatureTransformProjection::default()
+                };
+                read_transform_children(source_part_path, reader, &mut transform)?;
+                transforms.push(transform);
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if name.namespace_uri.as_deref() == Some(DSIG_NAMESPACE)
+                    && name.local_name == "Transforms"
+                {
+                    break;
+                }
+                namespace_stack.pop();
+            }
+            Event::Start(event) => namespace_stack.push(namespace_declarations(&event)?),
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(transforms)
+}
+
+fn read_transform_children(
+    source_part_path: &str,
+    reader: &mut Reader<Cursor<&[u8]>>,
+    transform: &mut SignatureTransformProjection,
+) -> Result<(), DocxImportError> {
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Empty(event) | Event::Start(event) => {
+                let attrs = attributes(reader, &event)?;
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                match name.local_name.as_str() {
+                    "RelationshipReference" => {
+                        if let Some(source_id) = attrs.get("SourceId") {
+                            transform.relationship_references.push(source_id.clone());
+                        }
+                    }
+                    "RelationshipsGroupReference" => {
+                        if let Some(source_type) = attrs.get("SourceType") {
+                            transform
+                                .relationship_group_references
+                                .push(source_type.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                if !event.is_empty() {
+                    skip_element(reader, &name.local_name)?;
+                }
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if name.namespace_uri.as_deref() == Some(DSIG_NAMESPACE)
+                    && name.local_name == "Transform"
+                {
+                    break;
+                }
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(())
+}
+
+fn parse_key_info_xml(
+    xml: &str,
+    source_part_path: &str,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> SignatureKeyInfoProjection {
+    let mut key_info = SignatureKeyInfoProjection::default();
+    if let (Some(modulus_b64), Some(exponent_b64)) = (
+        text_between_local(xml, "Modulus"),
+        text_between_local(xml, "Exponent"),
+    ) {
+        let fingerprint = sha256_hex(format!("{modulus_b64}:{exponent_b64}").as_bytes());
+        key_info.key_value_rsa = Some(RsaKeyValueProjection {
+            modulus_b64,
+            exponent_b64,
+            fingerprint,
+        });
+    }
+    let mut rest = xml;
+    while let Some((start, tag_len)) = rest
+        .find("<ds:X509Certificate>")
+        .map(|start| (start, "<ds:X509Certificate>".len()))
+        .or_else(|| {
+            rest.find("<X509Certificate>")
+                .map(|start| (start, "<X509Certificate>".len()))
+        })
+    {
+        let content_start = start + tag_len;
+        let Some(end) = rest[content_start..].find("</") else {
+            break;
+        };
+        let value = &rest[content_start..content_start + end];
+        key_info
+            .x509_certificates
+            .push(parse_x509_certificate_projection(
+                value,
+                source_part_path,
+                diagnostics,
+            ));
+        rest = &rest[content_start + end..];
+    }
+    key_info
+}
+
+fn parse_x509_certificate_projection(
+    b64: &str,
+    source_part_path: &str,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> X509CertificateProjection {
+    let cleaned = b64.split_whitespace().collect::<String>();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes());
+    let Ok(der) = decoded else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_CERTIFICATE_MALFORMED",
+            source_part_path,
+            "X509Certificate is not valid base64 DER",
+        ));
+        return malformed_certificate();
+    };
+    let der_sha256 = sha256_hex(&der);
+    match X509Certificate::from_der(&der) {
+        Ok((_, certificate)) => X509CertificateProjection {
+            der_sha256,
+            subject: Some(certificate.subject().to_string()),
+            issuer: Some(certificate.issuer().to_string()),
+            serial: Some(certificate.raw_serial_as_string()),
+            not_before: certificate.validity().not_before.to_rfc2822().ok(),
+            not_after: certificate.validity().not_after.to_rfc2822().ok(),
+            public_key_algorithm: Some(certificate.public_key().algorithm.algorithm.to_string()),
+            malformed: false,
+        },
+        Err(_) => {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_CERTIFICATE_MALFORMED",
+                source_part_path,
+                "X509Certificate DER cannot be parsed",
+            ));
+            let mut projection = malformed_certificate();
+            projection.der_sha256 = der_sha256;
+            projection
+        }
+    }
+}
+
+fn malformed_certificate() -> X509CertificateProjection {
+    X509CertificateProjection {
+        der_sha256: String::new(),
+        subject: None,
+        issuer: None,
+        serial: None,
+        not_before: None,
+        not_after: None,
+        public_key_algorithm: None,
+        malformed: true,
+    }
+}
+
+fn parse_office_signature_info(
+    xml: &str,
+) -> Result<Option<OfficeSignatureInfoProjection>, DocxImportError> {
+    if !xml.contains("SignatureInfoV1") {
+        return Ok(None);
+    }
+    let mut projection = OfficeSignatureInfoProjection::default();
+    projection.setup_id = text_between_local(xml, "SetupID");
+    projection.signature_comments = text_between_local(xml, "SignatureComments");
+    projection.signature_provider_id = text_between_local(xml, "SignatureProviderId");
+    projection.signature_provider_url = text_between_local(xml, "SignatureProviderUrl");
+    projection.signature_type = text_between_local(xml, "SignatureType");
+    Ok(Some(projection))
+}
+
+fn text_between_local(xml: &str, local: &str) -> Option<String> {
+    let start_suffix = format!("{local}>");
+    let end_suffix = format!("</");
+    let start = xml.find(&start_suffix)? + start_suffix.len();
+    let rest = &xml[start..];
+    let end = rest.find(&end_suffix)?;
+    Some(rest[..end].to_owned())
+}
+
+fn verify_xml_signature(
+    opc: &OpcPackageProjection,
+    parts: &[RawPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+    signature_part_path: &str,
+    signature_bytes: &[u8],
+    xml_signature: &cvn_core::XmlSignatureProjection,
+    mut diagnostics: Vec<SignatureDiagnostic>,
+) -> SignatureVerificationReport {
+    let mut references = Vec::new();
+    let mut overall_status = SignatureVerificationStatus::Valid;
+    for reference in &xml_signature.signed_info.references {
+        let verification = verify_signature_reference(
+            opc,
+            parts,
+            objects,
+            signature_part_path,
+            signature_bytes,
+            reference,
+            &mut diagnostics,
+        );
+        if verification.status != SignatureVerificationStatus::Valid {
+            overall_status = combine_signature_status(overall_status, verification.status);
+        }
+        references.push(verification);
+    }
+
+    let signed_info_bytes =
+        match signed_info_canonical_bytes(signature_bytes, &xml_signature.signed_info) {
+            Ok(bytes) => bytes,
+            Err(code) => {
+                diagnostics.push(signature_diag(
+                    code,
+                    signature_part_path,
+                    "SignedInfo canonicalization failed or is unsupported",
+                ));
+                overall_status = combine_signature_status(
+                    overall_status,
+                    SignatureVerificationStatus::UnsupportedAlgorithm,
+                );
+                Vec::new()
+            }
+        };
+    let signed_info_digest = if signed_info_bytes.is_empty() {
+        None
+    } else {
+        Some(sha256_hex(&signed_info_bytes))
+    };
+    let (signature_value_status, key_fingerprint) = verify_signature_value(
+        &xml_signature.signed_info.signature_method,
+        &signed_info_bytes,
+        &xml_signature.signature_value,
+        &xml_signature.key_info,
+        signature_part_path,
+        &mut diagnostics,
+    );
+    if signature_value_status != SignatureVerificationStatus::Valid {
+        overall_status = combine_signature_status(overall_status, signature_value_status);
+    }
+    if xml_signature.signed_info.signature_method == RSA_SHA1
+        || xml_signature
+            .signed_info
+            .references
+            .iter()
+            .any(|reference| reference.digest_method == SHA1_DIGEST)
+    {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_LEGACY_SHA1",
+            signature_part_path,
+            "SHA-1 is verification-only legacy signature material",
+        ));
+    }
+    diagnostics.push(signature_diag(
+        "CVN_SIGNATURE_TRUST_UNASSESSED",
+        signature_part_path,
+        "certificate trust chain, revocation, and timestamp trust are outside P0-CVN-09",
+    ));
+
+    SignatureVerificationReport {
+        status: overall_status,
+        cryptographic_validity: overall_status,
+        certificate_trust: SignatureVerificationStatus::UnassessedTrust,
+        signature_value_status,
+        key_fingerprint,
+        signed_info_digest,
+        references,
+        diagnostics,
+    }
+}
+
+fn verify_signature_reference(
+    opc: &OpcPackageProjection,
+    parts: &[RawPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+    signature_part_path: &str,
+    signature_bytes: &[u8],
+    reference: &SignatureReferenceProjection,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> SignatureReferenceVerification {
+    let expected_digest = reference.digest_value.clone();
+    let mut target_part_path = None;
+    let target_bytes = match resolve_reference_bytes(
+        opc,
+        parts,
+        objects,
+        signature_part_path,
+        signature_bytes,
+        reference,
+        &mut target_part_path,
+        diagnostics,
+    ) {
+        ReferenceBytes::Bytes(bytes) => bytes,
+        ReferenceBytes::Unsupported(status) => {
+            return SignatureReferenceVerification {
+                uri: reference.uri.clone(),
+                status,
+                expected_digest,
+                actual_digest: None,
+                target_part_path,
+            }
+        }
+    };
+    let Some(actual_digest_bytes) =
+        digest_bytes_for_method(&reference.digest_method, &target_bytes)
+    else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_DIGEST_ALGORITHM_UNSUPPORTED",
+            signature_part_path,
+            "Reference DigestMethod is unsupported",
+        ));
+        return SignatureReferenceVerification {
+            uri: reference.uri.clone(),
+            status: SignatureVerificationStatus::UnsupportedAlgorithm,
+            expected_digest,
+            actual_digest: None,
+            target_part_path,
+        };
+    };
+    let actual_digest = base64::engine::general_purpose::STANDARD.encode(&actual_digest_bytes);
+    let status = if constant_time_eq(actual_digest.as_bytes(), expected_digest.as_bytes()) {
+        SignatureVerificationStatus::Valid
+    } else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_REFERENCE_DIGEST_MISMATCH",
+            signature_part_path,
+            "Reference DigestValue does not match recalculated digest",
+        ));
+        SignatureVerificationStatus::Invalid
+    };
+    SignatureReferenceVerification {
+        uri: reference.uri.clone(),
+        status,
+        expected_digest,
+        actual_digest: Some(actual_digest),
+        target_part_path,
+    }
+}
+
+enum ReferenceBytes {
+    Bytes(Vec<u8>),
+    Unsupported(SignatureVerificationStatus),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_reference_bytes(
+    opc: &OpcPackageProjection,
+    parts: &[RawPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+    signature_part_path: &str,
+    signature_bytes: &[u8],
+    reference: &SignatureReferenceProjection,
+    target_part_path: &mut Option<String>,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> ReferenceBytes {
+    if reference.uri.starts_with("http://") || reference.uri.starts_with("https://") {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_REFERENCE_EXTERNAL_UNSUPPORTED",
+            signature_part_path,
+            "External Reference URI is not resolved",
+        ));
+        return ReferenceBytes::Unsupported(SignatureVerificationStatus::UnsupportedTransform);
+    }
+    if reference
+        .transforms
+        .iter()
+        .any(|transform| transform.algorithm.contains("xslt"))
+    {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_TRANSFORM_UNSUPPORTED",
+            signature_part_path,
+            "XSLT transform is not executed",
+        ));
+        return ReferenceBytes::Unsupported(SignatureVerificationStatus::UnsupportedTransform);
+    }
+    if reference
+        .transforms
+        .iter()
+        .any(|transform| transform.algorithm == RELATIONSHIP_TRANSFORM)
+    {
+        let Some(path) = part_path_from_reference(signature_part_path, &reference.uri) else {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_REFERENCE_TARGET_MISSING",
+                signature_part_path,
+                "relationship transform target cannot be resolved",
+            ));
+            return ReferenceBytes::Unsupported(SignatureVerificationStatus::Malformed);
+        };
+        *target_part_path = Some(path.clone());
+        return relationship_transform_bytes(opc, &path, reference, diagnostics)
+            .map(ReferenceBytes::Bytes)
+            .unwrap_or(ReferenceBytes::Unsupported(
+                SignatureVerificationStatus::UnsupportedTransform,
+            ));
+    }
+    if reference
+        .transforms
+        .iter()
+        .any(|transform| transform.algorithm == CONTENT_TYPE_TRANSFORM)
+    {
+        *target_part_path = Some("[Content_Types].xml".to_owned());
+        return ReferenceBytes::Bytes(content_type_transform_bytes(opc));
+    }
+    if let Some(fragment) = reference.uri.strip_prefix('#') {
+        if let Some(object_xml) = same_document_object(signature_bytes, fragment) {
+            return ReferenceBytes::Bytes(object_xml.into_bytes());
+        }
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_REFERENCE_TARGET_MISSING",
+            signature_part_path,
+            "same-document Reference target is missing",
+        ));
+        return ReferenceBytes::Unsupported(SignatureVerificationStatus::Malformed);
+    }
+    let Some(path) = part_path_from_reference(signature_part_path, &reference.uri) else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_REFERENCE_TARGET_MISSING",
+            signature_part_path,
+            "Reference URI cannot be resolved to a package part",
+        ));
+        return ReferenceBytes::Unsupported(SignatureVerificationStatus::Malformed);
+    };
+    *target_part_path = Some(path.clone());
+    let Some(bytes) = object_bytes_for_part(parts, objects, &path) else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_REFERENCE_TARGET_MISSING",
+            &path,
+            "Reference target part is missing",
+        ));
+        return ReferenceBytes::Unsupported(SignatureVerificationStatus::Malformed);
+    };
+    ReferenceBytes::Bytes(bytes.to_vec())
+}
+
+fn relationship_transform_bytes(
+    opc: &OpcPackageProjection,
+    rels_path: &str,
+    reference: &SignatureReferenceProjection,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> Option<Vec<u8>> {
+    let source_part = relationship_source_part(rels_path);
+    let mut selected = Vec::new();
+    for transform in &reference.transforms {
+        for source_id in &transform.relationship_references {
+            selected.extend(opc.relationships.iter().filter(|relationship| {
+                relationship.source_part == source_part
+                    && relationship.relationship_id == *source_id
+                    && relationship.relationship_type != OPC_SIGNATURE_ORIGIN_REL_TYPE
+                    && relationship.relationship_type != OPC_SIGNATURE_REL_TYPE
+            }));
+        }
+        for source_type in &transform.relationship_group_references {
+            selected.extend(opc.relationships.iter().filter(|relationship| {
+                relationship.source_part == source_part
+                    && relationship.relationship_type == *source_type
+                    && relationship.relationship_type != OPC_SIGNATURE_ORIGIN_REL_TYPE
+                    && relationship.relationship_type != OPC_SIGNATURE_REL_TYPE
+            }));
+        }
+    }
+    if selected.is_empty() {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_TRANSFORM_UNSUPPORTED",
+            rels_path,
+            "relationship transform selected no supported relationships",
+        ));
+        return None;
+    }
+    selected.sort_by(|left, right| left.relationship_id.cmp(&right.relationship_id));
+    selected.dedup_by(|left, right| left.relationship_id == right.relationship_id);
+    let mut xml = String::from(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    for relationship in selected {
+        xml.push_str("<Relationship");
+        xml.push_str(&format!(
+            r#" Id="{}" Type="{}" Target="{}""#,
+            escape_xml_attr(&relationship.relationship_id),
+            escape_xml_attr(&relationship.relationship_type),
+            escape_xml_attr(&relationship.target)
+        ));
+        if relationship.target_mode == TargetMode::External {
+            xml.push_str(r#" TargetMode="External""#);
+        }
+        xml.push_str("/>");
+    }
+    xml.push_str("</Relationships>");
+    Some(xml.into_bytes())
+}
+
+fn content_type_transform_bytes(opc: &OpcPackageProjection) -> Vec<u8> {
+    let mut xml = String::from(
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+    );
+    let mut defaults = opc.content_types.defaults.clone();
+    defaults.sort_by(|left, right| left.extension.cmp(&right.extension));
+    for default in defaults {
+        xml.push_str(&format!(
+            r#"<Default Extension="{}" ContentType="{}"/>"#,
+            escape_xml_attr(&default.extension),
+            escape_xml_attr(&default.content_type)
+        ));
+    }
+    let mut overrides = opc.content_types.overrides.clone();
+    overrides.sort_by(|left, right| left.part_name.cmp(&right.part_name));
+    for override_entry in overrides {
+        xml.push_str(&format!(
+            r#"<Override PartName="/{}" ContentType="{}"/>"#,
+            escape_xml_attr(&override_entry.part_name),
+            escape_xml_attr(&override_entry.content_type)
+        ));
+    }
+    xml.push_str("</Types>");
+    xml.into_bytes()
+}
+
+fn verify_signature_value(
+    signature_method: &str,
+    signed_info_bytes: &[u8],
+    signature_value: &str,
+    key_info: &SignatureKeyInfoProjection,
+    signature_part_path: &str,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+) -> (SignatureVerificationStatus, Option<String>) {
+    if signed_info_bytes.is_empty() {
+        return (SignatureVerificationStatus::Malformed, None);
+    }
+    if signature_digest_for_method(signature_method).is_none() {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_METHOD_UNSUPPORTED",
+            signature_part_path,
+            "SignatureMethod is unsupported",
+        ));
+        return (SignatureVerificationStatus::UnsupportedAlgorithm, None);
+    }
+    let signature_bytes = match base64::engine::general_purpose::STANDARD.decode(
+        signature_value
+            .split_whitespace()
+            .collect::<String>()
+            .as_bytes(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            diagnostics.push(signature_diag(
+                "CVN_SIGNATURE_VALUE_MISMATCH",
+                signature_part_path,
+                "SignatureValue is not valid base64",
+            ));
+            return (SignatureVerificationStatus::Invalid, None);
+        }
+    };
+    let Some((public_key, fingerprint)) =
+        public_key_from_key_info(key_info, diagnostics, signature_part_path)
+    else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_KEY_MISSING",
+            signature_part_path,
+            "no supported RSA public key is available",
+        ));
+        return (SignatureVerificationStatus::MissingKey, None);
+    };
+    let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_bytes.as_slice()) else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_VALUE_MISMATCH",
+            signature_part_path,
+            "SignatureValue length is invalid for RSA",
+        ));
+        return (SignatureVerificationStatus::Invalid, Some(fingerprint));
+    };
+    let verified = match signature_method {
+        RSA_SHA1 => VerifyingKey::<Sha1>::new(public_key).verify(signed_info_bytes, &signature),
+        RSA_SHA256 => VerifyingKey::<Sha256>::new(public_key).verify(signed_info_bytes, &signature),
+        RSA_SHA384 => VerifyingKey::<Sha384>::new(public_key).verify(signed_info_bytes, &signature),
+        RSA_SHA512 => VerifyingKey::<Sha512>::new(public_key).verify(signed_info_bytes, &signature),
+        _ => unreachable!("checked earlier"),
+    };
+    if verified.is_ok() {
+        (SignatureVerificationStatus::Valid, Some(fingerprint))
+    } else {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_VALUE_MISMATCH",
+            signature_part_path,
+            "SignatureValue does not verify against SignedInfo and KeyInfo",
+        ));
+        (SignatureVerificationStatus::Invalid, Some(fingerprint))
+    }
+}
+
+fn public_key_from_key_info(
+    key_info: &SignatureKeyInfoProjection,
+    diagnostics: &mut Vec<SignatureDiagnostic>,
+    signature_part_path: &str,
+) -> Option<(RsaPublicKey, String)> {
+    if let Some(key_value) = &key_info.key_value_rsa {
+        let modulus = base64::engine::general_purpose::STANDARD
+            .decode(
+                key_value
+                    .modulus_b64
+                    .split_whitespace()
+                    .collect::<String>()
+                    .as_bytes(),
+            )
+            .ok()?;
+        let exponent = base64::engine::general_purpose::STANDARD
+            .decode(
+                key_value
+                    .exponent_b64
+                    .split_whitespace()
+                    .collect::<String>()
+                    .as_bytes(),
+            )
+            .ok()?;
+        let key = RsaPublicKey::new(
+            BigUint::from_bytes_be(&modulus),
+            BigUint::from_bytes_be(&exponent),
+        )
+        .ok()?;
+        return Some((key, key_value.fingerprint.clone()));
+    }
+    for certificate in &key_info.x509_certificates {
+        if certificate.malformed {
+            continue;
+        }
+        let Ok(der) =
+            base64::engine::general_purpose::STANDARD.decode(certificate.der_sha256.as_bytes())
+        else {
+            continue;
+        };
+        let _ = der;
+    }
+    if !key_info.x509_certificates.is_empty() {
+        diagnostics.push(signature_diag(
+            "CVN_SIGNATURE_KEY_MISSING",
+            signature_part_path,
+            "X.509 metadata was projected, but RSA public key extraction is unavailable without KeyValue",
+        ));
+    }
+    None
+}
+
+fn signed_info_canonical_bytes(
+    signature_bytes: &[u8],
+    signed_info: &SignedInfoProjection,
+) -> Result<Vec<u8>, &'static str> {
+    if !is_supported_canonicalization(&signed_info.canonicalization_method) {
+        return Err("CVN_SIGNATURE_CANONICALIZATION_UNSUPPORTED");
+    }
+    let xml = String::from_utf8_lossy(signature_bytes);
+    let Some(start) = xml
+        .find("<ds:SignedInfo")
+        .or_else(|| xml.find("<SignedInfo"))
+    else {
+        return Err("CVN_SIGNATURE_XML_MALFORMED");
+    };
+    let Some(relative_end) = xml[start..]
+        .find("</ds:SignedInfo>")
+        .or_else(|| xml[start..].find("</SignedInfo>"))
+    else {
+        return Err("CVN_SIGNATURE_XML_MALFORMED");
+    };
+    let end_tag = if xml[start + relative_end..].starts_with("</ds:SignedInfo>") {
+        "</ds:SignedInfo>"
+    } else {
+        "</SignedInfo>"
+    };
+    let end = start + relative_end + end_tag.len();
+    Ok(xml[start..end].as_bytes().to_vec())
+}
+
+fn digest_bytes_for_method(method: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    match method {
+        SHA1_DIGEST => Some(Sha1::digest(bytes).to_vec()),
+        SHA256_DIGEST => Some(Sha256::digest(bytes).to_vec()),
+        SHA384_DIGEST => Some(Sha384::digest(bytes).to_vec()),
+        SHA512_DIGEST => Some(Sha512::digest(bytes).to_vec()),
+        _ => None,
+    }
+}
+
+fn signature_digest_for_method(method: &str) -> Option<&'static str> {
+    match method {
+        RSA_SHA1 => Some(SHA1_DIGEST),
+        RSA_SHA256 => Some(SHA256_DIGEST),
+        RSA_SHA384 => Some(SHA384_DIGEST),
+        RSA_SHA512 => Some(SHA512_DIGEST),
+        _ => None,
+    }
+}
+
+fn is_supported_canonicalization(method: &str) -> bool {
+    matches!(method, C14N_10 | C14N_10_COMMENTS | EXCLUSIVE_C14N_10)
+}
+
+fn combine_signature_status(
+    current: SignatureVerificationStatus,
+    next: SignatureVerificationStatus,
+) -> SignatureVerificationStatus {
+    use SignatureVerificationStatus::{
+        Invalid, Malformed, MissingKey, UnsupportedAlgorithm, UnsupportedTransform, Valid,
+    };
+    match (current, next) {
+        (Invalid, _) | (_, Invalid) => Invalid,
+        (UnsupportedAlgorithm, _) | (_, UnsupportedAlgorithm) => UnsupportedAlgorithm,
+        (UnsupportedTransform, _) | (_, UnsupportedTransform) => UnsupportedTransform,
+        (MissingKey, _) | (_, MissingKey) => MissingKey,
+        (Malformed, _) | (_, Malformed) => Malformed,
+        (Valid, status) => status,
+        (status, Valid) => status,
+        (status, _) => status,
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
+fn part_path_from_reference(signature_part_path: &str, uri: &str) -> Option<String> {
+    let path = uri.strip_prefix('/').unwrap_or(uri);
+    if path.is_empty() {
+        return None;
+    }
+    if path.contains("://") || path.split('/').any(|segment| segment == "..") {
+        return None;
+    }
+    if uri.starts_with('/') {
+        return Some(path.to_owned());
+    }
+    let base = signature_part_path
+        .rsplit_once('/')
+        .map(|(base, _)| base)
+        .unwrap_or("");
+    normalize_relative_part_path(base, path)
+}
+
+fn resolve_relationship_target(source_part: Option<&str>, target: &str) -> Option<String> {
+    let target = target.strip_prefix('/').unwrap_or(target);
+    if target.contains("://") || target.split('/').any(|segment| segment == "..") {
+        return None;
+    }
+    if target.starts_with('/') {
+        return Some(target.trim_start_matches('/').to_owned());
+    }
+    let base = source_part
+        .and_then(|part| part.rsplit_once('/').map(|(base, _)| base))
+        .unwrap_or("");
+    normalize_relative_part_path(base, target)
+}
+
+fn normalize_relative_part_path(base: &str, target: &str) -> Option<String> {
+    let mut segments = Vec::new();
+    if !base.is_empty() {
+        segments.extend(
+            base.split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            value => segments.push(percent_decode_unreserved(value)?),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+fn percent_decode_unreserved(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            output.push(byte);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn same_document_object(signature_bytes: &[u8], fragment: &str) -> Option<String> {
+    let xml = String::from_utf8_lossy(signature_bytes);
+    let needle = format!(r#"Id="{fragment}""#);
+    let id_pos = xml.find(&needle)?;
+    let start = xml[..id_pos].rfind('<')?;
+    let name_end = xml[start + 1..]
+        .find(|ch: char| ch.is_whitespace() || ch == '>')
+        .map(|offset| start + 1 + offset)?;
+    let raw_name = &xml[start + 1..name_end];
+    let end_tag = format!("</{raw_name}>");
+    let relative_end = xml[name_end..].find(&end_tag)?;
+    let end = name_end + relative_end + end_tag.len();
+    Some(xml[start..end].to_owned())
+}
+
+fn read_text_until(
+    reader: &mut Reader<Cursor<&[u8]>>,
+    local_name: &str,
+    source_part_path: &str,
+) -> Result<String, DocxImportError> {
+    let mut buffer = Vec::new();
+    let mut text = String::new();
+    let mut depth = 0_usize;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(_) => depth += 1,
+            Event::Text(event) => text.push_str(&String::from_utf8_lossy(event.as_ref())),
+            Event::CData(event) => text.push_str(&String::from_utf8_lossy(event.as_ref())),
+            Event::End(event) => {
+                let raw = String::from_utf8_lossy(event.name().as_ref()).into_owned();
+                let local = raw.rsplit(':').next().unwrap_or(raw.as_str());
+                if depth == 0 && local == local_name {
+                    break;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(text)
+}
+
+fn read_element_xml(
+    event: &BytesStart<'_>,
+    reader: &mut Reader<Cursor<&[u8]>>,
+    _source_part_path: &str,
+) -> Result<String, DocxImportError> {
+    let raw_name = String::from_utf8_lossy(event.name().as_ref()).into_owned();
+    Ok(format!(
+        "{}{}{}",
+        start_event_xml(event)?,
+        read_branch_xml(reader, raw_name.rsplit(':').next().unwrap_or(&raw_name))?,
+        format!("</{raw_name}>")
+    ))
+}
+
+fn is_ds_event(
+    event: &BytesStart<'_>,
+    namespace_stack: &[BTreeMap<String, String>],
+    local_name: &str,
+) -> bool {
+    let mut stack = namespace_stack.to_vec();
+    if let Ok(declarations) = namespace_declarations(event) {
+        stack.push(declarations);
+    }
+    let name = qname(event.name().as_ref(), &stack);
+    name.namespace_uri.as_deref() == Some(DSIG_NAMESPACE) && name.local_name == local_name
+}
+
+fn dsig_scope() -> BTreeMap<String, String> {
+    BTreeMap::from([("ds".to_owned(), DSIG_NAMESPACE.to_owned())])
+}
+
+fn escape_xml_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn signature_diag(code: &str, path: &str, message: &str) -> SignatureDiagnostic {
+    SignatureDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.to_owned(),
+    }
 }
 
 fn attributes(
@@ -4910,6 +6238,12 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
+    use base64::Engine;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+    use sha2::Sha256;
     use zip::write::FileOptions;
     use zip::ZipWriter;
 
@@ -4950,6 +6284,137 @@ mod tests {
             .find(|part| part.original_path == "word/copy.xml")
             .unwrap();
         assert_eq!(document_part.content_digest, copy_part.content_digest);
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn discovers_and_verifies_opc_xml_signature_from_relationship_graph() {
+        let docx = write_signed_docx("signature-valid", false, false);
+        let package = import_docx(&docx).unwrap();
+        let signatures = package.document.signatures.as_ref().unwrap();
+
+        assert_eq!(signatures.origins.len(), 1);
+        assert_eq!(signatures.signatures.len(), 1);
+        let signature = &signatures.signatures[0];
+        assert_eq!(signature.origin_part_path, "_xmlsignatures/origin.sigs");
+        assert_eq!(signature.signature_part_path, "_xmlsignatures/sig1.xml");
+        assert_eq!(
+            signature.verification.status,
+            SignatureVerificationStatus::Valid
+        );
+        assert_eq!(
+            signature.verification.certificate_trust,
+            SignatureVerificationStatus::UnassessedTrust
+        );
+        assert!(signature
+            .verification
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_SIGNATURE_TRUST_UNASSESSED"));
+        assert_eq!(signature.verification.references.len(), 1);
+        assert_eq!(
+            signature.verification.references[0].status,
+            SignatureVerificationStatus::Valid
+        );
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    fn write_signed_docx(
+        name: &str,
+        tamper_reference_target: bool,
+        tamper_signature_value: bool,
+    ) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+        let document_bytes = b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>signed</w:t></w:r></w:p></w:body></w:document>".to_vec();
+        let digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&document_bytes));
+        let mut rng = rsa::rand_core::OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let signed_info = format!(
+            "<ds:SignedInfo xmlns:ds=\"{DSIG_NAMESPACE}\"><ds:CanonicalizationMethod Algorithm=\"{C14N_10}\"/><ds:SignatureMethod Algorithm=\"{RSA_SHA256}\"/><ds:Reference URI=\"/word/document.xml\"><ds:DigestMethod Algorithm=\"{SHA256_DIGEST}\"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"
+        );
+        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let mut signature_value = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(signed_info.as_bytes()).to_vec());
+        if tamper_signature_value {
+            signature_value.replace_range(0..1, "A");
+        }
+        let modulus =
+            base64::engine::general_purpose::STANDARD.encode(public_key.n().to_bytes_be());
+        let exponent =
+            base64::engine::general_purpose::STANDARD.encode(public_key.e().to_bytes_be());
+        let signature_xml = format!(
+            "<ds:Signature xmlns:ds=\"{DSIG_NAMESPACE}\">{signed_info}<ds:SignatureValue>{signature_value}</ds:SignatureValue><ds:KeyInfo><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{modulus}</ds:Modulus><ds:Exponent>{exponent}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue><ds:X509Data><ds:X509Certificate>not-a-certificate</ds:X509Certificate></ds:X509Data></ds:KeyInfo><ds:Object Id=\"idOfficeObject\"><SignatureInfoV1><SetupID>setup</SetupID><SignatureComments>fixture</SignatureComments><SignatureType>1</SignatureType></SignatureInfoV1></ds:Object></ds:Signature>"
+        );
+        let final_document_bytes = if tamper_reference_target {
+            b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>tampered</w:t></w:r></w:p></w:body></w:document>".to_vec()
+        } else {
+            document_bytes
+        };
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        add(&mut zip, options, "[Content_Types].xml", br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/_xmlsignatures/origin.sigs" ContentType="application/vnd.openxmlformats-package.digital-signature-origin"/><Override PartName="/_xmlsignatures/sig1.xml" ContentType="application/vnd.openxmlformats-package.digital-signature-xmlsignature+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDoc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rSigOrigin" Type="http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin" Target="_xmlsignatures/origin.sigs"/></Relationships>"#);
+        add(
+            &mut zip,
+            options,
+            "word/document.xml",
+            &final_document_bytes,
+        );
+        add(&mut zip, options, "_xmlsignatures/origin.sigs", b"");
+        add(&mut zip, options, "_xmlsignatures/_rels/origin.sigs.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rSig1" Type="http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/signature" Target="sig1.xml"/></Relationships>"#);
+        add(
+            &mut zip,
+            options,
+            "_xmlsignatures/sig1.xml",
+            signature_xml.as_bytes(),
+        );
+        zip.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn signature_reference_digest_mismatch_is_reported() {
+        let docx = write_signed_docx("signature-reference-tamper", true, false);
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.references[0].status,
+            SignatureVerificationStatus::Invalid
+        );
+        assert!(signature
+            .verification
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_SIGNATURE_REFERENCE_DIGEST_MISMATCH"));
+
+        std::fs::remove_file(docx).unwrap();
+    }
+
+    #[test]
+    fn signature_value_mismatch_is_reported() {
+        let docx = write_signed_docx("signature-value-tamper", false, true);
+        let package = import_docx(&docx).unwrap();
+        let signature = &package.document.signatures.as_ref().unwrap().signatures[0];
+
+        assert_eq!(
+            signature.verification.signature_value_status,
+            SignatureVerificationStatus::Invalid
+        );
+        assert!(signature
+            .verification
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_SIGNATURE_VALUE_MISMATCH"));
 
         std::fs::remove_file(docx).unwrap();
     }

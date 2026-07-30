@@ -60,6 +60,24 @@ fn export_command(args: &[String]) -> Result<(), CliError> {
 }
 
 fn verify_command(args: &[String]) -> Result<(), CliError> {
+    if args.len() == 2 && args[1] == "--signatures" {
+        let input = PathBuf::from(&args[0]);
+        let integrity = cvn_verify::verify_canonical_package_integrity(&input)?;
+        print_integrity_report(&integrity);
+        if !integrity.passed {
+            return Err(CliError::IntegrityFailed);
+        }
+        let report = cvn_verify::verify_opc_signatures(input)?;
+        print_signature_report(&report);
+        if report.unsupported {
+            return Err(CliError::SignatureUnsupported);
+        }
+        if !report.passed {
+            return Err(CliError::SignatureVerificationFailed);
+        }
+        return Ok(());
+    }
+
     if args.len() == 1 {
         let input = PathBuf::from(&args[0]);
         let report = cvn_verify::verify_canonical_package_integrity(input)?;
@@ -72,7 +90,7 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
 
     if args.len() != 3 || args[1] != "--against" {
         return Err(CliError::Usage(
-            "usage: tcvn verify <input.cvn> [--against <document.docx>]".to_owned(),
+            "usage: tcvn verify <input.cvn> [--signatures] [--against <document.docx>]".to_owned(),
         ));
     }
 
@@ -112,11 +130,17 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
     if flags.iter().any(|flag| {
         !matches!(
             flag.as_str(),
-            "--semantic" | "--styles" | "--numbering" | "--stories" | "--changes" | "--mce"
+            "--semantic"
+                | "--styles"
+                | "--numbering"
+                | "--stories"
+                | "--changes"
+                | "--mce"
+                | "--signatures"
         )
     }) {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce]"
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures]"
                 .to_owned(),
         ));
     }
@@ -148,10 +172,46 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
                 serde_json::to_string_pretty(&cvn_json.payload.track_changes)?
             ),
             "--mce" => println!("{}", serde_json::to_string_pretty(&cvn_json.payload.mce)?),
+            "--signatures" => println!(
+                "{}",
+                serde_json::to_string_pretty(&cvn_json.payload.signatures)?
+            ),
             _ => unreachable!("validated inspect flag"),
         }
     }
     Ok(())
+}
+
+fn print_signature_report(report: &cvn_verify::OpcSignatureVerificationReport) {
+    println!(
+        "Verification OpcXmlDigitalSignatures: passed={} signatures={}",
+        report.passed, report.signatures
+    );
+    for signature in &report.projection.signatures {
+        println!(
+            "  signature_part={} cryptographic_validity={:?} certificate_trust={:?} signature_value={:?}",
+            signature.signature_part_path,
+            signature.verification.cryptographic_validity,
+            signature.verification.certificate_trust,
+            signature.verification.signature_value_status
+        );
+        for reference in &signature.verification.references {
+            println!(
+                "    reference uri={} status={:?} target={} expected={} actual={}",
+                reference.uri,
+                reference.status,
+                reference.target_part_path.as_deref().unwrap_or("<none>"),
+                reference.expected_digest,
+                reference.actual_digest.as_deref().unwrap_or("<none>")
+            );
+        }
+        for diagnostic in &signature.verification.diagnostics {
+            println!(
+                "    diagnostic code={} path={} message={}",
+                diagnostic.code, diagnostic.path, diagnostic.message
+            );
+        }
+    }
 }
 
 fn print_integrity_report(report: &cvn_package::CanonicalPackageIntegrityReport) {
@@ -197,6 +257,8 @@ enum CliError {
     Verify(#[from] cvn_verify::ExpandedOpcVerifyError),
     #[error("integrity verification failed: {0}")]
     Integrity(#[from] cvn_verify::CanonicalPackageIntegrityVerifyError),
+    #[error("OPC XML signature verification failed: {0}")]
+    Signature(#[from] cvn_verify::OpcSignatureVerifyError),
     #[error("package error: {0}")]
     Package(#[from] cvn_package::PackageError),
     #[error("JSON error: {0}")]
@@ -205,6 +267,10 @@ enum CliError {
     IntegrityFailed,
     #[error("Expanded OPC Part Byte Identity failed")]
     VerificationFailed,
+    #[error("OPC XML signature cryptographic verification failed")]
+    SignatureVerificationFailed,
+    #[error("OPC XML signature algorithm or transform unsupported")]
+    SignatureUnsupported,
 }
 
 impl CliError {
@@ -215,10 +281,13 @@ impl CliError {
             | Self::Export(_)
             | Self::Verify(_)
             | Self::Integrity(_)
+            | Self::Signature(_)
             | Self::Package(_)
             | Self::Json(_) => 3,
             Self::IntegrityFailed => 4,
             Self::VerificationFailed => 5,
+            Self::SignatureVerificationFailed => 6,
+            Self::SignatureUnsupported => 7,
         }
     }
 }
@@ -243,10 +312,13 @@ Commands:
   tcvn verify <input.cvn>
       Verify CanonicalPackageIntegrity for a CVN package.
 
+  tcvn verify <input.cvn> --signatures
+      Verify OPC XML Digital Signatures cryptographically; signer trust remains unassessed.
+
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
-  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce]
+  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures]
       Print read-only projections from cvn.json.
 
   tcvn diff <left.cvn> <right.cvn>

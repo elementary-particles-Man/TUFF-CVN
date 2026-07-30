@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use cvn_canonical::{sha256_canonical, to_canonical_bytes};
-use cvn_core::{ChecksumAlgorithm, ChecksumEntry, CvnDocument, Relation};
+use cvn_core::{
+    ChecksumAlgorithm, ChecksumEntry, CvnDocument, OpcSignatureRegistryProjection, Relation,
+    SignatureVerificationStatus,
+};
 use cvn_docx_import::import_docx;
 use cvn_package::{read_package, verify_package_integrity, CanonicalPackageIntegrityReport};
 use thiserror::Error;
@@ -47,6 +50,15 @@ pub struct ExpandedOpcPartByteIdentityReport {
     pub package_errors: Vec<String>,
 }
 
+/// OPC XML Digital Signature verification report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpcSignatureVerificationReport {
+    pub passed: bool,
+    pub unsupported: bool,
+    pub signatures: usize,
+    pub projection: OpcSignatureRegistryProjection,
+}
+
 /// Length mismatch for one OPC part.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartLengthMismatch {
@@ -79,11 +91,53 @@ pub enum CanonicalPackageIntegrityVerifyError {
     Package(#[from] cvn_package::PackageError),
 }
 
+/// OPC signature verification error.
+#[derive(Debug, Error)]
+pub enum OpcSignatureVerifyError {
+    #[error("package error: {0}")]
+    Package(#[from] cvn_package::PackageError),
+    #[error("DOCX import error: {0}")]
+    Import(#[from] cvn_docx_import::DocxImportError),
+}
+
 /// Verifies CanonicalPackageIntegrity for a CVN package.
 pub fn verify_canonical_package_integrity(
     cvn_package_path: impl AsRef<Path>,
 ) -> Result<CanonicalPackageIntegrityReport, CanonicalPackageIntegrityVerifyError> {
     verify_package_integrity(cvn_package_path).map_err(CanonicalPackageIntegrityVerifyError::from)
+}
+
+/// Recomputes OPC XML Digital Signature projection and cryptographic validity.
+pub fn verify_opc_signatures(
+    cvn_package_path: impl AsRef<Path>,
+) -> Result<OpcSignatureVerificationReport, OpcSignatureVerifyError> {
+    let package = read_package(cvn_package_path)?;
+    let projection = cvn_docx_import::rebuild_signature_registry_projection(
+        &package.document,
+        &package.objects,
+    )?;
+    let unsupported = projection.signatures.iter().any(|signature| {
+        matches!(
+            signature.verification.status,
+            SignatureVerificationStatus::UnsupportedAlgorithm
+                | SignatureVerificationStatus::UnsupportedTransform
+        )
+    });
+    let passed = projection.signatures.iter().all(|signature| {
+        signature.verification.status == SignatureVerificationStatus::Valid
+            && signature
+                .verification
+                .references
+                .iter()
+                .all(|reference| reference.status == SignatureVerificationStatus::Valid)
+            && signature.verification.signature_value_status == SignatureVerificationStatus::Valid
+    });
+    Ok(OpcSignatureVerificationReport {
+        passed,
+        unsupported,
+        signatures: projection.signatures.len(),
+        projection,
+    })
 }
 
 /// Verifies the minimal CVN structural invariants currently implemented.

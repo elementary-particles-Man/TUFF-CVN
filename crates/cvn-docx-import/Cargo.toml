@@ -9,10 +9,14 @@ repository.workspace = true
 cvn-core = { path = "../cvn-core" }
 cvn-canonical = { path = "../cvn-canonical" }
 cvn-package = { path = "../cvn-package" }
+base64 = "0.23"
 hex = "0.4"
 quick-xml = "0.38"
+rsa = { version = "0.9.8", features = ["sha1", "sha2"] }
+sha1 = { version = "0.10", features = ["oid"] }
 sha2 = "0.10"
 thiserror = "1"
+x509-parser = "0.18"
 zip = "0.6"
 
 [lib]
