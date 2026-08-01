@@ -444,6 +444,8 @@ pub struct SemanticDocument {
     pub references: Option<DocumentReferencesProjection>,
     #[serde(default)]
     pub drawings: Option<DrawingRegistryProjection>,
+    #[serde(default)]
+    pub embedded_visual_objects: Option<EmbeddedVisualObjectsProjection>,
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
 }
 
@@ -615,6 +617,155 @@ pub struct ImageResourceProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrawingResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
+
+/// Read-only projection of charts, diagrams, OLE objects, and embedded
+/// packages referenced from semantic content.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedVisualObjectsProjection {
+    pub source_part: String,
+    pub objects: Vec<EmbeddedVisualObjectProjection>,
+    pub diagnostics: Vec<EmbeddedVisualObjectDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedVisualObjectProjection {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    #[serde(rename = "object_kind")]
+    pub kind: EmbeddedVisualObjectKind,
+    pub graphic_data_uri: Option<String>,
+    pub chart: Option<ChartProjection>,
+    pub diagram: Option<DiagramProjection>,
+    pub ole: Option<OleObjectProjection>,
+    pub package_resource: Option<EmbeddedResourceProjection>,
+    pub targets: Vec<EmbeddedObjectTarget>,
+    pub preview_image_relationship_id: Option<String>,
+    pub preview_image: Option<EmbeddedResourceProjection>,
+    pub risk_class: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<EmbeddedVisualObjectDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddedVisualObjectKind {
+    Chart,
+    SmartartDiagram,
+    OleEmbeddedObject,
+    OleLinkedObject,
+    EmbeddedPackage,
+    ActivexBlocked,
+    UnsupportedVisualObject,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedObjectTarget {
+    pub kind: EmbeddedObjectTargetKind,
+    pub role: Option<String>,
+    pub relationship_id: Option<String>,
+    pub relationship_type: Option<String>,
+    pub target_mode: Option<TargetMode>,
+    pub raw_target: Option<String>,
+    pub resolved_part_path: Option<String>,
+    pub resource: Option<EmbeddedResourceProjection>,
+    pub risk_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddedObjectTargetKind {
+    EmbeddedPart,
+    InternalPart,
+    ExternalRelationship,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedResourceProjection {
+    pub part_path: Option<String>,
+    pub content_type: Option<String>,
+    pub object_digest: Option<String>,
+    pub length: Option<u64>,
+    pub format_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartProjection {
+    pub part_path: Option<String>,
+    pub content_type: Option<String>,
+    pub object_digest: Option<String>,
+    pub length: Option<u64>,
+    pub chart_type: String,
+    pub title: Option<ChartTitleProjection>,
+    pub series: Vec<ChartSeriesProjection>,
+    pub embedded_workbook: Option<EmbeddedResourceProjection>,
+    pub external_data: Option<EmbeddedObjectTarget>,
+    pub external_data_auto_update: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartTitleProjection {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartSeriesProjection {
+    pub title: Option<String>,
+    pub category_reference: Option<ChartDataReferenceProjection>,
+    pub value_reference: Option<ChartDataReferenceProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartDataReferenceProjection {
+    pub formula: Option<String>,
+    pub cached_string_values: Vec<String>,
+    pub cached_numeric_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagramProjection {
+    pub data_part: Option<DiagramPartReferenceProjection>,
+    pub layout_part: Option<DiagramPartReferenceProjection>,
+    pub style_part: Option<DiagramPartReferenceProjection>,
+    pub colors_part: Option<DiagramPartReferenceProjection>,
+    pub points: Vec<String>,
+    pub connections: Vec<String>,
+    pub texts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagramPartReferenceProjection {
+    pub role: String,
+    pub relationship_id: Option<String>,
+    pub part_path: Option<String>,
+    pub content_type: Option<String>,
+    pub object_digest: Option<String>,
+    pub length: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OleObjectProjection {
+    pub metadata: OleMetadataProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OleMetadataProjection {
+    pub object_type: Option<String>,
+    pub prog_id: Option<String>,
+    pub shape_id: Option<String>,
+    pub draw_aspect: Option<String>,
+    pub object_id: Option<String>,
+    pub update_mode: Option<String>,
+    pub raw_attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedVisualObjectDiagnostic {
     pub code: String,
     pub path: String,
     pub message: String,
@@ -1181,6 +1332,7 @@ pub enum SemanticInline {
     BookmarkEnd(BookmarkProjection),
     Field(FieldProjection),
     Drawing(DrawingProjection),
+    EmbeddedVisualObject(EmbeddedVisualObjectProjection),
     Tab,
     LineBreak {
         break_kind: String,
@@ -1567,6 +1719,7 @@ pub enum IntegrityNodeKind {
     OpcSignatureProjection,
     DocumentReferencesProjection,
     DrawingImageProjection,
+    EmbeddedVisualObjectsProjection,
     Objects,
 }
 
@@ -1587,6 +1740,7 @@ impl IntegrityNodeKind {
             Self::OpcSignatureProjection => "opc_signature_projection",
             Self::DocumentReferencesProjection => "document_references_projection",
             Self::DrawingImageProjection => "drawing_image_projection",
+            Self::EmbeddedVisualObjectsProjection => "embedded_visual_objects_projection",
             Self::Objects => "objects",
         }
     }
