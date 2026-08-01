@@ -22,7 +22,7 @@ pub const MANIFEST_FILE: &str = "cvn.json";
 
 /// Content-addressed object prefix inside a CVN preservation package.
 pub const SHA256_OBJECT_PREFIX: &str = "objects/sha256";
-pub const INTEGRITY_VERSION: &str = "cvn-integrity-v9-document-references";
+pub const INTEGRITY_VERSION: &str = "cvn-integrity-v10-drawing-images";
 
 const DOMAIN_PAYLOAD: &[u8] = b"TUFF-CVN\0payload\0";
 const DOMAIN_PART_MAP: &[u8] = b"TUFF-CVN\0part-map\0";
@@ -36,6 +36,7 @@ const DOMAIN_TRACK_CHANGES: &[u8] = b"TUFF-CVN\0track-changes\0";
 const DOMAIN_MCE: &[u8] = b"TUFF-CVN\0mce\0";
 const DOMAIN_OPC_SIGNATURES: &[u8] = b"TUFF-CVN\0opc-signatures\0";
 const DOMAIN_DOCUMENT_REFERENCES: &[u8] = b"TUFF-CVN\0document-references\0";
+const DOMAIN_DRAWING_IMAGES: &[u8] = b"TUFF-CVN\0drawing-images\0";
 const DOMAIN_OBJECTS: &[u8] = b"TUFF-CVN\0objects\0";
 const DOMAIN_ROOT: &[u8] = b"TUFF-CVN\0root\0";
 
@@ -423,6 +424,11 @@ fn calculate_integrity_nodes(
             to_canonical_bytes(&document.semantic.references)?,
         ),
         (
+            IntegrityNodeKind::DrawingImageProjection,
+            DOMAIN_DRAWING_IMAGES,
+            to_canonical_bytes(&document.semantic.drawings)?,
+        ),
+        (
             IntegrityNodeKind::Objects,
             DOMAIN_OBJECTS,
             to_canonical_bytes(&object_inventory_projection(objects))?,
@@ -463,7 +469,7 @@ fn domain_hash(domain: &[u8], bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn integrity_node_order() -> [IntegrityNodeKind; 13] {
+fn integrity_node_order() -> [IntegrityNodeKind; 14] {
     [
         IntegrityNodeKind::CanonicalPayload,
         IntegrityNodeKind::PartMap,
@@ -477,6 +483,7 @@ fn integrity_node_order() -> [IntegrityNodeKind; 13] {
         IntegrityNodeKind::MceProjection,
         IntegrityNodeKind::OpcSignatureProjection,
         IntegrityNodeKind::DocumentReferencesProjection,
+        IntegrityNodeKind::DrawingImageProjection,
         IntegrityNodeKind::Objects,
     ]
 }
@@ -497,6 +504,7 @@ fn mismatch_code(kind: IntegrityNodeKind) -> &'static str {
         IntegrityNodeKind::DocumentReferencesProjection => {
             "CVN_DOCUMENT_REFERENCES_PROJECTION_DIGEST_MISMATCH"
         }
+        IntegrityNodeKind::DrawingImageProjection => "CVN_DRAWING_IMAGE_PROJECTION_DIGEST_MISMATCH",
         IntegrityNodeKind::Objects => "CVN_OBJECT_INVENTORY_DIGEST_MISMATCH",
     }
 }
@@ -991,6 +999,31 @@ mod tests {
         assert!(has_package_failure(
             &report,
             "CVN_DOCUMENT_REFERENCES_PROJECTION_DIGEST_MISMATCH"
+        ));
+        assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
+
+        cleanup(&temp);
+    }
+
+    #[test]
+    fn drawing_image_projection_change_is_detected() {
+        let temp = write_integrity_fixture("drawings-change");
+        let path = temp.join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["payload"]["semantic"]["drawings"] = serde_json::json!({
+            "source_part": "word/document.xml",
+            "drawings": [],
+            "diagnostics": []
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let report = verify_package_integrity(&temp).unwrap();
+
+        assert!(!report.passed);
+        assert!(has_package_failure(
+            &report,
+            "CVN_DRAWING_IMAGE_PROJECTION_DIGEST_MISMATCH"
         ));
         assert!(has_package_failure(&report, "CVN_ROOT_DIGEST_MISMATCH"));
 

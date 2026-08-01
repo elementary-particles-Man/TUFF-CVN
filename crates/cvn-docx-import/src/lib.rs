@@ -10,13 +10,17 @@ use cvn_core::{
     AbstractNumberingProjection, BookmarkBoundaryKind, BookmarkProjection, BookmarkRangeProjection,
     CommentProjection, CommentRangeProjection, ContentTypeDefault, ContentTypeOverride,
     ContentTypesProjection, CrossReferenceProjection, CvnDocument, DocumentId,
-    DocumentReferenceDiagnostic, DocumentReferencesProjection, FieldCharacterKind,
+    DocumentReferenceDiagnostic, DocumentReferencesProjection, DrawingCropProjection,
+    DrawingExtentProjection, DrawingGeometryProjection, DrawingKind, DrawingMetadataProjection,
+    DrawingOffsetProjection, DrawingPlacement, DrawingPositionProjection, DrawingProjection,
+    DrawingRegistryProjection, DrawingResolutionDiagnostic, DrawingTarget, DrawingTargetKind,
+    DrawingTransformProjection, DrawingWrapProjection, FieldCharacterKind,
     FieldCharacterKindProjection, FieldInstructionProjection, FieldKind, FieldProjection,
     FieldResultProjection, HeaderFooterReferenceProjection, HyperlinkProjection, HyperlinkTarget,
-    HyperlinkTargetKind, MceAlternateContentProjection, MceBranchKind, MceBranchProjection,
-    MceCapabilities, MceCompatibilityAttributes, MceNamespaceRequirement, MceProjection,
-    MceQualifiedName, MceResolutionDiagnostic, MceSelectedContent, MceSelection, NoteProjection,
-    NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
+    HyperlinkTargetKind, ImageResourceProjection, MceAlternateContentProjection, MceBranchKind,
+    MceBranchProjection, MceCapabilities, MceCompatibilityAttributes, MceNamespaceRequirement,
+    MceProjection, MceQualifiedName, MceResolutionDiagnostic, MceSelectedContent, MceSelection,
+    NoteProjection, NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
     NumberingReference, NumberingRegistryProjection, NumberingResolutionDiagnostic,
     OfficeSignatureInfoProjection, OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship,
     OpcSignatureOriginProjection, OpcSignatureProjection, OpcSignatureRegistryProjection,
@@ -111,6 +115,14 @@ const MC_NAMESPACE: &str = "http://schemas.openxmlformats.org/markup-compatibili
 const WML_TRANSITIONAL_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const WML_STRICT_NAMESPACE: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
+const WP_NAMESPACE: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+const DRAWINGML_MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const DRAWINGML_PICTURE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/drawingml/2006/picture";
+const VML_NAMESPACE: &str = "urn:schemas-microsoft-com:vml";
+const OFFICE_NAMESPACE: &str = "urn:schemas-microsoft-com:office:office";
+const IMAGE_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 
 fn mce_capabilities() -> MceCapabilities {
     MceCapabilities {
@@ -347,7 +359,12 @@ pub fn import_docx_with_limits(
         }
         document.track_changes = Some(projection);
     }
-    resolve_semantic_references(&mut document.semantic, &document.opc.relationships);
+    resolve_semantic_references(
+        &mut document.semantic,
+        &document.opc.relationships,
+        &document.opc.content_types,
+        &document.opc.parts,
+    );
 
     let objects = objects_by_digest
         .into_iter()
@@ -931,6 +948,7 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                             SemanticInline::Text(_)
                             | SemanticInline::BookmarkStart(_)
                             | SemanticInline::BookmarkEnd(_)
+                            | SemanticInline::Drawing(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. } => {}
                         }
@@ -982,6 +1000,7 @@ fn mce_inlines_contain_story_references(inlines: &[SemanticInline]) -> bool {
         SemanticInline::Text(_)
         | SemanticInline::BookmarkStart(_)
         | SemanticInline::BookmarkEnd(_)
+        | SemanticInline::Drawing(_)
         | SemanticInline::Tab
         | SemanticInline::LineBreak { .. } => false,
     })
@@ -2634,6 +2653,495 @@ fn read_element_xml(
     ))
 }
 
+fn read_element_xml_with_scope(
+    event: &BytesStart<'_>,
+    scope: &BTreeMap<String, String>,
+    reader: &mut Reader<Cursor<&[u8]>>,
+    _source_part_path: &str,
+) -> Result<String, DocxImportError> {
+    let raw_name = String::from_utf8_lossy(event.name().as_ref()).into_owned();
+    Ok(format!(
+        "{}{}{}",
+        start_event_xml_with_scope(event, scope)?,
+        read_branch_xml(reader, raw_name.rsplit(':').next().unwrap_or(&raw_name))?,
+        format!("</{raw_name}>")
+    ))
+}
+
+fn parse_xml_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" | "t" | "on" => Some(true),
+        "0" | "false" | "f" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_xml_i64(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok()
+}
+
+fn drawing_diag(code: &str, path: &str, message: impl Into<String>) -> DrawingResolutionDiagnostic {
+    DrawingResolutionDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn ensure_drawing_geometry(projection: &mut DrawingProjection) -> &mut DrawingGeometryProjection {
+    projection
+        .geometry
+        .get_or_insert(DrawingGeometryProjection {
+            extent: None,
+            offset: None,
+            transform: None,
+            crop: None,
+        })
+}
+
+fn ensure_drawing_transform(projection: &mut DrawingProjection) -> &mut DrawingTransformProjection {
+    ensure_drawing_geometry(projection)
+        .transform
+        .get_or_insert(DrawingTransformProjection {
+            rotation: None,
+            flip_h: false,
+            flip_v: false,
+            offset: None,
+            extent: None,
+        })
+}
+
+fn parse_vml_style(
+    style: &str,
+    path: &str,
+    diagnostics: &mut Vec<DrawingResolutionDiagnostic>,
+) -> BTreeMap<String, String> {
+    let mut properties = BTreeMap::new();
+    for token in style.split(';') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = token.split_once(':') else {
+            diagnostics.push(drawing_diag(
+                "CVN_DRAWING_VML_STYLE_INVALID",
+                path,
+                format!("invalid VML style token `{token}`"),
+            ));
+            continue;
+        };
+        properties.insert(key.trim().to_owned(), value.trim().to_owned());
+    }
+    properties
+}
+
+fn parse_i64_attr_or_diag(
+    attrs: &BTreeMap<String, String>,
+    keys: &[&str],
+    path: &str,
+    name: &str,
+    diagnostics: &mut Vec<DrawingResolutionDiagnostic>,
+) -> Option<i64> {
+    let value = keys
+        .iter()
+        .find_map(|key| attrs.get(*key).or_else(|| attr_named(attrs, key)));
+    match value {
+        Some(value) => match parse_xml_i64(value) {
+            Some(parsed) => Some(parsed),
+            None => {
+                diagnostics.push(drawing_diag(
+                    "CVN_DRAWING_GEOMETRY_INVALID",
+                    path,
+                    format!("invalid integer `{value}` for `{name}`"),
+                ));
+                None
+            }
+        },
+        None => None,
+    }
+}
+
+fn parse_drawing_projection(
+    document_id: &DocumentId,
+    source_part_path: &str,
+    document_digest: &str,
+    anchor: SourceAnchor,
+    raw_xml: &str,
+    id_set: &mut BTreeSet<String>,
+) -> Result<DrawingProjection, DocxImportError> {
+    let id = semantic_id(
+        document_id,
+        source_part_path,
+        "drawing",
+        None,
+        &anchor.xml_path,
+        document_digest,
+        id_set,
+    )?;
+    let mut projection = DrawingProjection {
+        id,
+        source_anchor: anchor.clone(),
+        kind: DrawingKind::Unresolved,
+        placement: DrawingPlacement::Unsupported,
+        graphic_data_uri: None,
+        metadata: None,
+        geometry: None,
+        targets: Vec::new(),
+        vml_shape_id: None,
+        vml_shape_type: None,
+        vml_style_raw: None,
+        vml_style_properties: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut reader = Reader::from_reader(Cursor::new(raw_xml.as_bytes()));
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut axis_stack: Vec<&'static str> = Vec::new();
+    let mut position_text_target: Option<(&'static str, &'static str)> = None;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                parse_drawing_event(
+                    &name,
+                    &attrs,
+                    &mut projection,
+                    &mut axis_stack,
+                    &mut position_text_target,
+                );
+            }
+            Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                parse_drawing_event(
+                    &name,
+                    &attrs,
+                    &mut projection,
+                    &mut axis_stack,
+                    &mut position_text_target,
+                );
+                namespace_stack.pop();
+            }
+            Event::Text(text) => {
+                if let Some((axis, target)) = position_text_target {
+                    let value = String::from_utf8_lossy(text.as_ref()).into_owned();
+                    if let DrawingPlacement::Anchor {
+                        position_h,
+                        position_v,
+                        ..
+                    } = &mut projection.placement
+                    {
+                        let slot = if axis == "h" { position_h } else { position_v };
+                        if let Some(position) = slot.as_mut() {
+                            if target == "align" {
+                                position.align = Some(value);
+                            } else {
+                                match parse_xml_i64(&value) {
+                                    Some(offset) => position.pos_offset = Some(offset),
+                                    None => projection.diagnostics.push(drawing_diag(
+                                        "CVN_DRAWING_GEOMETRY_INVALID",
+                                        &projection.source_anchor.xml_path,
+                                        format!("invalid position offset `{value}`"),
+                                    )),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Event::End(event) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                if matches!(name.local_name.as_str(), "positionH" | "positionV") {
+                    axis_stack.pop();
+                }
+                if matches!(name.local_name.as_str(), "align" | "posOffset") {
+                    position_text_target = None;
+                }
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if projection.kind == DrawingKind::Unresolved {
+        projection.kind = if raw_xml.contains(":imagedata") {
+            DrawingKind::VmlImage
+        } else {
+            DrawingKind::UnsupportedGraphic
+        };
+    }
+    Ok(projection)
+}
+
+fn parse_drawing_event(
+    name: &XmlName,
+    attrs: &BTreeMap<String, String>,
+    projection: &mut DrawingProjection,
+    axis_stack: &mut Vec<&'static str>,
+    position_text_target: &mut Option<(&'static str, &'static str)>,
+) {
+    match (name.namespace_uri.as_deref(), name.local_name.as_str()) {
+        (Some(WP_NAMESPACE), "inline") => {
+            projection.kind = DrawingKind::DrawingmlInlineImage;
+            projection.placement = DrawingPlacement::Inline;
+        }
+        (Some(WP_NAMESPACE), "anchor") => {
+            projection.kind = DrawingKind::DrawingmlAnchoredImage;
+            projection.placement = DrawingPlacement::Anchor {
+                simple_pos: attrs
+                    .get("simplePos")
+                    .and_then(|value| parse_xml_bool(value)),
+                relative_height: attrs.get("relativeHeight").cloned(),
+                behind_doc: attrs
+                    .get("behindDoc")
+                    .and_then(|value| parse_xml_bool(value)),
+                locked: attrs.get("locked").and_then(|value| parse_xml_bool(value)),
+                layout_in_cell: attrs
+                    .get("layoutInCell")
+                    .and_then(|value| parse_xml_bool(value)),
+                allow_overlap: attrs
+                    .get("allowOverlap")
+                    .and_then(|value| parse_xml_bool(value)),
+                dist_t: attrs.get("distT").cloned(),
+                dist_b: attrs.get("distB").cloned(),
+                dist_l: attrs.get("distL").cloned(),
+                dist_r: attrs.get("distR").cloned(),
+                position_h: None,
+                position_v: None,
+                wrap: None,
+            };
+        }
+        (Some(WP_NAMESPACE), "extent") => {
+            let path = projection.source_anchor.xml_path.clone();
+            let cx =
+                parse_i64_attr_or_diag(attrs, &["cx"], &path, "cx", &mut projection.diagnostics);
+            let cy =
+                parse_i64_attr_or_diag(attrs, &["cy"], &path, "cy", &mut projection.diagnostics);
+            let geometry = ensure_drawing_geometry(projection);
+            geometry.extent = Some(DrawingExtentProjection { cx, cy });
+        }
+        (Some(WP_NAMESPACE), "docPr") => {
+            projection.metadata = Some(DrawingMetadataProjection {
+                doc_pr_id: attrs.get("id").cloned(),
+                name: attrs.get("name").cloned(),
+                description: attrs.get("descr").cloned(),
+                title: attrs.get("title").cloned(),
+                hidden: attrs.get("hidden").and_then(|value| parse_xml_bool(value)),
+                raw_attributes: attrs.clone(),
+                vml_title: None,
+            });
+        }
+        (Some(WP_NAMESPACE), "positionH") => {
+            axis_stack.push("h");
+            if let DrawingPlacement::Anchor { position_h, .. } = &mut projection.placement {
+                *position_h = Some(DrawingPositionProjection {
+                    relative_from: attrs.get("relativeFrom").cloned(),
+                    align: None,
+                    pos_offset: None,
+                });
+            }
+        }
+        (Some(WP_NAMESPACE), "positionV") => {
+            axis_stack.push("v");
+            if let DrawingPlacement::Anchor { position_v, .. } = &mut projection.placement {
+                *position_v = Some(DrawingPositionProjection {
+                    relative_from: attrs.get("relativeFrom").cloned(),
+                    align: None,
+                    pos_offset: None,
+                });
+            }
+        }
+        (Some(WP_NAMESPACE), "align") => {
+            if let Some(axis) = axis_stack.last().copied() {
+                *position_text_target = Some((axis, "align"));
+            }
+        }
+        (Some(WP_NAMESPACE), "posOffset") => {
+            if let Some(axis) = axis_stack.last().copied() {
+                *position_text_target = Some((axis, "offset"));
+            }
+        }
+        (
+            Some(WP_NAMESPACE),
+            "wrapNone" | "wrapSquare" | "wrapTight" | "wrapThrough" | "wrapTopAndBottom",
+        ) => {
+            if let DrawingPlacement::Anchor { wrap, .. } = &mut projection.placement {
+                *wrap = Some(DrawingWrapProjection {
+                    kind: name.local_name.clone(),
+                    dist_t: attrs.get("distT").cloned(),
+                    dist_b: attrs.get("distB").cloned(),
+                    dist_l: attrs.get("distL").cloned(),
+                    dist_r: attrs.get("distR").cloned(),
+                    raw_polygon_xml: None,
+                });
+            }
+        }
+        (Some(DRAWINGML_MAIN_NAMESPACE), "graphicData") => {
+            projection.graphic_data_uri = attrs.get("uri").cloned();
+            if projection.graphic_data_uri.as_deref() != Some(DRAWINGML_PICTURE_NAMESPACE) {
+                projection.kind = DrawingKind::UnsupportedGraphic;
+                projection.diagnostics.push(drawing_diag(
+                    "CVN_DRAWING_GRAPHIC_DATA_UNSUPPORTED",
+                    &projection.source_anchor.xml_path,
+                    format!(
+                        "graphicData uri `{}` is not projected as an image",
+                        projection
+                            .graphic_data_uri
+                            .as_deref()
+                            .unwrap_or("<missing>")
+                    ),
+                ));
+            }
+        }
+        (Some(DRAWINGML_MAIN_NAMESPACE), "blip") => {
+            if let Some(relationship_id) = attrs.get("r:embed").cloned() {
+                projection.targets.push(DrawingTarget {
+                    kind: DrawingTargetKind::EmbeddedPart,
+                    relationship_id: Some(relationship_id),
+                    relationship_type: None,
+                    target_mode: None,
+                    raw_target: None,
+                    resolved_part_path: None,
+                    resource: None,
+                    risk_class: None,
+                });
+            }
+            if let Some(relationship_id) = attrs.get("r:link").cloned() {
+                projection.targets.push(DrawingTarget {
+                    kind: DrawingTargetKind::Unresolved,
+                    relationship_id: Some(relationship_id),
+                    relationship_type: None,
+                    target_mode: None,
+                    raw_target: None,
+                    resolved_part_path: None,
+                    resource: None,
+                    risk_class: None,
+                });
+            }
+        }
+        (Some(DRAWINGML_MAIN_NAMESPACE), "srcRect") => {
+            let path = projection.source_anchor.xml_path.clone();
+            let left =
+                parse_i64_attr_or_diag(attrs, &["l"], &path, "l", &mut projection.diagnostics);
+            let top =
+                parse_i64_attr_or_diag(attrs, &["t"], &path, "t", &mut projection.diagnostics);
+            let right =
+                parse_i64_attr_or_diag(attrs, &["r"], &path, "r", &mut projection.diagnostics);
+            let bottom =
+                parse_i64_attr_or_diag(attrs, &["b"], &path, "b", &mut projection.diagnostics);
+            let geometry = ensure_drawing_geometry(projection);
+            geometry.crop = Some(DrawingCropProjection {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
+        (Some(DRAWINGML_MAIN_NAMESPACE), "xfrm") => {
+            let path = projection.source_anchor.xml_path.clone();
+            let rotation =
+                parse_i64_attr_or_diag(attrs, &["rot"], &path, "rot", &mut projection.diagnostics);
+            let transform = ensure_drawing_transform(projection);
+            transform.rotation = rotation;
+            transform.flip_h = attrs
+                .get("flipH")
+                .and_then(|value| parse_xml_bool(value))
+                .unwrap_or(false);
+            transform.flip_v = attrs
+                .get("flipV")
+                .and_then(|value| parse_xml_bool(value))
+                .unwrap_or(false);
+        }
+        (Some(DRAWINGML_MAIN_NAMESPACE), "off") => {
+            let path = projection.source_anchor.xml_path.clone();
+            let x = parse_i64_attr_or_diag(attrs, &["x"], &path, "x", &mut projection.diagnostics);
+            let y = parse_i64_attr_or_diag(attrs, &["y"], &path, "y", &mut projection.diagnostics);
+            let transform = ensure_drawing_transform(projection);
+            transform.offset = Some(DrawingOffsetProjection { x, y });
+            ensure_drawing_geometry(projection).offset = transform.offset.clone();
+        }
+        (Some(DRAWINGML_MAIN_NAMESPACE), "ext") => {
+            let path = projection.source_anchor.xml_path.clone();
+            let cx =
+                parse_i64_attr_or_diag(attrs, &["cx"], &path, "cx", &mut projection.diagnostics);
+            let cy =
+                parse_i64_attr_or_diag(attrs, &["cy"], &path, "cy", &mut projection.diagnostics);
+            let transform = ensure_drawing_transform(projection);
+            transform.extent = Some(DrawingExtentProjection { cx, cy });
+        }
+        (Some(VML_NAMESPACE), "shape") => {
+            projection.kind = DrawingKind::VmlImage;
+            projection.placement = DrawingPlacement::Vml;
+            projection.vml_shape_id = attrs.get("id").cloned();
+            projection.vml_shape_type = attrs.get("type").cloned();
+            projection.vml_style_raw = attrs.get("style").cloned();
+            if let Some(style) = projection.vml_style_raw.as_ref() {
+                projection.vml_style_properties = parse_vml_style(
+                    style,
+                    &projection.source_anchor.xml_path,
+                    &mut projection.diagnostics,
+                );
+            }
+        }
+        (Some(VML_NAMESPACE), "imagedata") => {
+            projection.kind = DrawingKind::VmlImage;
+            if let Some(relationship_id) = attrs
+                .get("r:id")
+                .cloned()
+                .or_else(|| attrs.get("id").cloned())
+            {
+                projection.targets.push(DrawingTarget {
+                    kind: DrawingTargetKind::EmbeddedPart,
+                    relationship_id: Some(relationship_id),
+                    relationship_type: None,
+                    target_mode: None,
+                    raw_target: None,
+                    resolved_part_path: None,
+                    resource: None,
+                    risk_class: None,
+                });
+            }
+            let metadata = projection
+                .metadata
+                .get_or_insert(DrawingMetadataProjection {
+                    doc_pr_id: None,
+                    name: None,
+                    description: None,
+                    title: None,
+                    hidden: None,
+                    raw_attributes: BTreeMap::new(),
+                    vml_title: None,
+                });
+            metadata.vml_title = attrs
+                .get("o:title")
+                .cloned()
+                .or_else(|| attrs.get("title").cloned());
+            metadata.raw_attributes.extend(attrs.clone());
+        }
+        (Some(OFFICE_NAMESPACE), "OLEObject" | "lock") | (Some(VML_NAMESPACE), "textbox") => {
+            projection.kind = DrawingKind::UnsupportedGraphic;
+            projection.diagnostics.push(drawing_diag(
+                "CVN_DRAWING_ACTIVE_OBJECT_BLOCKED",
+                &projection.source_anchor.xml_path,
+                format!(
+                    "active object `{}` is preserved but not executed",
+                    name.local_name
+                ),
+            ));
+        }
+        _ => {}
+    }
+}
+
 fn is_ds_event(
     event: &BytesStart<'_>,
     namespace_stack: &[BTreeMap<String, String>],
@@ -3709,6 +4217,66 @@ fn parse_semantic_document(
                             children: Vec::new(),
                         });
                     }
+                    "drawing" if name.is_wordprocessingml() => {
+                        let scope = namespace_context(&namespace_stack);
+                        let raw_xml = read_element_xml_with_scope(
+                            &event,
+                            &scope,
+                            &mut reader,
+                            source_part_path,
+                        )?;
+                        let drawing = parse_drawing_projection(
+                            document_id,
+                            source_part_path,
+                            &document_digest,
+                            anchor,
+                            &raw_xml,
+                            &mut id_set,
+                        )?;
+                        append_inline(
+                            &mut paragraph_stack,
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Drawing(drawing),
+                        );
+                        path_stack.pop();
+                        child_counts.pop();
+                        namespace_stack.pop();
+                        buffer.clear();
+                        continue;
+                    }
+                    "pict" if name.is_wordprocessingml() => {
+                        let scope = namespace_context(&namespace_stack);
+                        let raw_xml = read_element_xml_with_scope(
+                            &event,
+                            &scope,
+                            &mut reader,
+                            source_part_path,
+                        )?;
+                        let drawing = parse_drawing_projection(
+                            document_id,
+                            source_part_path,
+                            &document_digest,
+                            anchor,
+                            &raw_xml,
+                            &mut id_set,
+                        )?;
+                        append_inline(
+                            &mut paragraph_stack,
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Drawing(drawing),
+                        );
+                        path_stack.pop();
+                        child_counts.pop();
+                        namespace_stack.pop();
+                        buffer.clear();
+                        continue;
+                    }
                     "fldSimple" if name.is_wordprocessingml() => {
                         let id = semantic_id(
                             document_id,
@@ -4170,6 +4738,46 @@ fn parse_semantic_document(
                             _ => {}
                         }
                     }
+                    "drawing" if name.is_wordprocessingml() => {
+                        let scope = namespace_context(&namespace_stack);
+                        let raw_xml = empty_event_xml_with_scope(&event, &scope)?;
+                        let drawing = parse_drawing_projection(
+                            document_id,
+                            source_part_path,
+                            &document_digest,
+                            anchor,
+                            &raw_xml,
+                            &mut id_set,
+                        )?;
+                        append_inline(
+                            &mut paragraph_stack,
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Drawing(drawing),
+                        );
+                    }
+                    "pict" if name.is_wordprocessingml() => {
+                        let scope = namespace_context(&namespace_stack);
+                        let raw_xml = empty_event_xml_with_scope(&event, &scope)?;
+                        let drawing = parse_drawing_projection(
+                            document_id,
+                            source_part_path,
+                            &document_digest,
+                            anchor,
+                            &raw_xml,
+                            &mut id_set,
+                        )?;
+                        append_inline(
+                            &mut paragraph_stack,
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::Drawing(drawing),
+                        );
+                    }
                     "bookmarkStart" if name.is_wordprocessingml() => {
                         let bookmark_id = attr_named(&attrs, "id")
                             .cloned()
@@ -4479,6 +5087,7 @@ fn parse_semantic_document(
             numbering: None,
             stories: None,
             references: None,
+            drawings: None,
             unsupported_features,
         },
         track_changes,
@@ -5586,7 +6195,12 @@ fn end_numbering_element(
     }
 }
 
-fn resolve_semantic_references(semantic: &mut SemanticDocument, relationships: &[OpcRelationship]) {
+fn resolve_semantic_references(
+    semantic: &mut SemanticDocument,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+) {
     let styles_snapshot = semantic.styles.clone();
     let numbering_snapshot = semantic.numbering.clone();
     for block in &mut semantic.blocks {
@@ -5604,6 +6218,7 @@ fn resolve_semantic_references(semantic: &mut SemanticDocument, relationships: &
         resolve_story_registry(stories, &semantic.blocks, relationships);
     }
     resolve_document_references(semantic, relationships);
+    resolve_document_drawings(semantic, relationships, content_types, parts);
 }
 
 fn resolve_block_references(
@@ -5778,6 +6393,7 @@ fn resolve_run_story_references(run: &mut SemanticRun, relationships: &[OpcRelat
             | SemanticInline::Text(_)
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Drawing(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::TrackedChange { .. } => {}
@@ -5809,6 +6425,7 @@ fn resolve_mce_inline_references(
             SemanticInline::Text(_)
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Drawing(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -5960,6 +6577,353 @@ fn resolve_document_references(semantic: &mut SemanticDocument, relationships: &
         .diagnostics
         .sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
     semantic.references = Some(projection);
+}
+
+fn resolve_document_drawings(
+    semantic: &mut SemanticDocument,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+) {
+    let mut projection = DrawingRegistryProjection {
+        source_part: semantic.source_part.clone(),
+        drawings: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut doc_pr_ids = BTreeMap::<String, SourceAnchor>::new();
+    collect_drawings_from_blocks(
+        &mut semantic.blocks,
+        relationships,
+        content_types,
+        parts,
+        &mut projection,
+        &mut doc_pr_ids,
+    );
+    if let Some(stories) = semantic.stories.as_mut() {
+        for part in &mut stories.parts {
+            collect_drawings_from_blocks(
+                &mut part.blocks,
+                relationships,
+                content_types,
+                parts,
+                &mut projection,
+                &mut doc_pr_ids,
+            );
+            for note in &mut part.notes {
+                collect_drawings_from_blocks(
+                    &mut note.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    &mut projection,
+                    &mut doc_pr_ids,
+                );
+            }
+            for comment in &mut part.comments {
+                collect_drawings_from_blocks(
+                    &mut comment.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    &mut projection,
+                    &mut doc_pr_ids,
+                );
+            }
+        }
+    }
+    projection.drawings.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    projection
+        .diagnostics
+        .sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    semantic.drawings = Some(projection);
+}
+
+fn collect_drawings_from_blocks(
+    blocks: &mut [SemanticBlock],
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    projection: &mut DrawingRegistryProjection,
+    doc_pr_ids: &mut BTreeMap<String, SourceAnchor>,
+) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for run in &mut paragraph.runs {
+                    collect_drawings_from_inlines(
+                        &mut run.inlines,
+                        relationships,
+                        content_types,
+                        parts,
+                        projection,
+                        doc_pr_ids,
+                    );
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        collect_drawings_from_blocks(
+                            &mut cell.blocks,
+                            relationships,
+                            content_types,
+                            parts,
+                            projection,
+                            doc_pr_ids,
+                        );
+                    }
+                }
+            }
+            SemanticBlock::TrackedChange(change) => match &mut change.content {
+                TrackedContent::Inline { items } => collect_drawings_from_inlines(
+                    items,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                ),
+                TrackedContent::Block { blocks } => collect_drawings_from_blocks(
+                    blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                ),
+                TrackedContent::PropertyChange { .. } => {}
+            },
+            SemanticBlock::MceSelectedContent(content) => {
+                collect_drawings_from_blocks(
+                    &mut content.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                );
+                collect_drawings_from_inlines(
+                    &mut content.inlines,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                );
+            }
+        }
+    }
+}
+
+fn collect_drawings_from_inlines(
+    inlines: &mut [SemanticInline],
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    projection: &mut DrawingRegistryProjection,
+    doc_pr_ids: &mut BTreeMap<String, SourceAnchor>,
+) {
+    for inline in inlines {
+        match inline {
+            SemanticInline::Drawing(drawing) => {
+                resolve_drawing_targets(drawing, relationships, content_types, parts);
+                if let Some(metadata) = drawing
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.doc_pr_id.as_ref())
+                {
+                    if let Some(previous) =
+                        doc_pr_ids.insert(metadata.clone(), drawing.source_anchor.clone())
+                    {
+                        let message =
+                            format!("docPr id `{metadata}` is duplicated across drawings");
+                        projection.diagnostics.push(drawing_diag(
+                            "CVN_DRAWING_DOC_PR_DUPLICATE_ID",
+                            &drawing.source_anchor.xml_path,
+                            message.clone(),
+                        ));
+                        projection.diagnostics.push(drawing_diag(
+                            "CVN_DRAWING_DOC_PR_DUPLICATE_ID",
+                            &previous.xml_path,
+                            message,
+                        ));
+                    }
+                }
+                projection.diagnostics.extend(drawing.diagnostics.clone());
+                projection.drawings.push(drawing.clone());
+            }
+            SemanticInline::Hyperlink(hyperlink) => collect_drawings_from_inlines(
+                &mut hyperlink.children,
+                relationships,
+                content_types,
+                parts,
+                projection,
+                doc_pr_ids,
+            ),
+            SemanticInline::Field(field) => collect_drawings_from_inlines(
+                &mut field.result.children,
+                relationships,
+                content_types,
+                parts,
+                projection,
+                doc_pr_ids,
+            ),
+            SemanticInline::TrackedChange { change } => match &mut change.content {
+                TrackedContent::Inline { items } => collect_drawings_from_inlines(
+                    items,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                ),
+                TrackedContent::Block { blocks } => collect_drawings_from_blocks(
+                    blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                ),
+                TrackedContent::PropertyChange { .. } => {}
+            },
+            SemanticInline::MceSelectedContent(content) => {
+                collect_drawings_from_blocks(
+                    &mut content.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                );
+                collect_drawings_from_inlines(
+                    &mut content.inlines,
+                    relationships,
+                    content_types,
+                    parts,
+                    projection,
+                    doc_pr_ids,
+                );
+            }
+            SemanticInline::Text(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. }
+            | SemanticInline::FootnoteReference { .. }
+            | SemanticInline::EndnoteReference { .. }
+            | SemanticInline::CommentReference { .. }
+            | SemanticInline::CommentRangeStart { .. }
+            | SemanticInline::CommentRangeEnd { .. } => {}
+        }
+    }
+}
+
+fn resolve_drawing_targets(
+    drawing: &mut DrawingProjection,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+) {
+    for target in &mut drawing.targets {
+        let Some(relationship_id) = target.relationship_id.as_ref() else {
+            continue;
+        };
+        let Some(relationship) = relationships.iter().find(|relationship| {
+            relationship.source_part.as_deref()
+                == Some(drawing.source_anchor.source_part_path.as_str())
+                && relationship.relationship_id == *relationship_id
+        }) else {
+            drawing.diagnostics.push(drawing_diag(
+                "CVN_DRAWING_RELATIONSHIP_MISSING",
+                &drawing.source_anchor.xml_path,
+                format!("relationship `{relationship_id}` is not defined"),
+            ));
+            target.kind = DrawingTargetKind::Unresolved;
+            continue;
+        };
+
+        target.relationship_type = Some(relationship.relationship_type.clone());
+        target.target_mode = Some(relationship.target_mode);
+        target.raw_target = Some(relationship.target.clone());
+
+        if relationship.relationship_type != IMAGE_RELATIONSHIP_TYPE {
+            drawing.diagnostics.push(drawing_diag(
+                "CVN_DRAWING_RELATIONSHIP_TYPE_MISMATCH",
+                &drawing.source_anchor.xml_path,
+                format!(
+                    "relationship `{relationship_id}` has unexpected type `{}`",
+                    relationship.relationship_type
+                ),
+            ));
+        }
+
+        match relationship.target_mode {
+            TargetMode::External => {
+                target.kind = DrawingTargetKind::ExternalRelationship;
+                target.risk_class = classify_hyperlink_risk(&relationship.target);
+                drawing.diagnostics.push(drawing_diag(
+                    "CVN_DRAWING_EXTERNAL_TARGET_INERT",
+                    &drawing.source_anchor.xml_path,
+                    "external image target is preserved inertly",
+                ));
+            }
+            TargetMode::Internal => {
+                target.kind = DrawingTargetKind::EmbeddedPart;
+                target.resolved_part_path = resolve_internal_target_path(
+                    &drawing.source_anchor.source_part_path,
+                    &relationship.target,
+                );
+                let Some(part_path) = target.resolved_part_path.as_ref() else {
+                    drawing.diagnostics.push(drawing_diag(
+                        "CVN_DRAWING_MEDIA_PART_MISSING",
+                        &drawing.source_anchor.xml_path,
+                        format!(
+                            "target `{}` does not resolve to a valid OPC part",
+                            relationship.target
+                        ),
+                    ));
+                    target.kind = DrawingTargetKind::Unresolved;
+                    continue;
+                };
+                let Some(part) = parts.iter().find(|part| part.original_path == *part_path) else {
+                    drawing.diagnostics.push(drawing_diag(
+                        "CVN_DRAWING_MEDIA_PART_MISSING",
+                        &drawing.source_anchor.xml_path,
+                        format!("media part `{part_path}` is not present"),
+                    ));
+                    target.kind = DrawingTargetKind::Unresolved;
+                    continue;
+                };
+                let content_type = part
+                    .content_type
+                    .clone()
+                    .or_else(|| resolve_content_type(content_types, part_path));
+                if content_type.is_none() {
+                    drawing.diagnostics.push(drawing_diag(
+                        "CVN_DRAWING_CONTENT_TYPE_MISSING",
+                        &drawing.source_anchor.xml_path,
+                        format!("content type for `{part_path}` is not defined"),
+                    ));
+                }
+                target.resource = Some(ImageResourceProjection {
+                    part_path: Some(part.original_path.clone()),
+                    content_type,
+                    object_digest: Some(part.content_digest.clone()),
+                    length: Some(part.original_size),
+                });
+            }
+        }
+    }
 }
 
 fn collect_reference_phase_one(
@@ -6162,7 +7126,8 @@ fn collect_reference_inlines_phase_one(
             | SemanticInline::EndnoteReference { .. }
             | SemanticInline::CommentReference { .. }
             | SemanticInline::CommentRangeStart { .. }
-            | SemanticInline::CommentRangeEnd { .. } => {}
+            | SemanticInline::CommentRangeEnd { .. }
+            | SemanticInline::Drawing(_) => {}
         }
     }
 }
@@ -6329,6 +7294,7 @@ fn collect_reference_inlines_phase_two(
             }
             SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Drawing(_)
             | SemanticInline::Text(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
@@ -6857,6 +7823,7 @@ fn collect_track_change_story_references(
                     SemanticInline::Text(_)
                     | SemanticInline::BookmarkStart(_)
                     | SemanticInline::BookmarkEnd(_)
+                    | SemanticInline::Drawing(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
                     | SemanticInline::TrackedChange { .. } => {}
@@ -6939,6 +7906,7 @@ fn collect_run_story_references(run: &SemanticRun, references: &mut Vec<StoryRef
             SemanticInline::Text(_)
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Drawing(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. } => {}
             SemanticInline::TrackedChange { change } => {
@@ -7023,6 +7991,7 @@ fn collect_comment_ranges(
                             SemanticInline::Text(_)
                             | SemanticInline::BookmarkStart(_)
                             | SemanticInline::BookmarkEnd(_)
+                            | SemanticInline::Drawing(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. }
                             | SemanticInline::FootnoteReference { .. }
@@ -7095,6 +8064,7 @@ fn collect_track_change_comment_ranges(
                     SemanticInline::Text(_)
                     | SemanticInline::BookmarkStart(_)
                     | SemanticInline::BookmarkEnd(_)
+                    | SemanticInline::Drawing(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
                     | SemanticInline::FootnoteReference { .. }
@@ -7159,6 +8129,7 @@ fn collect_mce_inline_comment_ranges(
             SemanticInline::Text(_)
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Drawing(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -8637,6 +9608,38 @@ mod tests {
         path
     }
 
+    fn write_drawing_docx(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/><Relationship Id="rIdImgPng" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/><Relationship Id="rIdImgJpg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image2.jpg"/><Relationship Id="rIdImgExt" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://example.invalid/image?a=1&amp;b=2" TargetMode="External"/><Relationship Id="rIdImgMissingPart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/missing.png"/><Relationship Id="rIdWrongType" Type="hyperlink" Target="media/image1.png"/><Relationship Id="rIdHyper" Type="hyperlink" Target="https://example.invalid/link" TargetMode="External"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/header1.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeaderImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/footnotes.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFootImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br##"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><w:body><w:p><w:r><w:drawing><wp:inline><wp:extent cx="990000" cy="792000"/><wp:docPr id="100" name="InlineImage" descr="inline desc" title="inline title" hidden="0"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgPng"/><a:srcRect l="1000" t="2000" r="3000" b="4000"/></pic:blipFill><pic:spPr><a:xfrm rot="60000" flipH="1" flipV="0"><a:off x="111" y="222"/><a:ext cx="333" cy="444"/></a:xfrm></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:anchor simplePos="0" relativeHeight="251658240" behindDoc="0" locked="1" layoutInCell="1" allowOverlap="0" distT="10" distB="20" distL="30" distR="40"><wp:positionH relativeFrom="margin"><wp:posOffset>123</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:align>top</wp:align></wp:positionV><wp:wrapSquare distL="12" distR="13" distT="14" distB="15"/><wp:extent cx="1110000" cy="888000"/><wp:docPr id="101" name="AnchorImage" descr="anchor desc" title="anchor title" hidden="1"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgJpg"/></pic:blipFill><pic:spPr><a:xfrm rot="120000" flipH="0" flipV="1"><a:off x="333" y="444"/><a:ext cx="555" cy="666"/></a:xfrm></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="102" name="ExternalImage"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:link="rIdImgExt"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="103" name="EmbedAndLink"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgPng" r:link="rIdImgExt"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="104" name="MissingRelationship"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdMissing"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="105" name="MissingPart"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgMissingPart"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="106" name="WrongType"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdWrongType"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="107" name="UnsupportedGraphic"/><a:graphic><a:graphicData uri="urn:unsupported:graphic"><foo:shape xmlns:foo="urn:unsupported:graphic"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:pict><v:shape id="VML1" type="#_x0000_t75" style="position:absolute;left:10pt;top:20pt;width:30pt;height:40pt;rotation:90"><v:imagedata r:id="rIdImgPng" o:title="VML title"/></v:shape></w:pict></w:r></w:p><w:p><w:r><w:pict><v:shape id="VML2" type="#_x0000_t75" style="position:absolute;bogus"><v:imagedata r:id="rIdImgPng"/></v:shape></w:pict></w:r></w:p><w:p><w:r><w:pict><o:OLEObject ProgID="Package"/></w:pict></w:r></w:p><w:p><w:hyperlink r:id="rIdHyper"><w:r><w:drawing><wp:inline><wp:docPr id="108" name="HyperlinkDrawing"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgPng"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:hyperlink></w:p><w:p><w:r><w:fldSimple w:instr=" REF BookmarkOne "><w:r><w:drawing><wp:inline><wp:docPr id="109" name="FieldDrawing"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgPng"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="51" w:author="Alice"><w:r><w:drawing><wp:inline><wp:docPr id="110" name="TrackedDrawing"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgPng"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:drawing><wp:inline><wp:docPr id="111" name="MceDrawing"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImgPng"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"##);
+        add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:p><w:r><w:drawing><wp:inline><wp:docPr id="112" name="HeaderDrawing"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdHeaderImg"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:hdr>"#);
+        add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:drawing><wp:inline><wp:docPr id="113" name="FootnoteDrawing"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdFootImg"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:footnote></w:footnotes>"#);
+        add(
+            &mut zip,
+            options,
+            "word/media/image1.png",
+            b"not-a-real-png-but-stable",
+        );
+        add(
+            &mut zip,
+            options,
+            "word/media/image2.jpg",
+            b"not-a-real-jpeg-but-stable",
+        );
+        zip.finish().unwrap();
+        path
+    }
+
     fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         for block in &document.blocks {
@@ -9106,6 +10109,379 @@ mod tests {
         let _ = fs::remove_dir_all(&out2);
     }
 
+    #[test]
+    fn drawing_projection_is_deterministic_and_connected() {
+        let docx = write_drawing_docx("drawings");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(
+            first.document.semantic.drawings,
+            second.document.semantic.drawings
+        );
+        assert_eq!(
+            collect_drawing_semantic_ids(&first.document.semantic),
+            collect_drawing_semantic_ids(&second.document.semantic)
+        );
+
+        let registry = first.document.semantic.drawings.as_ref().unwrap();
+        assert_eq!(registry.source_part, "word/document.xml");
+        assert!(registry
+            .drawings
+            .iter()
+            .any(|drawing| drawing.kind == DrawingKind::DrawingmlInlineImage));
+        assert!(registry
+            .drawings
+            .iter()
+            .any(|drawing| drawing.kind == DrawingKind::DrawingmlAnchoredImage));
+        assert!(registry
+            .drawings
+            .iter()
+            .any(|drawing| drawing.kind == DrawingKind::VmlImage));
+        assert!(registry
+            .drawings
+            .iter()
+            .any(|drawing| drawing.kind == DrawingKind::UnsupportedGraphic));
+
+        let inline = registry
+            .drawings
+            .iter()
+            .find(|drawing| {
+                drawing
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.name.as_deref())
+                    == Some("InlineImage")
+            })
+            .unwrap();
+        let inline_metadata = inline.metadata.as_ref().unwrap();
+        let inline_geometry = inline.geometry.as_ref().unwrap();
+        let inline_transform = inline_geometry.transform.as_ref().unwrap();
+        let inline_target = inline
+            .targets
+            .iter()
+            .find(|target| target.relationship_id.as_deref() == Some("rIdImgPng"))
+            .unwrap();
+        let inline_resource = inline_target.resource.as_ref().unwrap();
+        assert_eq!(inline_metadata.doc_pr_id.as_deref(), Some("100"));
+        assert_eq!(inline_metadata.description.as_deref(), Some("inline desc"));
+        assert_eq!(inline_metadata.title.as_deref(), Some("inline title"));
+        assert_eq!(inline_metadata.hidden, Some(false));
+        assert_eq!(
+            inline_geometry.extent.as_ref().and_then(|extent| extent.cx),
+            Some(990000)
+        );
+        assert_eq!(
+            inline_geometry.extent.as_ref().and_then(|extent| extent.cy),
+            Some(792000)
+        );
+        assert_eq!(inline_transform.rotation, Some(60000));
+        assert!(inline_transform.flip_h);
+        assert!(!inline_transform.flip_v);
+        assert_eq!(
+            inline_transform.offset.as_ref().and_then(|offset| offset.x),
+            Some(111)
+        );
+        assert_eq!(
+            inline_transform.offset.as_ref().and_then(|offset| offset.y),
+            Some(222)
+        );
+        assert_eq!(
+            inline_transform
+                .extent
+                .as_ref()
+                .and_then(|extent| extent.cx),
+            Some(333)
+        );
+        assert_eq!(
+            inline_transform
+                .extent
+                .as_ref()
+                .and_then(|extent| extent.cy),
+            Some(444)
+        );
+        assert_eq!(
+            inline_geometry.crop.as_ref().and_then(|crop| crop.left),
+            Some(1000)
+        );
+        assert_eq!(
+            inline_geometry.crop.as_ref().and_then(|crop| crop.top),
+            Some(2000)
+        );
+        assert_eq!(
+            inline_geometry.crop.as_ref().and_then(|crop| crop.right),
+            Some(3000)
+        );
+        assert_eq!(
+            inline_geometry.crop.as_ref().and_then(|crop| crop.bottom),
+            Some(4000)
+        );
+        assert_eq!(inline_target.kind, DrawingTargetKind::EmbeddedPart);
+        assert_eq!(
+            inline_target.resolved_part_path.as_deref(),
+            Some("word/media/image1.png")
+        );
+        assert_eq!(
+            inline_resource.part_path.as_deref(),
+            Some("word/media/image1.png")
+        );
+        assert_eq!(inline_resource.content_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            inline_resource.length,
+            Some(b"not-a-real-png-but-stable".len() as u64)
+        );
+        assert!(inline_resource.object_digest.is_some());
+
+        let anchor = registry
+            .drawings
+            .iter()
+            .find(|drawing| {
+                drawing
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.name.as_deref())
+                    == Some("AnchorImage")
+            })
+            .unwrap();
+        let anchor_metadata = anchor.metadata.as_ref().unwrap();
+        let anchor_geometry = anchor.geometry.as_ref().unwrap();
+        let anchor_transform = anchor_geometry.transform.as_ref().unwrap();
+        assert_eq!(anchor.kind, DrawingKind::DrawingmlAnchoredImage);
+        assert_eq!(anchor_metadata.hidden, Some(true));
+        assert_eq!(anchor_transform.rotation, Some(120000));
+        assert!(!anchor_transform.flip_h);
+        assert!(anchor_transform.flip_v);
+        match &anchor.placement {
+            DrawingPlacement::Anchor {
+                simple_pos,
+                relative_height,
+                behind_doc,
+                locked,
+                layout_in_cell,
+                allow_overlap,
+                dist_t,
+                dist_b,
+                dist_l,
+                dist_r,
+                position_h,
+                position_v,
+                wrap,
+            } => {
+                assert_eq!(*simple_pos, Some(false));
+                assert_eq!(relative_height.as_deref(), Some("251658240"));
+                assert_eq!(*behind_doc, Some(false));
+                assert_eq!(*locked, Some(true));
+                assert_eq!(*layout_in_cell, Some(true));
+                assert_eq!(*allow_overlap, Some(false));
+                assert_eq!(dist_t.as_deref(), Some("10"));
+                assert_eq!(dist_b.as_deref(), Some("20"));
+                assert_eq!(dist_l.as_deref(), Some("30"));
+                assert_eq!(dist_r.as_deref(), Some("40"));
+                assert_eq!(
+                    position_h
+                        .as_ref()
+                        .and_then(|position| position.relative_from.as_deref()),
+                    Some("margin")
+                );
+                assert_eq!(
+                    position_h.as_ref().and_then(|position| position.pos_offset),
+                    Some(123)
+                );
+                assert_eq!(
+                    position_v
+                        .as_ref()
+                        .and_then(|position| position.relative_from.as_deref()),
+                    Some("paragraph")
+                );
+                assert_eq!(
+                    position_v
+                        .as_ref()
+                        .and_then(|position| position.align.as_deref()),
+                    Some("top")
+                );
+                assert_eq!(
+                    wrap.as_ref().map(|wrap| wrap.kind.as_str()),
+                    Some("wrapSquare")
+                );
+                assert_eq!(
+                    wrap.as_ref().and_then(|wrap| wrap.dist_l.as_deref()),
+                    Some("12")
+                );
+                assert_eq!(
+                    wrap.as_ref().and_then(|wrap| wrap.dist_r.as_deref()),
+                    Some("13")
+                );
+                assert_eq!(
+                    wrap.as_ref().and_then(|wrap| wrap.dist_t.as_deref()),
+                    Some("14")
+                );
+                assert_eq!(
+                    wrap.as_ref().and_then(|wrap| wrap.dist_b.as_deref()),
+                    Some("15")
+                );
+            }
+            other => panic!("expected anchor placement, got {other:?}"),
+        }
+
+        let external = registry
+            .drawings
+            .iter()
+            .find(|drawing| {
+                drawing
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.name.as_deref())
+                    == Some("ExternalImage")
+            })
+            .unwrap();
+        assert!(external.targets.iter().any(|target| {
+            target.kind == DrawingTargetKind::ExternalRelationship
+                && target.relationship_id.as_deref() == Some("rIdImgExt")
+                && target.raw_target.as_deref() == Some("https://example.invalid/image?a=1&b=2")
+                && target.risk_class.as_deref() == Some("ordinary_web")
+        }));
+
+        let embed_and_link = registry
+            .drawings
+            .iter()
+            .find(|drawing| {
+                drawing
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.name.as_deref())
+                    == Some("EmbedAndLink")
+            })
+            .unwrap();
+        assert_eq!(embed_and_link.targets.len(), 2);
+        assert!(embed_and_link
+            .targets
+            .iter()
+            .any(|target| target.relationship_id.as_deref() == Some("rIdImgPng")));
+        assert!(embed_and_link
+            .targets
+            .iter()
+            .any(|target| target.relationship_id.as_deref() == Some("rIdImgExt")));
+
+        let shared_digest = inline_resource.object_digest.as_deref().unwrap();
+        assert!(
+            registry
+                .drawings
+                .iter()
+                .flat_map(|drawing| drawing.targets.iter())
+                .filter_map(|target| target.resource.as_ref())
+                .filter(|resource| resource.object_digest.as_deref() == Some(shared_digest))
+                .count()
+                >= 5
+        );
+
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_RELATIONSHIP_MISSING"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_MEDIA_PART_MISSING"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_RELATIONSHIP_TYPE_MISMATCH"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_GRAPHIC_DATA_UNSUPPORTED"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_VML_STYLE_INVALID"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_ACTIVE_OBJECT_BLOCKED"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_EXTERNAL_TARGET_INERT"));
+
+        assert!(semantic_contains_drawing_wrapper(&first.document.semantic));
+        let main_drawings = collect_drawings_from_blocks_for_test(&first.document.semantic.blocks);
+        assert!(main_drawings.iter().any(|drawing| {
+            drawing
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.name.as_deref())
+                == Some("HyperlinkDrawing")
+        }));
+        assert!(main_drawings.iter().any(|drawing| {
+            drawing
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.name.as_deref())
+                == Some("FieldDrawing")
+        }));
+        assert!(main_drawings.iter().any(|drawing| {
+            drawing
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.name.as_deref())
+                == Some("TrackedDrawing")
+        }));
+        assert!(main_drawings.iter().any(|drawing| {
+            drawing
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.name.as_deref())
+                == Some("MceDrawing")
+        }));
+        assert!(
+            story_part_drawings(&first.document.semantic, StoryPartKind::HeaderDefault)
+                .iter()
+                .any(|drawing| {
+                    drawing
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.name.as_deref())
+                        == Some("HeaderDrawing")
+                })
+        );
+        assert!(
+            story_part_drawings(&first.document.semantic, StoryPartKind::Footnotes)
+                .iter()
+                .any(|drawing| {
+                    drawing
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.name.as_deref())
+                        == Some("FootnoteDrawing")
+                })
+        );
+
+        let out1 =
+            std::env::temp_dir().join(format!("tuff-cvn-drawings-out-1-{}", std::process::id()));
+        let out2 =
+            std::env::temp_dir().join(format!("tuff-cvn-drawings-out-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+        cvn_package::write_package(&out1, &first).unwrap();
+        cvn_package::write_package(&out2, &second).unwrap();
+        assert_eq!(
+            cvn_package::read_cvn_json_bytes(&out1).unwrap(),
+            cvn_package::read_cvn_json_bytes(&out2).unwrap()
+        );
+        assert_eq!(
+            cvn_package::verify_package_integrity(&out1)
+                .unwrap()
+                .root_actual,
+            cvn_package::verify_package_integrity(&out2)
+                .unwrap()
+                .root_actual
+        );
+
+        let _ = fs::remove_file(&docx);
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+    }
+
     fn collect_block_ids(block: &SemanticBlock, ids: &mut Vec<String>) {
         match block {
             SemanticBlock::Paragraph(paragraph) => {
@@ -9207,6 +10583,9 @@ mod tests {
                     ids.push(field.id.as_str().to_owned());
                     collect_reference_ids_from_inlines(&field.result.children, ids);
                 }
+                SemanticInline::Drawing(drawing) => {
+                    ids.push(drawing.id.as_str().to_owned());
+                }
                 SemanticInline::TrackedChange { change } => match &change.content {
                     TrackedContent::Inline { items } => {
                         collect_reference_ids_from_inlines(items, ids);
@@ -9270,6 +10649,213 @@ mod tests {
                 })
             })
         })
+    }
+
+    fn semantic_contains_drawing_wrapper(document: &SemanticDocument) -> bool {
+        contains_inline_wrapper(&document.blocks, |inline| {
+            matches!(inline, SemanticInline::Drawing(_))
+        }) || document.stories.as_ref().is_some_and(|stories| {
+            stories.parts.iter().any(|part| {
+                contains_inline_wrapper(&part.blocks, |inline| {
+                    matches!(inline, SemanticInline::Drawing(_))
+                }) || part.notes.iter().any(|note| {
+                    contains_inline_wrapper(&note.blocks, |inline| {
+                        matches!(inline, SemanticInline::Drawing(_))
+                    })
+                }) || part.comments.iter().any(|comment| {
+                    contains_inline_wrapper(&comment.blocks, |inline| {
+                        matches!(inline, SemanticInline::Drawing(_))
+                    })
+                })
+            })
+        })
+    }
+
+    fn collect_drawing_semantic_ids(document: &SemanticDocument) -> Vec<String> {
+        let mut ids = Vec::new();
+        collect_drawing_ids_from_blocks(&document.blocks, &mut ids);
+        if let Some(stories) = document.stories.as_ref() {
+            for part in &stories.parts {
+                collect_drawing_ids_from_blocks(&part.blocks, &mut ids);
+                for note in &part.notes {
+                    collect_drawing_ids_from_blocks(&note.blocks, &mut ids);
+                }
+                for comment in &part.comments {
+                    collect_drawing_ids_from_blocks(&comment.blocks, &mut ids);
+                }
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    fn collect_drawing_ids_from_blocks(blocks: &[SemanticBlock], ids: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                SemanticBlock::Paragraph(paragraph) => {
+                    for run in &paragraph.runs {
+                        collect_drawing_ids_from_inlines(&run.inlines, ids);
+                    }
+                }
+                SemanticBlock::Table(table) => {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            collect_drawing_ids_from_blocks(&cell.blocks, ids);
+                        }
+                    }
+                }
+                SemanticBlock::TrackedChange(change) => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_drawing_ids_from_inlines(items, ids);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        collect_drawing_ids_from_blocks(blocks, ids);
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticBlock::MceSelectedContent(content) => {
+                    collect_drawing_ids_from_blocks(&content.blocks, ids);
+                    collect_drawing_ids_from_inlines(&content.inlines, ids);
+                }
+            }
+        }
+    }
+
+    fn collect_drawing_ids_from_inlines(inlines: &[SemanticInline], ids: &mut Vec<String>) {
+        for inline in inlines {
+            match inline {
+                SemanticInline::Drawing(drawing) => {
+                    ids.push(drawing.id.as_str().to_owned());
+                }
+                SemanticInline::Hyperlink(hyperlink) => {
+                    collect_drawing_ids_from_inlines(&hyperlink.children, ids);
+                }
+                SemanticInline::Field(field) => {
+                    collect_drawing_ids_from_inlines(&field.result.children, ids);
+                }
+                SemanticInline::TrackedChange { change } => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_drawing_ids_from_inlines(items, ids);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        collect_drawing_ids_from_blocks(blocks, ids);
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticInline::MceSelectedContent(content) => {
+                    collect_drawing_ids_from_blocks(&content.blocks, ids);
+                    collect_drawing_ids_from_inlines(&content.inlines, ids);
+                }
+                SemanticInline::BookmarkStart(_)
+                | SemanticInline::BookmarkEnd(_)
+                | SemanticInline::Text(_)
+                | SemanticInline::Tab
+                | SemanticInline::LineBreak { .. }
+                | SemanticInline::FootnoteReference { .. }
+                | SemanticInline::EndnoteReference { .. }
+                | SemanticInline::CommentReference { .. }
+                | SemanticInline::CommentRangeStart { .. }
+                | SemanticInline::CommentRangeEnd { .. } => {}
+            }
+        }
+    }
+
+    fn story_part_drawings<'a>(
+        document: &'a SemanticDocument,
+        kind: StoryPartKind,
+    ) -> Vec<&'a DrawingProjection> {
+        let mut drawings = Vec::new();
+        if let Some(stories) = document.stories.as_ref() {
+            for part in &stories.parts {
+                if part.kind != kind {
+                    continue;
+                }
+                drawings.extend(collect_drawings_from_blocks_for_test(&part.blocks));
+                for note in &part.notes {
+                    drawings.extend(collect_drawings_from_blocks_for_test(&note.blocks));
+                }
+                for comment in &part.comments {
+                    drawings.extend(collect_drawings_from_blocks_for_test(&comment.blocks));
+                }
+            }
+        }
+        drawings
+    }
+
+    fn collect_drawings_from_blocks_for_test<'a>(
+        blocks: &'a [SemanticBlock],
+    ) -> Vec<&'a DrawingProjection> {
+        let mut drawings = Vec::new();
+        for block in blocks {
+            match block {
+                SemanticBlock::Paragraph(paragraph) => {
+                    for run in &paragraph.runs {
+                        collect_drawings_from_inlines_for_test(&run.inlines, &mut drawings);
+                    }
+                }
+                SemanticBlock::Table(table) => {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            drawings.extend(collect_drawings_from_blocks_for_test(&cell.blocks));
+                        }
+                    }
+                }
+                SemanticBlock::TrackedChange(change) => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_drawings_from_inlines_for_test(items, &mut drawings);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        drawings.extend(collect_drawings_from_blocks_for_test(blocks));
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticBlock::MceSelectedContent(content) => {
+                    drawings.extend(collect_drawings_from_blocks_for_test(&content.blocks));
+                    collect_drawings_from_inlines_for_test(&content.inlines, &mut drawings);
+                }
+            }
+        }
+        drawings
+    }
+
+    fn collect_drawings_from_inlines_for_test<'a>(
+        inlines: &'a [SemanticInline],
+        drawings: &mut Vec<&'a DrawingProjection>,
+    ) {
+        for inline in inlines {
+            match inline {
+                SemanticInline::Drawing(drawing) => drawings.push(drawing),
+                SemanticInline::Hyperlink(hyperlink) => {
+                    collect_drawings_from_inlines_for_test(&hyperlink.children, drawings);
+                }
+                SemanticInline::Field(field) => {
+                    collect_drawings_from_inlines_for_test(&field.result.children, drawings);
+                }
+                SemanticInline::TrackedChange { change } => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_drawings_from_inlines_for_test(items, drawings);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        drawings.extend(collect_drawings_from_blocks_for_test(blocks));
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticInline::MceSelectedContent(content) => {
+                    drawings.extend(collect_drawings_from_blocks_for_test(&content.blocks));
+                    collect_drawings_from_inlines_for_test(&content.inlines, drawings);
+                }
+                SemanticInline::BookmarkStart(_)
+                | SemanticInline::BookmarkEnd(_)
+                | SemanticInline::Text(_)
+                | SemanticInline::Tab
+                | SemanticInline::LineBreak { .. }
+                | SemanticInline::FootnoteReference { .. }
+                | SemanticInline::EndnoteReference { .. }
+                | SemanticInline::CommentReference { .. }
+                | SemanticInline::CommentRangeStart { .. }
+                | SemanticInline::CommentRangeEnd { .. } => {}
+            }
+        }
     }
 
     fn contains_inline_wrapper(
@@ -9338,6 +10924,7 @@ mod tests {
                         return true;
                     }
                 }
+                SemanticInline::Drawing(_) => {}
                 SemanticInline::TrackedChange { change } => match &change.content {
                     TrackedContent::Inline { items } => {
                         if contains_inline_wrapper_in_inlines(items, predicate) {
@@ -9452,6 +11039,7 @@ mod tests {
                     collect_inline_text(child, text);
                 }
             }
+            SemanticInline::Drawing(_) => {}
             SemanticInline::TrackedChange { change } => {
                 if let TrackedContent::Inline { items } = &change.content {
                     for inline in items {
@@ -9577,6 +11165,7 @@ mod tests {
                 SemanticInline::Field(field) => {
                     collect_mce_inline_wrappers_from_inlines(&field.result.children, wrappers);
                 }
+                SemanticInline::Drawing(_) => {}
                 SemanticInline::Text(_)
                 | SemanticInline::BookmarkStart(_)
                 | SemanticInline::BookmarkEnd(_)

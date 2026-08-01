@@ -442,6 +442,8 @@ pub struct SemanticDocument {
     pub stories: Option<StoryRegistryProjection>,
     #[serde(default)]
     pub references: Option<DocumentReferencesProjection>,
+    #[serde(default)]
+    pub drawings: Option<DrawingRegistryProjection>,
     pub unsupported_features: Vec<UnsupportedSemanticFeature>,
 }
 
@@ -455,6 +457,167 @@ pub struct DocumentReferencesProjection {
     pub fields: Vec<FieldProjection>,
     pub cross_references: Vec<CrossReferenceProjection>,
     pub diagnostics: Vec<DocumentReferenceDiagnostic>,
+}
+
+/// Read-only projection of DOCX DrawingML/VML image references.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingRegistryProjection {
+    pub source_part: String,
+    pub drawings: Vec<DrawingProjection>,
+    pub diagnostics: Vec<DrawingResolutionDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingProjection {
+    pub id: SemanticNodeId,
+    pub source_anchor: SourceAnchor,
+    #[serde(rename = "drawing_kind")]
+    pub kind: DrawingKind,
+    pub placement: DrawingPlacement,
+    pub graphic_data_uri: Option<String>,
+    pub metadata: Option<DrawingMetadataProjection>,
+    pub geometry: Option<DrawingGeometryProjection>,
+    pub targets: Vec<DrawingTarget>,
+    pub vml_shape_id: Option<String>,
+    pub vml_shape_type: Option<String>,
+    pub vml_style_raw: Option<String>,
+    #[serde(default)]
+    pub vml_style_properties: BTreeMap<String, String>,
+    #[serde(default)]
+    pub diagnostics: Vec<DrawingResolutionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrawingKind {
+    DrawingmlInlineImage,
+    DrawingmlAnchoredImage,
+    VmlImage,
+    UnsupportedGraphic,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DrawingPlacement {
+    Inline,
+    Anchor {
+        simple_pos: Option<bool>,
+        relative_height: Option<String>,
+        behind_doc: Option<bool>,
+        locked: Option<bool>,
+        layout_in_cell: Option<bool>,
+        allow_overlap: Option<bool>,
+        dist_t: Option<String>,
+        dist_b: Option<String>,
+        dist_l: Option<String>,
+        dist_r: Option<String>,
+        position_h: Option<DrawingPositionProjection>,
+        position_v: Option<DrawingPositionProjection>,
+        wrap: Option<DrawingWrapProjection>,
+    },
+    Vml,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingTarget {
+    pub kind: DrawingTargetKind,
+    pub relationship_id: Option<String>,
+    pub relationship_type: Option<String>,
+    pub target_mode: Option<TargetMode>,
+    pub raw_target: Option<String>,
+    pub resolved_part_path: Option<String>,
+    pub resource: Option<ImageResourceProjection>,
+    pub risk_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrawingTargetKind {
+    EmbeddedPart,
+    ExternalRelationship,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingGeometryProjection {
+    pub extent: Option<DrawingExtentProjection>,
+    pub offset: Option<DrawingOffsetProjection>,
+    pub transform: Option<DrawingTransformProjection>,
+    pub crop: Option<DrawingCropProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingExtentProjection {
+    pub cx: Option<i64>,
+    pub cy: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingOffsetProjection {
+    pub x: Option<i64>,
+    pub y: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingTransformProjection {
+    pub rotation: Option<i64>,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub offset: Option<DrawingOffsetProjection>,
+    pub extent: Option<DrawingExtentProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingCropProjection {
+    pub left: Option<i64>,
+    pub top: Option<i64>,
+    pub right: Option<i64>,
+    pub bottom: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingWrapProjection {
+    pub kind: String,
+    pub dist_t: Option<String>,
+    pub dist_b: Option<String>,
+    pub dist_l: Option<String>,
+    pub dist_r: Option<String>,
+    pub raw_polygon_xml: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingPositionProjection {
+    pub relative_from: Option<String>,
+    pub align: Option<String>,
+    pub pos_offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingMetadataProjection {
+    pub doc_pr_id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub title: Option<String>,
+    pub hidden: Option<bool>,
+    pub raw_attributes: BTreeMap<String, String>,
+    pub vml_title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageResourceProjection {
+    pub part_path: Option<String>,
+    pub content_type: Option<String>,
+    pub object_digest: Option<String>,
+    pub length: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawingResolutionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1017,6 +1180,7 @@ pub enum SemanticInline {
     BookmarkStart(BookmarkProjection),
     BookmarkEnd(BookmarkProjection),
     Field(FieldProjection),
+    Drawing(DrawingProjection),
     Tab,
     LineBreak {
         break_kind: String,
@@ -1402,6 +1566,7 @@ pub enum IntegrityNodeKind {
     MceProjection,
     OpcSignatureProjection,
     DocumentReferencesProjection,
+    DrawingImageProjection,
     Objects,
 }
 
@@ -1421,6 +1586,7 @@ impl IntegrityNodeKind {
             Self::MceProjection => "mce_projection",
             Self::OpcSignatureProjection => "opc_signature_projection",
             Self::DocumentReferencesProjection => "document_references_projection",
+            Self::DrawingImageProjection => "drawing_image_projection",
             Self::Objects => "objects",
         }
     }

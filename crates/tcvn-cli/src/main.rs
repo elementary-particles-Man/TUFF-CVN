@@ -123,7 +123,7 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
 fn inspect_command(args: &[String]) -> Result<(), CliError> {
     if args.len() < 2 {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references]".to_owned(),
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings]".to_owned(),
         ));
     }
     let flags = &args[1..];
@@ -138,10 +138,11 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
                 | "--mce"
                 | "--signatures"
                 | "--references"
+                | "--drawings"
         )
     }) {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references]"
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings]"
                 .to_owned(),
         ));
     }
@@ -180,6 +181,10 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
             "--references" => println!(
                 "{}",
                 serde_json::to_string_pretty(&cvn_json.payload.semantic.references)?
+            ),
+            "--drawings" => println!(
+                "{}",
+                serde_json::to_string_pretty(&cvn_json.payload.semantic.drawings)?
             ),
             _ => unreachable!("validated inspect flag"),
         }
@@ -338,7 +343,7 @@ Commands:
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
-  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references]
+  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings]
       Print read-only projections from cvn.json.
 
   tcvn diff <left.cvn> <right.cvn>
