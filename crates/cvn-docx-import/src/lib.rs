@@ -8,13 +8,17 @@ use std::path::Path;
 use base64::Engine;
 use cvn_core::{
     AbstractNumberingProjection, BookmarkBoundaryKind, BookmarkProjection, BookmarkRangeProjection,
+    ChartDataReferenceProjection, ChartProjection, ChartSeriesProjection, ChartTitleProjection,
     CommentProjection, CommentRangeProjection, ContentTypeDefault, ContentTypeOverride,
-    ContentTypesProjection, CrossReferenceProjection, CvnDocument, DocumentId,
-    DocumentReferenceDiagnostic, DocumentReferencesProjection, DrawingCropProjection,
-    DrawingExtentProjection, DrawingGeometryProjection, DrawingKind, DrawingMetadataProjection,
-    DrawingOffsetProjection, DrawingPlacement, DrawingPositionProjection, DrawingProjection,
-    DrawingRegistryProjection, DrawingResolutionDiagnostic, DrawingTarget, DrawingTargetKind,
-    DrawingTransformProjection, DrawingWrapProjection, FieldCharacterKind,
+    ContentTypesProjection, CrossReferenceProjection, CvnDocument, DiagramPartReferenceProjection,
+    DiagramProjection, DocumentId, DocumentReferenceDiagnostic, DocumentReferencesProjection,
+    DrawingCropProjection, DrawingExtentProjection, DrawingGeometryProjection, DrawingKind,
+    DrawingMetadataProjection, DrawingOffsetProjection, DrawingPlacement,
+    DrawingPositionProjection, DrawingProjection, DrawingRegistryProjection,
+    DrawingResolutionDiagnostic, DrawingTarget, DrawingTargetKind, DrawingTransformProjection,
+    DrawingWrapProjection, EmbeddedObjectTarget, EmbeddedObjectTargetKind,
+    EmbeddedResourceProjection, EmbeddedVisualObjectDiagnostic, EmbeddedVisualObjectKind,
+    EmbeddedVisualObjectProjection, EmbeddedVisualObjectsProjection, FieldCharacterKind,
     FieldCharacterKindProjection, FieldInstructionProjection, FieldKind, FieldProjection,
     FieldResultProjection, HeaderFooterReferenceProjection, HyperlinkProjection, HyperlinkTarget,
     HyperlinkTargetKind, ImageResourceProjection, MceAlternateContentProjection, MceBranchKind,
@@ -22,21 +26,21 @@ use cvn_core::{
     MceProjection, MceQualifiedName, MceResolutionDiagnostic, MceSelectedContent, MceSelection,
     NoteProjection, NumberFormatProjection, NumberingInstanceProjection, NumberingLevelProjection,
     NumberingReference, NumberingRegistryProjection, NumberingResolutionDiagnostic,
-    OfficeSignatureInfoProjection, OpaqueEntry, OpcPackageProjection, OpcPart, OpcRelationship,
-    OpcSignatureOriginProjection, OpcSignatureProjection, OpcSignatureRegistryProjection,
-    ParagraphPropertiesProjection, PreservationMode, ResolvedStyleProjection,
-    RsaKeyValueProjection, RunPropertiesProjection, SemanticBlock, SemanticDocument,
-    SemanticInline, SemanticNodeId, SemanticParagraph, SemanticRun, SemanticTable,
-    SemanticTableCell, SemanticTableRow, SemanticText, SignatureDiagnostic,
-    SignatureKeyInfoProjection, SignatureKeySource, SignatureReferenceProjection,
-    SignatureReferenceVerification, SignatureTransformProjection, SignatureVerificationReport,
-    SignatureVerificationStatus, SignedInfoProjection, SourceAnchor, SourceDescriptor,
-    SourceFormat, StoryPartKind, StoryPartProjection, StoryReference, StoryReferenceKind,
-    StoryRegistryProjection, StoryResolutionDiagnostic, StyleDefinitionProjection, StyleReference,
-    StyleRegistryProjection, StyleResolutionDiagnostic, StyleType, TargetMode,
-    TrackChangesProjection, TrackedChange, TrackedChangeId, TrackedChangeKind,
-    TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling, UnsupportedSemanticFeature,
-    X509CertificateProjection, ZipEntryMetadata,
+    OfficeSignatureInfoProjection, OleMetadataProjection, OleObjectProjection, OpaqueEntry,
+    OpcPackageProjection, OpcPart, OpcRelationship, OpcSignatureOriginProjection,
+    OpcSignatureProjection, OpcSignatureRegistryProjection, ParagraphPropertiesProjection,
+    PreservationMode, ResolvedStyleProjection, RsaKeyValueProjection, RunPropertiesProjection,
+    SemanticBlock, SemanticDocument, SemanticInline, SemanticNodeId, SemanticParagraph,
+    SemanticRun, SemanticTable, SemanticTableCell, SemanticTableRow, SemanticText,
+    SignatureDiagnostic, SignatureKeyInfoProjection, SignatureKeySource,
+    SignatureReferenceProjection, SignatureReferenceVerification, SignatureTransformProjection,
+    SignatureVerificationReport, SignatureVerificationStatus, SignedInfoProjection, SourceAnchor,
+    SourceDescriptor, SourceFormat, StoryPartKind, StoryPartProjection, StoryReference,
+    StoryReferenceKind, StoryRegistryProjection, StoryResolutionDiagnostic,
+    StyleDefinitionProjection, StyleReference, StyleRegistryProjection, StyleResolutionDiagnostic,
+    StyleType, TargetMode, TrackChangesProjection, TrackedChange, TrackedChangeId,
+    TrackedChangeKind, TrackedChangeMetadata, TrackedContent, UnsupportedFeatureHandling,
+    UnsupportedSemanticFeature, X509CertificateProjection, ZipEntryMetadata,
 };
 use cvn_package::{sha256_hex, write_package, CvnPackage, PackageObject};
 use quick_xml::events::{BytesStart, Event};
@@ -119,10 +123,29 @@ const WP_NAMESPACE: &str = "http://schemas.openxmlformats.org/drawingml/2006/wor
 const DRAWINGML_MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const DRAWINGML_PICTURE_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/drawingml/2006/picture";
+const DRAWINGML_CHART_NAMESPACE: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+const DRAWINGML_DIAGRAM_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/drawingml/2006/diagram";
 const VML_NAMESPACE: &str = "urn:schemas-microsoft-com:vml";
 const OFFICE_NAMESPACE: &str = "urn:schemas-microsoft-com:office:office";
 const IMAGE_RELATIONSHIP_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+const CHART_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+const OLE_OBJECT_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject";
+const PACKAGE_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package";
+const CONTROL_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/control";
+const DIAGRAM_DATA_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData";
+const DIAGRAM_LAYOUT_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout";
+const DIAGRAM_STYLE_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle";
+const DIAGRAM_COLORS_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors";
 
 fn mce_capabilities() -> MceCapabilities {
     MceCapabilities {
@@ -364,6 +387,7 @@ pub fn import_docx_with_limits(
         &document.opc.relationships,
         &document.opc.content_types,
         &document.opc.parts,
+        &objects_by_digest,
     );
 
     let objects = objects_by_digest
@@ -949,6 +973,7 @@ fn contains_story_references(blocks: &[SemanticBlock]) -> bool {
                             | SemanticInline::BookmarkStart(_)
                             | SemanticInline::BookmarkEnd(_)
                             | SemanticInline::Drawing(_)
+                            | SemanticInline::EmbeddedVisualObject(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. } => {}
                         }
@@ -1001,6 +1026,7 @@ fn mce_inlines_contain_story_references(inlines: &[SemanticInline]) -> bool {
         | SemanticInline::BookmarkStart(_)
         | SemanticInline::BookmarkEnd(_)
         | SemanticInline::Drawing(_)
+        | SemanticInline::EmbeddedVisualObject(_)
         | SemanticInline::Tab
         | SemanticInline::LineBreak { .. } => false,
     })
@@ -1065,7 +1091,7 @@ fn is_reserved_note_id(note_id: &str) -> bool {
 }
 
 fn resolve_internal_target_path(source_part: &str, target: &str) -> Option<String> {
-    if target.starts_with('/') || target.starts_with('\\') || target.contains("..") {
+    if target.starts_with('/') || target.starts_with('\\') {
         return None;
     }
     let parent = Path::new(source_part).parent()?;
@@ -1076,6 +1102,9 @@ fn resolve_internal_target_path(source_part: &str, target: &str) -> Option<Strin
         match component {
             Component::Normal(part) => normalized.push(part.to_string_lossy().into_owned()),
             Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop()?;
+            }
             _ => return None,
         }
     }
@@ -2761,6 +2790,294 @@ fn parse_i64_attr_or_diag(
     }
 }
 
+fn append_visual_inline(
+    document_id: &DocumentId,
+    source_part_path: &str,
+    document_digest: &str,
+    anchor: SourceAnchor,
+    raw_xml: &str,
+    id_set: &mut BTreeSet<String>,
+    paragraph_stack: &mut [ParagraphBuilder],
+    run_stack: &mut [RunBuilder],
+    active_change: &mut Option<TrackedChangeBuilder>,
+    hyperlink_stack: &mut [HyperlinkBuilder],
+    field_stack: &mut [FieldBuilder],
+) -> Result<(), DocxImportError> {
+    if let Some(object) = parse_embedded_visual_object_projection(
+        document_id,
+        source_part_path,
+        document_digest,
+        anchor.clone(),
+        raw_xml,
+        id_set,
+    )? {
+        append_inline(
+            paragraph_stack,
+            run_stack,
+            active_change,
+            hyperlink_stack,
+            field_stack,
+            SemanticInline::EmbeddedVisualObject(object),
+        );
+        return Ok(());
+    }
+
+    let drawing = parse_drawing_projection(
+        document_id,
+        source_part_path,
+        document_digest,
+        anchor,
+        raw_xml,
+        id_set,
+    )?;
+    append_inline(
+        paragraph_stack,
+        run_stack,
+        active_change,
+        hyperlink_stack,
+        field_stack,
+        SemanticInline::Drawing(drawing),
+    );
+    Ok(())
+}
+
+fn parse_embedded_visual_object_projection(
+    document_id: &DocumentId,
+    source_part_path: &str,
+    document_digest: &str,
+    anchor: SourceAnchor,
+    raw_xml: &str,
+    id_set: &mut BTreeSet<String>,
+) -> Result<Option<EmbeddedVisualObjectProjection>, DocxImportError> {
+    let mut reader = Reader::from_reader(Cursor::new(raw_xml.as_bytes()));
+    let mut buffer = Vec::new();
+    let mut namespace_stack: Vec<BTreeMap<String, String>> = Vec::new();
+    let id = semantic_id(
+        document_id,
+        source_part_path,
+        "embedded-visual-object",
+        None,
+        &anchor.xml_path,
+        document_digest,
+        id_set,
+    )?;
+    let mut projection = EmbeddedVisualObjectProjection {
+        id,
+        source_anchor: anchor,
+        kind: EmbeddedVisualObjectKind::Unresolved,
+        graphic_data_uri: None,
+        chart: None,
+        diagram: None,
+        ole: None,
+        package_resource: None,
+        targets: Vec::new(),
+        preview_image_relationship_id: None,
+        preview_image: None,
+        risk_class: None,
+        diagnostics: Vec::new(),
+    };
+    let mut saw_object = false;
+
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) | Event::Empty(event) => {
+                namespace_stack.push(namespace_declarations(&event)?);
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event)?;
+                match name.local_name.as_str() {
+                    "graphicData" => {
+                        projection.graphic_data_uri = attrs.get("uri").cloned();
+                        match projection.graphic_data_uri.as_deref() {
+                            Some(DRAWINGML_CHART_NAMESPACE) => {
+                                projection.kind = EmbeddedVisualObjectKind::Chart;
+                                saw_object = true;
+                            }
+                            Some(DRAWINGML_DIAGRAM_NAMESPACE) => {
+                                projection.kind = EmbeddedVisualObjectKind::SmartartDiagram;
+                                saw_object = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    "chart" => {
+                        if projection.kind == EmbeddedVisualObjectKind::Chart {
+                            saw_object = true;
+                            if let Some(relationship_id) = attrs
+                                .get("r:id")
+                                .cloned()
+                                .or_else(|| attrs.get("id").cloned())
+                            {
+                                projection.targets.push(EmbeddedObjectTarget {
+                                    kind: EmbeddedObjectTargetKind::InternalPart,
+                                    role: Some("chart_part".to_owned()),
+                                    relationship_id: Some(relationship_id),
+                                    relationship_type: None,
+                                    target_mode: None,
+                                    raw_target: None,
+                                    resolved_part_path: None,
+                                    resource: None,
+                                    risk_class: None,
+                                });
+                            }
+                        }
+                    }
+                    "relIds" => {
+                        projection.kind = EmbeddedVisualObjectKind::SmartartDiagram;
+                        saw_object = true;
+                        for (attribute_name, role) in [
+                            ("r:dm", "diagram_data"),
+                            ("r:lo", "diagram_layout"),
+                            ("r:qs", "diagram_style"),
+                            ("r:cs", "diagram_colors"),
+                        ] {
+                            if let Some(relationship_id) =
+                                attrs.get(attribute_name).cloned().or_else(|| {
+                                    attribute_name
+                                        .split_once(':')
+                                        .and_then(|(_, local)| attrs.get(local).cloned())
+                                })
+                            {
+                                projection.targets.push(EmbeddedObjectTarget {
+                                    kind: EmbeddedObjectTargetKind::InternalPart,
+                                    role: Some(role.to_owned()),
+                                    relationship_id: Some(relationship_id),
+                                    relationship_type: None,
+                                    target_mode: None,
+                                    raw_target: None,
+                                    resolved_part_path: None,
+                                    resource: None,
+                                    risk_class: None,
+                                });
+                            }
+                        }
+                    }
+                    "OLEObject" => {
+                        saw_object = true;
+                        let metadata = OleMetadataProjection {
+                            object_type: attrs.get("Type").cloned(),
+                            prog_id: attrs.get("ProgID").cloned(),
+                            shape_id: attrs
+                                .get("ShapeID")
+                                .cloned()
+                                .or_else(|| attrs.get("ShapeID").cloned()),
+                            draw_aspect: attrs.get("DrawAspect").cloned(),
+                            object_id: attrs.get("ObjectID").cloned(),
+                            update_mode: attrs.get("UpdateMode").cloned(),
+                            raw_attributes: attrs.clone(),
+                        };
+                        let object_kind = if metadata
+                            .prog_id
+                            .as_deref()
+                            .map(|value| value.eq_ignore_ascii_case("Package"))
+                            .unwrap_or(false)
+                        {
+                            EmbeddedVisualObjectKind::EmbeddedPackage
+                        } else if metadata
+                            .prog_id
+                            .as_deref()
+                            .map(|value| value.to_ascii_lowercase().contains("forms."))
+                            .unwrap_or(false)
+                        {
+                            EmbeddedVisualObjectKind::ActivexBlocked
+                        } else if metadata.object_type.as_deref() == Some("Link") {
+                            EmbeddedVisualObjectKind::OleLinkedObject
+                        } else {
+                            EmbeddedVisualObjectKind::OleEmbeddedObject
+                        };
+                        if object_kind == EmbeddedVisualObjectKind::ActivexBlocked {
+                            projection.diagnostics.push(embedded_object_diag(
+                                "CVN_EMBEDDED_OBJECT_ACTIVEX_BLOCKED",
+                                &projection.source_anchor.xml_path,
+                                "ActiveX content is preserved but blocked",
+                            ));
+                        }
+                        if let Some(relationship_id) = attrs
+                            .get("r:id")
+                            .cloned()
+                            .or_else(|| attrs.get("id").cloned())
+                        {
+                            projection.targets.push(EmbeddedObjectTarget {
+                                kind: EmbeddedObjectTargetKind::Unresolved,
+                                role: Some("object".to_owned()),
+                                relationship_id: Some(relationship_id),
+                                relationship_type: None,
+                                target_mode: None,
+                                raw_target: None,
+                                resolved_part_path: None,
+                                resource: None,
+                                risk_class: None,
+                            });
+                        }
+                        projection.risk_class = Some(match object_kind {
+                            EmbeddedVisualObjectKind::EmbeddedPackage => {
+                                "embedded_office_package".to_owned()
+                            }
+                            EmbeddedVisualObjectKind::OleLinkedObject => {
+                                "linked_external_object".to_owned()
+                            }
+                            EmbeddedVisualObjectKind::ActivexBlocked => "activex".to_owned(),
+                            _ => "embedded_binary_object".to_owned(),
+                        });
+                        projection.ole = Some(OleObjectProjection { metadata });
+                        projection.kind = object_kind;
+                    }
+                    "imagedata" => {
+                        projection.preview_image_relationship_id = attrs
+                            .get("r:id")
+                            .cloned()
+                            .or_else(|| attrs.get("id").cloned());
+                    }
+                    "control" => {
+                        saw_object = true;
+                        projection.kind = EmbeddedVisualObjectKind::ActivexBlocked;
+                        projection.risk_class = Some("activex".to_owned());
+                        projection.diagnostics.push(embedded_object_diag(
+                            "CVN_EMBEDDED_OBJECT_ACTIVEX_BLOCKED",
+                            &projection.source_anchor.xml_path,
+                            "ActiveX control is preserved but blocked",
+                        ));
+                    }
+                    _ => {}
+                }
+                namespace_stack.pop();
+            }
+            Event::DocType(_) => {
+                return Err(DocxImportError::DoctypeNotAllowed {
+                    path: source_part_path.to_owned(),
+                });
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    if !saw_object {
+        return Ok(None);
+    }
+    if projection.kind == EmbeddedVisualObjectKind::Unresolved {
+        projection.kind = EmbeddedVisualObjectKind::UnsupportedVisualObject;
+        projection.diagnostics.push(embedded_object_diag(
+            "CVN_EMBEDDED_OBJECT_UNSUPPORTED",
+            &projection.source_anchor.xml_path,
+            "visual object is preserved but not semantically projected further",
+        ));
+    }
+    Ok(Some(projection))
+}
+
+fn embedded_object_diag(
+    code: &str,
+    path: &str,
+    message: impl Into<String>,
+) -> EmbeddedVisualObjectDiagnostic {
+    EmbeddedVisualObjectDiagnostic {
+        code: code.to_owned(),
+        path: path.to_owned(),
+        message: message.into(),
+    }
+}
+
 fn parse_drawing_projection(
     document_id: &DocumentId,
     source_part_path: &str,
@@ -4225,22 +4542,19 @@ fn parse_semantic_document(
                             &mut reader,
                             source_part_path,
                         )?;
-                        let drawing = parse_drawing_projection(
+                        append_visual_inline(
                             document_id,
                             source_part_path,
                             &document_digest,
                             anchor,
                             &raw_xml,
                             &mut id_set,
-                        )?;
-                        append_inline(
                             &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
                             &mut field_stack,
-                            SemanticInline::Drawing(drawing),
-                        );
+                        )?;
                         path_stack.pop();
                         child_counts.pop();
                         namespace_stack.pop();
@@ -4255,22 +4569,50 @@ fn parse_semantic_document(
                             &mut reader,
                             source_part_path,
                         )?;
-                        let drawing = parse_drawing_projection(
+                        append_visual_inline(
                             document_id,
                             source_part_path,
                             &document_digest,
                             anchor,
                             &raw_xml,
                             &mut id_set,
-                        )?;
-                        append_inline(
                             &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
                             &mut field_stack,
-                            SemanticInline::Drawing(drawing),
-                        );
+                        )?;
+                        path_stack.pop();
+                        child_counts.pop();
+                        namespace_stack.pop();
+                        buffer.clear();
+                        continue;
+                    }
+                    "object" if name.is_wordprocessingml() => {
+                        let scope = namespace_context(&namespace_stack);
+                        let raw_xml = read_element_xml_with_scope(
+                            &event,
+                            &scope,
+                            &mut reader,
+                            source_part_path,
+                        )?;
+                        if let Some(object) = parse_embedded_visual_object_projection(
+                            document_id,
+                            source_part_path,
+                            &document_digest,
+                            anchor,
+                            &raw_xml,
+                            &mut id_set,
+                        )? {
+                            append_inline(
+                                &mut paragraph_stack,
+                                &mut run_stack,
+                                &mut active_change,
+                                &mut hyperlink_stack,
+                                &mut field_stack,
+                                SemanticInline::EmbeddedVisualObject(object),
+                            );
+                        }
                         path_stack.pop();
                         child_counts.pop();
                         namespace_stack.pop();
@@ -4741,42 +5083,57 @@ fn parse_semantic_document(
                     "drawing" if name.is_wordprocessingml() => {
                         let scope = namespace_context(&namespace_stack);
                         let raw_xml = empty_event_xml_with_scope(&event, &scope)?;
-                        let drawing = parse_drawing_projection(
+                        append_visual_inline(
                             document_id,
                             source_part_path,
                             &document_digest,
                             anchor,
                             &raw_xml,
                             &mut id_set,
-                        )?;
-                        append_inline(
                             &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
                             &mut field_stack,
-                            SemanticInline::Drawing(drawing),
-                        );
+                        )?;
                     }
                     "pict" if name.is_wordprocessingml() => {
                         let scope = namespace_context(&namespace_stack);
                         let raw_xml = empty_event_xml_with_scope(&event, &scope)?;
-                        let drawing = parse_drawing_projection(
+                        append_visual_inline(
                             document_id,
                             source_part_path,
                             &document_digest,
                             anchor,
                             &raw_xml,
                             &mut id_set,
-                        )?;
-                        append_inline(
                             &mut paragraph_stack,
                             &mut run_stack,
                             &mut active_change,
                             &mut hyperlink_stack,
                             &mut field_stack,
-                            SemanticInline::Drawing(drawing),
-                        );
+                        )?;
+                    }
+                    "object" if name.is_wordprocessingml() => {
+                        let scope = namespace_context(&namespace_stack);
+                        let raw_xml = empty_event_xml_with_scope(&event, &scope)?;
+                        if let Some(object) = parse_embedded_visual_object_projection(
+                            document_id,
+                            source_part_path,
+                            &document_digest,
+                            anchor,
+                            &raw_xml,
+                            &mut id_set,
+                        )? {
+                            append_inline(
+                                &mut paragraph_stack,
+                                &mut run_stack,
+                                &mut active_change,
+                                &mut hyperlink_stack,
+                                &mut field_stack,
+                                SemanticInline::EmbeddedVisualObject(object),
+                            );
+                        }
                     }
                     "bookmarkStart" if name.is_wordprocessingml() => {
                         let bookmark_id = attr_named(&attrs, "id")
@@ -5088,6 +5445,7 @@ fn parse_semantic_document(
             stories: None,
             references: None,
             drawings: None,
+            embedded_visual_objects: None,
             unsupported_features,
         },
         track_changes,
@@ -6200,6 +6558,7 @@ fn resolve_semantic_references(
     relationships: &[OpcRelationship],
     content_types: &ContentTypesProjection,
     parts: &[OpcPart],
+    objects: &BTreeMap<String, Vec<u8>>,
 ) {
     let styles_snapshot = semantic.styles.clone();
     let numbering_snapshot = semantic.numbering.clone();
@@ -6219,6 +6578,7 @@ fn resolve_semantic_references(
     }
     resolve_document_references(semantic, relationships);
     resolve_document_drawings(semantic, relationships, content_types, parts);
+    resolve_embedded_visual_objects(semantic, relationships, content_types, parts, objects);
 }
 
 fn resolve_block_references(
@@ -6394,6 +6754,7 @@ fn resolve_run_story_references(run: &mut SemanticRun, relationships: &[OpcRelat
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Drawing(_)
+            | SemanticInline::EmbeddedVisualObject(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::TrackedChange { .. } => {}
@@ -6426,6 +6787,7 @@ fn resolve_mce_inline_references(
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Drawing(_)
+            | SemanticInline::EmbeddedVisualObject(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -6647,6 +7009,993 @@ fn resolve_document_drawings(
     semantic.drawings = Some(projection);
 }
 
+fn resolve_embedded_visual_objects(
+    semantic: &mut SemanticDocument,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+) {
+    let mut projection = EmbeddedVisualObjectsProjection {
+        source_part: semantic.source_part.clone(),
+        objects: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    collect_embedded_visual_objects_from_blocks(
+        &mut semantic.blocks,
+        relationships,
+        content_types,
+        parts,
+        objects,
+        &mut projection,
+    );
+    if let Some(stories) = semantic.stories.as_mut() {
+        for part in &mut stories.parts {
+            collect_embedded_visual_objects_from_blocks(
+                &mut part.blocks,
+                relationships,
+                content_types,
+                parts,
+                objects,
+                &mut projection,
+            );
+            for note in &mut part.notes {
+                collect_embedded_visual_objects_from_blocks(
+                    &mut note.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    &mut projection,
+                );
+            }
+            for comment in &mut part.comments {
+                collect_embedded_visual_objects_from_blocks(
+                    &mut comment.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    &mut projection,
+                );
+            }
+        }
+    }
+    projection.objects.sort_by(|left, right| {
+        left.source_anchor
+            .source_part_path
+            .cmp(&right.source_anchor.source_part_path)
+            .then(
+                left.source_anchor
+                    .xml_path
+                    .cmp(&right.source_anchor.xml_path),
+            )
+    });
+    projection
+        .diagnostics
+        .sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+    semantic.embedded_visual_objects = Some(projection);
+}
+
+fn collect_embedded_visual_objects_from_blocks(
+    blocks: &mut [SemanticBlock],
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+    projection: &mut EmbeddedVisualObjectsProjection,
+) {
+    for block in blocks {
+        match block {
+            SemanticBlock::Paragraph(paragraph) => {
+                for run in &mut paragraph.runs {
+                    collect_embedded_visual_objects_from_inlines(
+                        &mut run.inlines,
+                        relationships,
+                        content_types,
+                        parts,
+                        objects,
+                        projection,
+                    );
+                }
+            }
+            SemanticBlock::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        collect_embedded_visual_objects_from_blocks(
+                            &mut cell.blocks,
+                            relationships,
+                            content_types,
+                            parts,
+                            objects,
+                            projection,
+                        );
+                    }
+                }
+            }
+            SemanticBlock::TrackedChange(change) => match &mut change.content {
+                TrackedContent::Inline { items } => collect_embedded_visual_objects_from_inlines(
+                    items,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                ),
+                TrackedContent::Block { blocks } => collect_embedded_visual_objects_from_blocks(
+                    blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                ),
+                TrackedContent::PropertyChange { .. } => {}
+            },
+            SemanticBlock::MceSelectedContent(content) => {
+                collect_embedded_visual_objects_from_blocks(
+                    &mut content.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                );
+                collect_embedded_visual_objects_from_inlines(
+                    &mut content.inlines,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                );
+            }
+        }
+    }
+}
+
+fn collect_embedded_visual_objects_from_inlines(
+    inlines: &mut [SemanticInline],
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    objects: &BTreeMap<String, Vec<u8>>,
+    projection: &mut EmbeddedVisualObjectsProjection,
+) {
+    for inline in inlines {
+        match inline {
+            SemanticInline::EmbeddedVisualObject(object) => {
+                resolve_embedded_visual_object_targets(
+                    object,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                );
+                projection.diagnostics.extend(object.diagnostics.clone());
+                projection.objects.push(object.clone());
+            }
+            SemanticInline::Hyperlink(hyperlink) => collect_embedded_visual_objects_from_inlines(
+                &mut hyperlink.children,
+                relationships,
+                content_types,
+                parts,
+                objects,
+                projection,
+            ),
+            SemanticInline::Field(field) => collect_embedded_visual_objects_from_inlines(
+                &mut field.result.children,
+                relationships,
+                content_types,
+                parts,
+                objects,
+                projection,
+            ),
+            SemanticInline::TrackedChange { change } => match &mut change.content {
+                TrackedContent::Inline { items } => collect_embedded_visual_objects_from_inlines(
+                    items,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                ),
+                TrackedContent::Block { blocks } => collect_embedded_visual_objects_from_blocks(
+                    blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                ),
+                TrackedContent::PropertyChange { .. } => {}
+            },
+            SemanticInline::MceSelectedContent(content) => {
+                collect_embedded_visual_objects_from_blocks(
+                    &mut content.blocks,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                );
+                collect_embedded_visual_objects_from_inlines(
+                    &mut content.inlines,
+                    relationships,
+                    content_types,
+                    parts,
+                    objects,
+                    projection,
+                );
+            }
+            SemanticInline::Text(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Drawing(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. }
+            | SemanticInline::FootnoteReference { .. }
+            | SemanticInline::EndnoteReference { .. }
+            | SemanticInline::CommentReference { .. }
+            | SemanticInline::CommentRangeStart { .. }
+            | SemanticInline::CommentRangeEnd { .. } => {}
+        }
+    }
+}
+
+fn resolve_embedded_visual_object_targets(
+    object: &mut EmbeddedVisualObjectProjection,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    blobs: &BTreeMap<String, Vec<u8>>,
+) {
+    for target in &mut object.targets {
+        resolve_embedded_object_target(
+            &object.source_anchor,
+            object.kind,
+            target,
+            relationships,
+            content_types,
+            parts,
+            &mut object.diagnostics,
+        );
+    }
+    if let Some(relationship_id) = object.preview_image_relationship_id.as_deref() {
+        if let Some(relationship) = resolve_relationship(
+            relationships,
+            &object.source_anchor.source_part_path,
+            relationship_id,
+        ) {
+            if relationship.relationship_type == IMAGE_RELATIONSHIP_TYPE
+                && relationship.target_mode == TargetMode::Internal
+            {
+                if let Some(part_path) = resolve_internal_target_path(
+                    &object.source_anchor.source_part_path,
+                    &relationship.target,
+                ) {
+                    object.preview_image =
+                        build_embedded_resource(content_types, parts, &part_path);
+                }
+            }
+        } else {
+            object.diagnostics.push(embedded_object_diag(
+                "CVN_EMBEDDED_OBJECT_RELATIONSHIP_MISSING",
+                &object.source_anchor.xml_path,
+                format!("preview image relationship `{relationship_id}` is not defined"),
+            ));
+        }
+    }
+
+    match object.kind {
+        EmbeddedVisualObjectKind::Chart => {
+            if let Some(target) = object
+                .targets
+                .iter()
+                .find(|target| target.role.as_deref() == Some("chart_part"))
+            {
+                if let Some(resource) = target.resource.as_ref() {
+                    object.chart = Some(parse_chart_projection(
+                        resource,
+                        &object.source_anchor,
+                        relationships,
+                        content_types,
+                        parts,
+                        blobs,
+                        &mut object.diagnostics,
+                    ));
+                }
+            }
+            object
+                .risk_class
+                .get_or_insert_with(|| "passive_chart".to_owned());
+        }
+        EmbeddedVisualObjectKind::SmartartDiagram => {
+            object.diagram = Some(parse_diagram_projection(
+                object,
+                relationships,
+                content_types,
+                parts,
+                blobs,
+            ));
+            object
+                .risk_class
+                .get_or_insert_with(|| "passive_diagram".to_owned());
+            object.diagnostics.push(embedded_object_diag(
+                "CVN_DIAGRAM_LAYOUT_NOT_EVALUATED",
+                &object.source_anchor.xml_path,
+                "diagram layout is preserved but not evaluated",
+            ));
+        }
+        EmbeddedVisualObjectKind::EmbeddedPackage => {
+            if let Some(target) = object
+                .targets
+                .iter()
+                .find(|target| target.role.as_deref() == Some("object"))
+            {
+                object.package_resource = target.resource.clone();
+            }
+        }
+        EmbeddedVisualObjectKind::OleLinkedObject
+        | EmbeddedVisualObjectKind::OleEmbeddedObject
+        | EmbeddedVisualObjectKind::ActivexBlocked
+        | EmbeddedVisualObjectKind::UnsupportedVisualObject
+        | EmbeddedVisualObjectKind::Unresolved => {}
+    }
+}
+
+fn collect_part_bytes<'a>(
+    resource: &EmbeddedResourceProjection,
+    blobs: &'a BTreeMap<String, Vec<u8>>,
+) -> Option<&'a [u8]> {
+    blobs
+        .get(resource.object_digest.as_deref()?)
+        .map(Vec::as_slice)
+}
+
+fn resolve_embedded_object_target(
+    anchor: &SourceAnchor,
+    object_kind: EmbeddedVisualObjectKind,
+    target: &mut EmbeddedObjectTarget,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    diagnostics: &mut Vec<EmbeddedVisualObjectDiagnostic>,
+) {
+    let Some(relationship_id) = target.relationship_id.as_deref() else {
+        return;
+    };
+    let Some(relationship) =
+        resolve_relationship(relationships, &anchor.source_part_path, relationship_id)
+    else {
+        diagnostics.push(embedded_object_diag(
+            "CVN_EMBEDDED_OBJECT_RELATIONSHIP_MISSING",
+            &anchor.xml_path,
+            format!("relationship `{relationship_id}` is not defined"),
+        ));
+        target.kind = EmbeddedObjectTargetKind::Unresolved;
+        return;
+    };
+
+    target.relationship_type = Some(relationship.relationship_type.clone());
+    target.target_mode = Some(relationship.target_mode);
+    target.raw_target = Some(relationship.target.clone());
+    if let Some(expected) =
+        expected_relationship_type_for_target(object_kind, target.role.as_deref())
+    {
+        if relationship.relationship_type != expected {
+            diagnostics.push(embedded_object_diag(
+                "CVN_EMBEDDED_OBJECT_RELATIONSHIP_TYPE_MISMATCH",
+                &anchor.xml_path,
+                format!(
+                    "relationship `{relationship_id}` has unexpected type `{}`",
+                    relationship.relationship_type
+                ),
+            ));
+        }
+    }
+
+    match relationship.target_mode {
+        TargetMode::External => {
+            target.kind = EmbeddedObjectTargetKind::ExternalRelationship;
+            target.risk_class = Some(classify_embedded_visual_object_risk(
+                object_kind,
+                &relationship.target,
+            ));
+            diagnostics.push(embedded_object_diag(
+                "CVN_EMBEDDED_OBJECT_EXTERNAL_TARGET_INERT",
+                &anchor.xml_path,
+                "external embedded-object target is preserved inertly",
+            ));
+            if matches!(
+                object_kind,
+                EmbeddedVisualObjectKind::OleLinkedObject
+                    | EmbeddedVisualObjectKind::ActivexBlocked
+            ) {
+                diagnostics.push(embedded_object_diag(
+                    "CVN_EMBEDDED_OBJECT_ACTIVE_CONTENT_BLOCKED",
+                    &anchor.xml_path,
+                    "active embedded content is preserved but blocked",
+                ));
+            }
+        }
+        TargetMode::Internal => {
+            let Some(part_path) =
+                resolve_internal_target_path(&anchor.source_part_path, &relationship.target)
+            else {
+                diagnostics.push(embedded_object_diag(
+                    "CVN_EMBEDDED_OBJECT_PART_MISSING",
+                    &anchor.xml_path,
+                    format!(
+                        "target `{}` does not resolve to a valid OPC part",
+                        relationship.target
+                    ),
+                ));
+                target.kind = EmbeddedObjectTargetKind::Unresolved;
+                return;
+            };
+            target.resolved_part_path = Some(part_path.clone());
+            target.kind = match object_kind {
+                EmbeddedVisualObjectKind::OleEmbeddedObject
+                | EmbeddedVisualObjectKind::EmbeddedPackage => {
+                    EmbeddedObjectTargetKind::EmbeddedPart
+                }
+                _ => EmbeddedObjectTargetKind::InternalPart,
+            };
+            target.resource = build_embedded_resource(content_types, parts, &part_path);
+            if target.resource.is_none() {
+                diagnostics.push(embedded_object_diag(
+                    if target
+                        .role
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("diagram_")
+                    {
+                        "CVN_DIAGRAM_PART_MISSING"
+                    } else {
+                        "CVN_EMBEDDED_OBJECT_PART_MISSING"
+                    },
+                    &anchor.xml_path,
+                    format!("target part `{part_path}` is not present"),
+                ));
+                target.kind = EmbeddedObjectTargetKind::Unresolved;
+            }
+        }
+    }
+}
+
+fn resolve_relationship<'a>(
+    relationships: &'a [OpcRelationship],
+    source_part: &str,
+    relationship_id: &str,
+) -> Option<&'a OpcRelationship> {
+    relationships.iter().find(|relationship| {
+        relationship.source_part.as_deref() == Some(source_part)
+            && relationship.relationship_id == relationship_id
+    })
+}
+
+fn build_embedded_resource(
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    part_path: &str,
+) -> Option<EmbeddedResourceProjection> {
+    let part = parts.iter().find(|part| part.original_path == part_path)?;
+    let content_type = part
+        .content_type
+        .clone()
+        .or_else(|| resolve_content_type(content_types, part_path));
+    Some(EmbeddedResourceProjection {
+        part_path: Some(part.original_path.clone()),
+        content_type: content_type.clone(),
+        object_digest: Some(part.content_digest.clone()),
+        length: Some(part.original_size),
+        format_hint: content_type.as_deref().map(format_hint_for_content_type),
+    })
+}
+
+fn format_hint_for_content_type(content_type: &str) -> String {
+    if let Some((_, subtype)) = content_type.split_once('/') {
+        subtype
+            .trim()
+            .trim_start_matches("vnd.")
+            .trim_start_matches("ms-")
+            .to_ascii_lowercase()
+    } else {
+        content_type.to_ascii_lowercase()
+    }
+}
+
+fn classify_embedded_visual_object_risk(
+    kind: EmbeddedVisualObjectKind,
+    raw_target: &str,
+) -> String {
+    match kind {
+        EmbeddedVisualObjectKind::Chart => "linked_external_object".to_owned(),
+        EmbeddedVisualObjectKind::SmartartDiagram => "passive_diagram".to_owned(),
+        EmbeddedVisualObjectKind::EmbeddedPackage => "embedded_office_package".to_owned(),
+        EmbeddedVisualObjectKind::ActivexBlocked => "activex".to_owned(),
+        EmbeddedVisualObjectKind::OleLinkedObject => {
+            let base =
+                classify_hyperlink_risk(raw_target).unwrap_or_else(|| "unknown_scheme".to_owned());
+            if base == "ordinary_web" || base == "unknown_scheme" {
+                "linked_external_object".to_owned()
+            } else {
+                base
+            }
+        }
+        EmbeddedVisualObjectKind::OleEmbeddedObject => "embedded_binary_object".to_owned(),
+        EmbeddedVisualObjectKind::UnsupportedVisualObject
+        | EmbeddedVisualObjectKind::Unresolved => "unknown_embedded_object".to_owned(),
+    }
+}
+
+fn expected_relationship_type_for_target(
+    object_kind: EmbeddedVisualObjectKind,
+    role: Option<&str>,
+) -> Option<&'static str> {
+    match (object_kind, role) {
+        (EmbeddedVisualObjectKind::Chart, Some("chart_part")) => Some(CHART_RELATIONSHIP_TYPE),
+        (EmbeddedVisualObjectKind::SmartartDiagram, Some("diagram_data")) => {
+            Some(DIAGRAM_DATA_RELATIONSHIP_TYPE)
+        }
+        (EmbeddedVisualObjectKind::SmartartDiagram, Some("diagram_layout")) => {
+            Some(DIAGRAM_LAYOUT_RELATIONSHIP_TYPE)
+        }
+        (EmbeddedVisualObjectKind::SmartartDiagram, Some("diagram_style")) => {
+            Some(DIAGRAM_STYLE_RELATIONSHIP_TYPE)
+        }
+        (EmbeddedVisualObjectKind::SmartartDiagram, Some("diagram_colors")) => {
+            Some(DIAGRAM_COLORS_RELATIONSHIP_TYPE)
+        }
+        (EmbeddedVisualObjectKind::EmbeddedPackage, Some("object")) => {
+            Some(PACKAGE_RELATIONSHIP_TYPE)
+        }
+        (EmbeddedVisualObjectKind::ActivexBlocked, Some("object")) => {
+            Some(CONTROL_RELATIONSHIP_TYPE)
+        }
+        (
+            EmbeddedVisualObjectKind::OleEmbeddedObject | EmbeddedVisualObjectKind::OleLinkedObject,
+            Some("object"),
+        ) => Some(OLE_OBJECT_RELATIONSHIP_TYPE),
+        _ => None,
+    }
+}
+
+fn parse_chart_projection(
+    resource: &EmbeddedResourceProjection,
+    source_anchor: &SourceAnchor,
+    relationships: &[OpcRelationship],
+    content_types: &ContentTypesProjection,
+    parts: &[OpcPart],
+    blobs: &BTreeMap<String, Vec<u8>>,
+    diagnostics: &mut Vec<EmbeddedVisualObjectDiagnostic>,
+) -> ChartProjection {
+    let mut projection = ChartProjection {
+        part_path: resource.part_path.clone(),
+        content_type: resource.content_type.clone(),
+        object_digest: resource.object_digest.clone(),
+        length: resource.length,
+        chart_type: "unknown".to_owned(),
+        title: None,
+        series: Vec::new(),
+        embedded_workbook: None,
+        external_data: None,
+        external_data_auto_update: None,
+    };
+    let Some(bytes) = collect_part_bytes(resource, blobs) else {
+        return projection;
+    };
+    let Some(part_path) = resource.part_path.as_deref() else {
+        return projection;
+    };
+
+    let mut reader = Reader::from_reader(Cursor::new(bytes));
+    let mut buffer = Vec::new();
+    let mut namespace_stack = Vec::<BTreeMap<String, String>>::new();
+    let mut tag_stack = Vec::<String>::new();
+    let mut current_series: Option<ChartSeriesProjection> = None;
+    let mut series_role: Option<&str> = None;
+    let mut series_formula: Option<String> = None;
+    let mut series_strings = Vec::<String>::new();
+    let mut series_numbers = Vec::<String>::new();
+    let mut title_text = String::new();
+    let mut series_title = String::new();
+    let mut external_data_id: Option<String> = None;
+    let mut external_data_auto_update: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                namespace_stack.push(namespace_declarations(&event).unwrap_or_default());
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event).unwrap_or_default();
+                tag_stack.push(name.local_name.clone());
+                match name.local_name.as_str() {
+                    "barChart" => projection.chart_type = "bar".to_owned(),
+                    "lineChart" => projection.chart_type = "line".to_owned(),
+                    "pieChart" => projection.chart_type = "pie".to_owned(),
+                    "areaChart" => projection.chart_type = "area".to_owned(),
+                    "scatterChart" => projection.chart_type = "scatter".to_owned(),
+                    "doughnutChart" => projection.chart_type = "doughnut".to_owned(),
+                    "radarChart" => projection.chart_type = "radar".to_owned(),
+                    "surfaceChart" => projection.chart_type = "surface".to_owned(),
+                    "stockChart" => projection.chart_type = "stock".to_owned(),
+                    "bubbleChart" => projection.chart_type = "bubble".to_owned(),
+                    "ser" => {
+                        current_series = Some(ChartSeriesProjection {
+                            title: None,
+                            category_reference: None,
+                            value_reference: None,
+                        });
+                        series_title.clear();
+                    }
+                    "cat" | "xVal" => {
+                        series_role = Some("category");
+                        series_formula = None;
+                        series_strings.clear();
+                        series_numbers.clear();
+                    }
+                    "val" | "yVal" => {
+                        series_role = Some("value");
+                        series_formula = None;
+                        series_strings.clear();
+                        series_numbers.clear();
+                    }
+                    "externalData" => {
+                        external_data_id = attrs
+                            .get("r:id")
+                            .cloned()
+                            .or_else(|| attrs.get("id").cloned());
+                    }
+                    "autoUpdate" => {
+                        external_data_auto_update = attrs.get("val").cloned();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(event)) => {
+                namespace_stack.push(namespace_declarations(&event).unwrap_or_default());
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                let attrs = attributes(&reader, &event).unwrap_or_default();
+                match name.local_name.as_str() {
+                    "externalData" => {
+                        external_data_id = attrs
+                            .get("r:id")
+                            .cloned()
+                            .or_else(|| attrs.get("id").cloned());
+                    }
+                    "autoUpdate" => {
+                        external_data_auto_update = attrs.get("val").cloned();
+                    }
+                    _ => {}
+                }
+                namespace_stack.pop();
+            }
+            Ok(Event::Text(text)) => {
+                let value = text
+                    .decode()
+                    .map(|value| value.into_owned())
+                    .unwrap_or_default();
+                match tag_stack.last().map(String::as_str) {
+                    Some("t") => {
+                        if tag_stack.iter().any(|tag| tag == "title") {
+                            title_text.push_str(&value);
+                        } else if current_series.is_some()
+                            && tag_stack.iter().any(|tag| tag == "tx")
+                        {
+                            series_title.push_str(&value);
+                        } else if current_series.is_none()
+                            && tag_stack.iter().any(|tag| tag == "pt")
+                        {
+                        }
+                    }
+                    Some("v")
+                        if current_series.is_some()
+                            && tag_stack.iter().any(|tag| tag == "tx")
+                            && !tag_stack.iter().any(|tag| {
+                                tag == "cat" || tag == "val" || tag == "xVal" || tag == "yVal"
+                            }) =>
+                    {
+                        series_title.push_str(&value);
+                    }
+                    Some("f") if current_series.is_some() => {
+                        series_formula = Some(value);
+                    }
+                    Some("v") if current_series.is_some() => match series_role {
+                        Some("category") => series_strings.push(value),
+                        Some("value") => series_numbers.push(value),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            Ok(Event::End(event)) => {
+                let name = qname(event.name().as_ref(), &namespace_stack);
+                match name.local_name.as_str() {
+                    "title" => {
+                        if !title_text.is_empty() {
+                            projection.title = Some(ChartTitleProjection {
+                                text: title_text.clone(),
+                            });
+                            title_text.clear();
+                        }
+                    }
+                    "tx" => {
+                        if let Some(series) = current_series.as_mut() {
+                            if !series_title.is_empty() {
+                                series.title = Some(series_title.clone());
+                                series_title.clear();
+                            }
+                        }
+                    }
+                    "cat" | "xVal" => {
+                        if let Some(series) = current_series.as_mut() {
+                            series.category_reference = Some(ChartDataReferenceProjection {
+                                formula: series_formula.take(),
+                                cached_string_values: std::mem::take(&mut series_strings),
+                                cached_numeric_values: std::mem::take(&mut series_numbers),
+                            });
+                        }
+                        series_role = None;
+                    }
+                    "val" | "yVal" => {
+                        if let Some(series) = current_series.as_mut() {
+                            series.value_reference = Some(ChartDataReferenceProjection {
+                                formula: series_formula.take(),
+                                cached_string_values: std::mem::take(&mut series_strings),
+                                cached_numeric_values: std::mem::take(&mut series_numbers),
+                            });
+                        }
+                        series_role = None;
+                    }
+                    "ser" => {
+                        if let Some(series) = current_series.take() {
+                            if series
+                                .category_reference
+                                .as_ref()
+                                .and_then(|value| value.formula.as_ref())
+                                .is_some()
+                                || series
+                                    .value_reference
+                                    .as_ref()
+                                    .and_then(|value| value.formula.as_ref())
+                                    .is_some()
+                            {
+                                diagnostics.push(embedded_object_diag(
+                                    "CVN_CHART_FORMULA_NOT_EVALUATED",
+                                    &source_anchor.xml_path,
+                                    "chart formulas are preserved but not evaluated",
+                                ));
+                            }
+                            projection.series.push(series);
+                        }
+                    }
+                    _ => {}
+                }
+                tag_stack.pop();
+                namespace_stack.pop();
+            }
+            Ok(Event::DocType(_)) => {
+                diagnostics.push(embedded_object_diag(
+                    "CVN_CHART_PART_MALFORMED",
+                    &source_anchor.xml_path,
+                    format!("chart part `{part_path}` contains a disallowed DOCTYPE"),
+                ));
+                break;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                diagnostics.push(embedded_object_diag(
+                    "CVN_CHART_PART_MALFORMED",
+                    &source_anchor.xml_path,
+                    format!("chart part `{part_path}` could not be parsed"),
+                ));
+                break;
+            }
+            _ => {}
+        }
+        buffer.clear();
+    }
+
+    if let Some(workbook_rel) = relationships.iter().find(|relationship| {
+        relationship.source_part.as_deref() == Some(part_path)
+            && relationship.target_mode == TargetMode::Internal
+            && relationship.relationship_type.contains("package")
+    }) {
+        if let Some(workbook_path) = resolve_internal_target_path(part_path, &workbook_rel.target) {
+            projection.embedded_workbook =
+                build_embedded_resource(content_types, parts, &workbook_path);
+        }
+    }
+    if let Some(relationship_id) = external_data_id {
+        let mut target = EmbeddedObjectTarget {
+            kind: EmbeddedObjectTargetKind::Unresolved,
+            role: Some("chart_external_data".to_owned()),
+            relationship_id: Some(relationship_id.clone()),
+            relationship_type: None,
+            target_mode: None,
+            raw_target: None,
+            resolved_part_path: None,
+            resource: None,
+            risk_class: None,
+        };
+        if let Some(relationship) = resolve_relationship(relationships, part_path, &relationship_id)
+        {
+            target.relationship_type = Some(relationship.relationship_type.clone());
+            target.target_mode = Some(relationship.target_mode);
+            target.raw_target = Some(relationship.target.clone());
+            match relationship.target_mode {
+                TargetMode::External => {
+                    target.kind = EmbeddedObjectTargetKind::ExternalRelationship;
+                    target.risk_class = Some("linked_external_object".to_owned());
+                }
+                TargetMode::Internal => {
+                    if let Some(target_path) =
+                        resolve_internal_target_path(part_path, &relationship.target)
+                    {
+                        target.kind = EmbeddedObjectTargetKind::InternalPart;
+                        target.resolved_part_path = Some(target_path.clone());
+                        target.resource =
+                            build_embedded_resource(content_types, parts, &target_path);
+                    }
+                }
+            }
+            diagnostics.push(embedded_object_diag(
+                "CVN_CHART_EXTERNAL_DATA_INERT",
+                &source_anchor.xml_path,
+                "chart externalData is preserved but not updated",
+            ));
+        }
+        projection.external_data = Some(target);
+        projection.external_data_auto_update = external_data_auto_update;
+    }
+    projection
+}
+
+fn parse_diagram_projection(
+    object: &EmbeddedVisualObjectProjection,
+    _relationships: &[OpcRelationship],
+    _content_types: &ContentTypesProjection,
+    _parts: &[OpcPart],
+    blobs: &BTreeMap<String, Vec<u8>>,
+) -> DiagramProjection {
+    let mut projection = DiagramProjection {
+        data_part: None,
+        layout_part: None,
+        style_part: None,
+        colors_part: None,
+        points: Vec::new(),
+        connections: Vec::new(),
+        texts: Vec::new(),
+    };
+    for target in &object.targets {
+        let reference = DiagramPartReferenceProjection {
+            role: target.role.clone().unwrap_or_default(),
+            relationship_id: target.relationship_id.clone(),
+            part_path: target
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.part_path.clone()),
+            content_type: target
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.content_type.clone()),
+            object_digest: target
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.object_digest.clone()),
+            length: target
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.length),
+        };
+        match target.role.as_deref() {
+            Some("diagram_data") => projection.data_part = Some(reference),
+            Some("diagram_layout") => projection.layout_part = Some(reference),
+            Some("diagram_style") => projection.style_part = Some(reference),
+            Some("diagram_colors") => projection.colors_part = Some(reference),
+            _ => {}
+        }
+    }
+    if let Some(data_part) = projection.data_part.as_ref() {
+        if let Some(bytes) = collect_part_bytes(
+            &EmbeddedResourceProjection {
+                part_path: data_part.part_path.clone(),
+                content_type: data_part.content_type.clone(),
+                object_digest: data_part.object_digest.clone(),
+                length: data_part.length,
+                format_hint: None,
+            },
+            blobs,
+        ) {
+            let mut reader = Reader::from_reader(Cursor::new(bytes));
+            let mut buffer = Vec::new();
+            let mut namespace_stack = Vec::<BTreeMap<String, String>>::new();
+            let mut tag_stack = Vec::<String>::new();
+            loop {
+                match reader.read_event_into(&mut buffer) {
+                    Ok(Event::Start(event)) => {
+                        namespace_stack.push(namespace_declarations(&event).unwrap_or_default());
+                        let name = qname(event.name().as_ref(), &namespace_stack);
+                        let attrs = attributes(&reader, &event).unwrap_or_default();
+                        tag_stack.push(name.local_name.clone());
+                        match name.local_name.as_str() {
+                            "pt" => {
+                                if let Some(id) = attrs
+                                    .get("modelId")
+                                    .cloned()
+                                    .or_else(|| attrs.get("id").cloned())
+                                {
+                                    projection.points.push(id);
+                                }
+                            }
+                            "cxn" => {
+                                let id = attrs
+                                    .get("modelId")
+                                    .cloned()
+                                    .or_else(|| attrs.get("id").cloned())
+                                    .unwrap_or_default();
+                                let src = attrs.get("srcId").cloned().unwrap_or_default();
+                                let dst = attrs.get("destId").cloned().unwrap_or_default();
+                                projection.connections.push(format!("{id}:{src}:{dst}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Event::Text(text)) => {
+                        if tag_stack.last().map(String::as_str) == Some("t") {
+                            let value = text
+                                .decode()
+                                .map(|value| value.into_owned())
+                                .unwrap_or_default();
+                            if !value.is_empty() {
+                                projection.texts.push(value);
+                            }
+                        }
+                    }
+                    Ok(Event::End(_)) => {
+                        tag_stack.pop();
+                        namespace_stack.pop();
+                    }
+                    Ok(Event::Empty(event)) => {
+                        namespace_stack.push(namespace_declarations(&event).unwrap_or_default());
+                        let name = qname(event.name().as_ref(), &namespace_stack);
+                        let attrs = attributes(&reader, &event).unwrap_or_default();
+                        match name.local_name.as_str() {
+                            "pt" => {
+                                if let Some(id) = attrs
+                                    .get("modelId")
+                                    .cloned()
+                                    .or_else(|| attrs.get("id").cloned())
+                                {
+                                    projection.points.push(id);
+                                }
+                            }
+                            "cxn" => {
+                                let id = attrs
+                                    .get("modelId")
+                                    .cloned()
+                                    .or_else(|| attrs.get("id").cloned())
+                                    .unwrap_or_default();
+                                let src = attrs.get("srcId").cloned().unwrap_or_default();
+                                let dst = attrs.get("destId").cloned().unwrap_or_default();
+                                projection.connections.push(format!("{id}:{src}:{dst}"));
+                            }
+                            _ => {}
+                        }
+                        namespace_stack.pop();
+                    }
+                    Ok(Event::Eof) => break,
+                    _ => {}
+                }
+                buffer.clear();
+            }
+        }
+    }
+    projection
+}
+
 fn collect_drawings_from_blocks(
     blocks: &mut [SemanticBlock],
     relationships: &[OpcRelationship],
@@ -6817,6 +8166,7 @@ fn collect_drawings_from_inlines(
             SemanticInline::Text(_)
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::EmbeddedVisualObject(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -7127,7 +8477,8 @@ fn collect_reference_inlines_phase_one(
             | SemanticInline::CommentReference { .. }
             | SemanticInline::CommentRangeStart { .. }
             | SemanticInline::CommentRangeEnd { .. }
-            | SemanticInline::Drawing(_) => {}
+            | SemanticInline::Drawing(_)
+            | SemanticInline::EmbeddedVisualObject(_) => {}
         }
     }
 }
@@ -7295,6 +8646,7 @@ fn collect_reference_inlines_phase_two(
             SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Drawing(_)
+            | SemanticInline::EmbeddedVisualObject(_)
             | SemanticInline::Text(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
@@ -7824,6 +9176,7 @@ fn collect_track_change_story_references(
                     | SemanticInline::BookmarkStart(_)
                     | SemanticInline::BookmarkEnd(_)
                     | SemanticInline::Drawing(_)
+                    | SemanticInline::EmbeddedVisualObject(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
                     | SemanticInline::TrackedChange { .. } => {}
@@ -7907,6 +9260,7 @@ fn collect_run_story_references(run: &SemanticRun, references: &mut Vec<StoryRef
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Drawing(_)
+            | SemanticInline::EmbeddedVisualObject(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. } => {}
             SemanticInline::TrackedChange { change } => {
@@ -7992,6 +9346,7 @@ fn collect_comment_ranges(
                             | SemanticInline::BookmarkStart(_)
                             | SemanticInline::BookmarkEnd(_)
                             | SemanticInline::Drawing(_)
+                            | SemanticInline::EmbeddedVisualObject(_)
                             | SemanticInline::Tab
                             | SemanticInline::LineBreak { .. }
                             | SemanticInline::FootnoteReference { .. }
@@ -8065,6 +9420,7 @@ fn collect_track_change_comment_ranges(
                     | SemanticInline::BookmarkStart(_)
                     | SemanticInline::BookmarkEnd(_)
                     | SemanticInline::Drawing(_)
+                    | SemanticInline::EmbeddedVisualObject(_)
                     | SemanticInline::Tab
                     | SemanticInline::LineBreak { .. }
                     | SemanticInline::FootnoteReference { .. }
@@ -8130,6 +9486,7 @@ fn collect_mce_inline_comment_ranges(
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
             | SemanticInline::Drawing(_)
+            | SemanticInline::EmbeddedVisualObject(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -9640,6 +10997,61 @@ mod tests {
         path
     }
 
+    fn write_embedded_visual_objects_docx(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tuff-cvn-{name}-{}.docx", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2026, 1, 1, 0, 0, 0).unwrap());
+        add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="bin" ContentType="application/octet-stream"/><Default Extension="docx" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/><Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/><Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/><Override PartName="/word/diagrams/data1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml"/><Override PartName="/word/diagrams/layout1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.diagramLayout+xml"/><Override PartName="/word/diagrams/style1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.diagramStyle+xml"/></Types>"#);
+        add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/><Relationship Id="rIdChart1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/><Relationship Id="rIdDiagramData" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml"/><Relationship Id="rIdDiagramLayout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout" Target="diagrams/layout1.xml"/><Relationship Id="rIdDiagramStyle" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle" Target="diagrams/style1.xml"/><Relationship Id="rIdDiagramColors" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors" Target="diagrams/missing-colors1.xml"/><Relationship Id="rIdOle1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/><Relationship Id="rIdOleLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="https://example.invalid/ole-object" TargetMode="External"/><Relationship Id="rIdPackage1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="embeddings/package1.docx"/><Relationship Id="rIdControl1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/control" Target="activeX/activeX1.bin"/><Relationship Id="rIdPreview" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/preview.png"/><Relationship Id="rIdWrongType" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/><Relationship Id="rIdMissingPart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/missing.bin"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/header1.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeaderObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/footnotes.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFootObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="embeddings/package1.docx"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br##"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><w:body><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rIdDiagramData" r:lo="rIdDiagramLayout" r:qs="rIdDiagramStyle" r:cs="rIdDiagramColors"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:object><v:shape id="OleShape1"><v:imagedata r:id="rIdPreview" o:title="Previewed object"/></v:shape><o:OLEObject Type="Embed" ProgID="Word.Document.12" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" UpdateMode="Always" r:id="rIdOle1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Link" ProgID="Excel.Sheet.12" ShapeID="_x0000_i1026" ObjectID="_2" r:id="rIdOleLink"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1027" ObjectID="_3" r:id="rIdPackage1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:control r:id="rIdControl1"/><o:OLEObject Type="Embed" ProgID="Forms.CommandButton.1" ShapeID="_x0000_i1028" ObjectID="_4" r:id="rIdControl1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_5" r:id="rIdMissingObject"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_6" r:id="rIdWrongType"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_7" r:id="rIdMissingPart"/></w:object></w:r></w:p><w:p><w:hyperlink w:anchor="LocalAnchor"><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:hyperlink></w:p><w:p><w:r><w:fldSimple w:instr=" REF LocalAnchor "><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ObjectID="_8" r:id="rIdPackage1"/></w:object></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="61" w:author="Alice"><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_9" r:id="rIdOle1"/></w:object></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"##);
+        add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:o="urn:schemas-microsoft-com:office:office"><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_10" r:id="rIdHeaderObject"/></w:object></w:r></w:p></w:hdr>"#);
+        add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:o="urn:schemas-microsoft-com:office:office"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ObjectID="_11" r:id="rIdFootObject"/></w:object></w:r></w:p></w:footnote></w:footnotes>"#);
+        add(&mut zip, options, "word/charts/chart1.xml", br##"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Chart Title</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:tx><c:v>Series 1</c:v></c:tx><c:cat><c:strRef><c:f>Sheet1!$A$1:$A$2</c:f><c:strCache><c:pt idx="0"><c:v>Cat A</c:v></c:pt><c:pt idx="1"><c:v>Cat B</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Sheet1!$B$1:$B$2</c:f><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea><c:externalData r:id="rIdChartExt"><c:autoUpdate val="1"/></c:externalData></c:chart></c:chartSpace>"##);
+        add(&mut zip, options, "word/charts/_rels/chart1.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdWorkbook" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/workbook1.xlsx"/><Relationship Id="rIdChartExt" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="https://example.invalid/chart-data.xlsx" TargetMode="External"/></Relationships>"#);
+        add(&mut zip, options, "word/diagrams/data1.xml", br##"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt modelId="0"><dgm:t><a:t>Node A</a:t></dgm:t></dgm:pt><dgm:pt modelId="2"><dgm:t><a:t>Node B</a:t></dgm:t></dgm:pt></dgm:ptLst><dgm:cxnLst><dgm:cxn modelId="1" srcId="0" destId="2"/></dgm:cxnLst></dgm:dataModel>"##);
+        add(&mut zip, options, "word/diagrams/layout1.xml", br#"<dgm:layoutDef xmlns:dgm=\"http://schemas.openxmlformats.org/drawingml/2006/diagram\" uniqueId=\"layout-1\"/>"#);
+        add(&mut zip, options, "word/diagrams/style1.xml", br#"<dgm:styleDef xmlns:dgm=\"http://schemas.openxmlformats.org/drawingml/2006/diagram\" uniqueId=\"style-1\"/>"#);
+        add(
+            &mut zip,
+            options,
+            "word/embeddings/oleObject1.bin",
+            b"ole-object-stable",
+        );
+        add(
+            &mut zip,
+            options,
+            "word/embeddings/package1.docx",
+            b"embedded-docx-stable",
+        );
+        add(
+            &mut zip,
+            options,
+            "word/embeddings/workbook1.xlsx",
+            b"embedded-workbook-stable",
+        );
+        add(
+            &mut zip,
+            options,
+            "word/activeX/activeX1.bin",
+            b"activex-stable",
+        );
+        add(
+            &mut zip,
+            options,
+            "word/media/preview.png",
+            b"preview-png-stable",
+        );
+        zip.finish().unwrap();
+        path
+    }
+
     fn collect_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         for block in &document.blocks {
@@ -10397,10 +11809,6 @@ mod tests {
         assert!(registry
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "CVN_DRAWING_ACTIVE_OBJECT_BLOCKED"));
-        assert!(registry
-            .diagnostics
-            .iter()
             .any(|diagnostic| diagnostic.code == "CVN_DRAWING_EXTERNAL_TARGET_INERT"));
 
         assert!(semantic_contains_drawing_wrapper(&first.document.semantic));
@@ -10460,6 +11868,249 @@ mod tests {
             std::env::temp_dir().join(format!("tuff-cvn-drawings-out-1-{}", std::process::id()));
         let out2 =
             std::env::temp_dir().join(format!("tuff-cvn-drawings-out-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+        cvn_package::write_package(&out1, &first).unwrap();
+        cvn_package::write_package(&out2, &second).unwrap();
+        assert_eq!(
+            cvn_package::read_cvn_json_bytes(&out1).unwrap(),
+            cvn_package::read_cvn_json_bytes(&out2).unwrap()
+        );
+        assert_eq!(
+            cvn_package::verify_package_integrity(&out1)
+                .unwrap()
+                .root_actual,
+            cvn_package::verify_package_integrity(&out2)
+                .unwrap()
+                .root_actual
+        );
+
+        let _ = fs::remove_file(&docx);
+        let _ = fs::remove_dir_all(&out1);
+        let _ = fs::remove_dir_all(&out2);
+    }
+
+    #[test]
+    fn embedded_visual_objects_projection_is_deterministic_and_connected() {
+        let docx = write_embedded_visual_objects_docx("embedded-objects");
+        let first = import_docx(&docx).unwrap();
+        let second = import_docx(&docx).unwrap();
+
+        assert_eq!(
+            first.document.semantic.embedded_visual_objects,
+            second.document.semantic.embedded_visual_objects
+        );
+        assert_eq!(
+            collect_object_semantic_ids(&first.document.semantic),
+            collect_object_semantic_ids(&second.document.semantic)
+        );
+
+        let registry = first
+            .document
+            .semantic
+            .embedded_visual_objects
+            .as_ref()
+            .unwrap();
+        assert_eq!(registry.source_part, "word/document.xml");
+        assert!(registry
+            .objects
+            .iter()
+            .any(|object| object.kind == EmbeddedVisualObjectKind::Chart));
+        assert!(registry
+            .objects
+            .iter()
+            .any(|object| object.kind == EmbeddedVisualObjectKind::SmartartDiagram));
+        assert!(registry
+            .objects
+            .iter()
+            .any(|object| object.kind == EmbeddedVisualObjectKind::OleEmbeddedObject));
+        assert!(registry
+            .objects
+            .iter()
+            .any(|object| object.kind == EmbeddedVisualObjectKind::OleLinkedObject));
+        assert!(registry
+            .objects
+            .iter()
+            .any(|object| object.kind == EmbeddedVisualObjectKind::EmbeddedPackage));
+        assert!(registry
+            .objects
+            .iter()
+            .any(|object| object.kind == EmbeddedVisualObjectKind::ActivexBlocked));
+
+        let chart = registry
+            .objects
+            .iter()
+            .find(|object| object.kind == EmbeddedVisualObjectKind::Chart)
+            .unwrap();
+        let chart_projection = chart.chart.as_ref().unwrap();
+        assert_eq!(chart_projection.chart_type, "bar");
+        assert_eq!(
+            chart_projection
+                .title
+                .as_ref()
+                .map(|title| title.text.as_str()),
+            Some("Chart Title")
+        );
+        assert_eq!(chart_projection.series.len(), 1);
+        assert_eq!(
+            chart_projection.series[0].title.as_deref(),
+            Some("Series 1")
+        );
+        assert_eq!(
+            chart_projection.series[0]
+                .category_reference
+                .as_ref()
+                .and_then(|value| value.formula.as_deref()),
+            Some("Sheet1!$A$1:$A$2")
+        );
+        assert_eq!(
+            chart_projection.series[0]
+                .value_reference
+                .as_ref()
+                .and_then(|value| value.formula.as_deref()),
+            Some("Sheet1!$B$1:$B$2")
+        );
+        assert_eq!(
+            chart_projection
+                .embedded_workbook
+                .as_ref()
+                .and_then(|resource| { resource.part_path.as_deref() }),
+            Some("word/embeddings/workbook1.xlsx")
+        );
+        assert_eq!(
+            chart_projection
+                .external_data
+                .as_ref()
+                .and_then(|target| target.raw_target.as_deref()),
+            Some("https://example.invalid/chart-data.xlsx")
+        );
+
+        let diagram = registry
+            .objects
+            .iter()
+            .find(|object| object.kind == EmbeddedVisualObjectKind::SmartartDiagram)
+            .unwrap();
+        let diagram_projection = diagram.diagram.as_ref().unwrap();
+        assert_eq!(
+            diagram_projection
+                .data_part
+                .as_ref()
+                .and_then(|part| part.part_path.as_deref()),
+            Some("word/diagrams/data1.xml")
+        );
+        assert_eq!(diagram_projection.points.len(), 2);
+        assert!(diagram_projection.texts.iter().any(|text| text == "Node A"));
+        assert!(diagram_projection
+            .connections
+            .iter()
+            .any(|connection| connection == "1:0:2"));
+
+        let previewed_ole = registry
+            .objects
+            .iter()
+            .find(|object| {
+                object.kind == EmbeddedVisualObjectKind::OleEmbeddedObject
+                    && object.preview_image.is_some()
+            })
+            .unwrap();
+        assert_eq!(
+            previewed_ole
+                .preview_image
+                .as_ref()
+                .and_then(|resource| resource.part_path.as_deref()),
+            Some("word/media/preview.png")
+        );
+        assert_eq!(
+            previewed_ole
+                .targets
+                .iter()
+                .find(|target| target.role.as_deref() == Some("object"))
+                .and_then(|target| target.resource.as_ref())
+                .and_then(|resource| resource.part_path.as_deref()),
+            Some("word/embeddings/oleObject1.bin")
+        );
+        assert_eq!(
+            previewed_ole
+                .ole
+                .as_ref()
+                .and_then(|ole| ole.metadata.prog_id.as_deref()),
+            Some("Word.Document.12")
+        );
+
+        assert!(registry.objects.iter().any(|object| {
+            object.kind == EmbeddedVisualObjectKind::OleLinkedObject
+                && object
+                    .targets
+                    .iter()
+                    .any(|target| target.kind == EmbeddedObjectTargetKind::ExternalRelationship)
+        }));
+        assert!(registry.objects.iter().any(|object| {
+            object.kind == EmbeddedVisualObjectKind::EmbeddedPackage
+                && object.package_resource.is_some()
+        }));
+
+        let shared_digest = previewed_ole
+            .targets
+            .iter()
+            .find(|target| target.role.as_deref() == Some("object"))
+            .and_then(|target| target.resource.as_ref())
+            .and_then(|resource| resource.object_digest.as_deref())
+            .unwrap();
+        assert!(
+            registry
+                .objects
+                .iter()
+                .flat_map(|object| object.targets.iter())
+                .filter_map(|target| target.resource.as_ref())
+                .filter(|resource| resource.object_digest.as_deref() == Some(shared_digest))
+                .count()
+                >= 2
+        );
+
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "CVN_EMBEDDED_OBJECT_RELATIONSHIP_MISSING" }));
+        assert!(registry.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CVN_EMBEDDED_OBJECT_RELATIONSHIP_TYPE_MISMATCH"
+        }));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_EMBEDDED_OBJECT_PART_MISSING"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_EMBEDDED_OBJECT_EXTERNAL_TARGET_INERT"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_EMBEDDED_OBJECT_ACTIVEX_BLOCKED"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_CHART_FORMULA_NOT_EVALUATED"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_CHART_EXTERNAL_DATA_INERT"));
+        assert!(registry
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CVN_DIAGRAM_PART_MISSING"));
+
+        assert!(semantic_contains_object_wrapper(&first.document.semantic));
+        let main_objects = collect_objects_from_blocks_for_test(&first.document.semantic.blocks);
+        assert!(main_objects.len() >= 10);
+        assert!(
+            story_part_objects(&first.document.semantic, StoryPartKind::HeaderDefault).len() >= 1
+        );
+        assert!(story_part_objects(&first.document.semantic, StoryPartKind::Footnotes).len() >= 1);
+
+        let out1 =
+            std::env::temp_dir().join(format!("tuff-cvn-objects-out-1-{}", std::process::id()));
+        let out2 =
+            std::env::temp_dir().join(format!("tuff-cvn-objects-out-2-{}", std::process::id()));
         let _ = fs::remove_dir_all(&out1);
         let _ = fs::remove_dir_all(&out2);
         cvn_package::write_package(&out1, &first).unwrap();
@@ -10586,6 +12237,9 @@ mod tests {
                 SemanticInline::Drawing(drawing) => {
                     ids.push(drawing.id.as_str().to_owned());
                 }
+                SemanticInline::EmbeddedVisualObject(object) => {
+                    ids.push(object.id.as_str().to_owned());
+                }
                 SemanticInline::TrackedChange { change } => match &change.content {
                     TrackedContent::Inline { items } => {
                         collect_reference_ids_from_inlines(items, ids);
@@ -10671,6 +12325,26 @@ mod tests {
         })
     }
 
+    fn semantic_contains_object_wrapper(document: &SemanticDocument) -> bool {
+        contains_inline_wrapper(&document.blocks, |inline| {
+            matches!(inline, SemanticInline::EmbeddedVisualObject(_))
+        }) || document.stories.as_ref().is_some_and(|stories| {
+            stories.parts.iter().any(|part| {
+                contains_inline_wrapper(&part.blocks, |inline| {
+                    matches!(inline, SemanticInline::EmbeddedVisualObject(_))
+                }) || part.notes.iter().any(|note| {
+                    contains_inline_wrapper(&note.blocks, |inline| {
+                        matches!(inline, SemanticInline::EmbeddedVisualObject(_))
+                    })
+                }) || part.comments.iter().any(|comment| {
+                    contains_inline_wrapper(&comment.blocks, |inline| {
+                        matches!(inline, SemanticInline::EmbeddedVisualObject(_))
+                    })
+                })
+            })
+        })
+    }
+
     fn collect_drawing_semantic_ids(document: &SemanticDocument) -> Vec<String> {
         let mut ids = Vec::new();
         collect_drawing_ids_from_blocks(&document.blocks, &mut ids);
@@ -10682,6 +12356,24 @@ mod tests {
                 }
                 for comment in &part.comments {
                     collect_drawing_ids_from_blocks(&comment.blocks, &mut ids);
+                }
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    fn collect_object_semantic_ids(document: &SemanticDocument) -> Vec<String> {
+        let mut ids = Vec::new();
+        collect_object_ids_from_blocks(&document.blocks, &mut ids);
+        if let Some(stories) = document.stories.as_ref() {
+            for part in &stories.parts {
+                collect_object_ids_from_blocks(&part.blocks, &mut ids);
+                for note in &part.notes {
+                    collect_object_ids_from_blocks(&note.blocks, &mut ids);
+                }
+                for comment in &part.comments {
+                    collect_object_ids_from_blocks(&comment.blocks, &mut ids);
                 }
             }
         }
@@ -10748,6 +12440,79 @@ mod tests {
                 }
                 SemanticInline::BookmarkStart(_)
                 | SemanticInline::BookmarkEnd(_)
+                | SemanticInline::EmbeddedVisualObject(_)
+                | SemanticInline::Text(_)
+                | SemanticInline::Tab
+                | SemanticInline::LineBreak { .. }
+                | SemanticInline::FootnoteReference { .. }
+                | SemanticInline::EndnoteReference { .. }
+                | SemanticInline::CommentReference { .. }
+                | SemanticInline::CommentRangeStart { .. }
+                | SemanticInline::CommentRangeEnd { .. } => {}
+            }
+        }
+    }
+
+    fn collect_object_ids_from_blocks(blocks: &[SemanticBlock], ids: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                SemanticBlock::Paragraph(paragraph) => {
+                    for run in &paragraph.runs {
+                        collect_object_ids_from_inlines(&run.inlines, ids);
+                    }
+                }
+                SemanticBlock::Table(table) => {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            collect_object_ids_from_blocks(&cell.blocks, ids);
+                        }
+                    }
+                }
+                SemanticBlock::TrackedChange(change) => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_object_ids_from_inlines(items, ids);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        collect_object_ids_from_blocks(blocks, ids);
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticBlock::MceSelectedContent(content) => {
+                    collect_object_ids_from_blocks(&content.blocks, ids);
+                    collect_object_ids_from_inlines(&content.inlines, ids);
+                }
+            }
+        }
+    }
+
+    fn collect_object_ids_from_inlines(inlines: &[SemanticInline], ids: &mut Vec<String>) {
+        for inline in inlines {
+            match inline {
+                SemanticInline::EmbeddedVisualObject(object) => {
+                    ids.push(object.id.as_str().to_owned());
+                }
+                SemanticInline::Hyperlink(hyperlink) => {
+                    collect_object_ids_from_inlines(&hyperlink.children, ids);
+                }
+                SemanticInline::Field(field) => {
+                    collect_object_ids_from_inlines(&field.result.children, ids);
+                }
+                SemanticInline::TrackedChange { change } => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_object_ids_from_inlines(items, ids);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        collect_object_ids_from_blocks(blocks, ids);
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticInline::MceSelectedContent(content) => {
+                    collect_object_ids_from_blocks(&content.blocks, ids);
+                    collect_object_ids_from_inlines(&content.inlines, ids);
+                }
+                SemanticInline::Drawing(_)
+                | SemanticInline::BookmarkStart(_)
+                | SemanticInline::BookmarkEnd(_)
                 | SemanticInline::Text(_)
                 | SemanticInline::Tab
                 | SemanticInline::LineBreak { .. }
@@ -10780,6 +12545,28 @@ mod tests {
             }
         }
         drawings
+    }
+
+    fn story_part_objects<'a>(
+        document: &'a SemanticDocument,
+        kind: StoryPartKind,
+    ) -> Vec<&'a EmbeddedVisualObjectProjection> {
+        let mut objects = Vec::new();
+        if let Some(stories) = document.stories.as_ref() {
+            for part in &stories.parts {
+                if part.kind != kind {
+                    continue;
+                }
+                objects.extend(collect_objects_from_blocks_for_test(&part.blocks));
+                for note in &part.notes {
+                    objects.extend(collect_objects_from_blocks_for_test(&note.blocks));
+                }
+                for comment in &part.comments {
+                    objects.extend(collect_objects_from_blocks_for_test(&comment.blocks));
+                }
+            }
+        }
+        objects
     }
 
     fn collect_drawings_from_blocks_for_test<'a>(
@@ -10818,6 +12605,42 @@ mod tests {
         drawings
     }
 
+    fn collect_objects_from_blocks_for_test<'a>(
+        blocks: &'a [SemanticBlock],
+    ) -> Vec<&'a EmbeddedVisualObjectProjection> {
+        let mut objects = Vec::new();
+        for block in blocks {
+            match block {
+                SemanticBlock::Paragraph(paragraph) => {
+                    for run in &paragraph.runs {
+                        collect_objects_from_inlines_for_test(&run.inlines, &mut objects);
+                    }
+                }
+                SemanticBlock::Table(table) => {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            objects.extend(collect_objects_from_blocks_for_test(&cell.blocks));
+                        }
+                    }
+                }
+                SemanticBlock::TrackedChange(change) => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_objects_from_inlines_for_test(items, &mut objects);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        objects.extend(collect_objects_from_blocks_for_test(blocks));
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticBlock::MceSelectedContent(content) => {
+                    objects.extend(collect_objects_from_blocks_for_test(&content.blocks));
+                    collect_objects_from_inlines_for_test(&content.inlines, &mut objects);
+                }
+            }
+        }
+        objects
+    }
+
     fn collect_drawings_from_inlines_for_test<'a>(
         inlines: &'a [SemanticInline],
         drawings: &mut Vec<&'a DrawingProjection>,
@@ -10825,6 +12648,7 @@ mod tests {
         for inline in inlines {
             match inline {
                 SemanticInline::Drawing(drawing) => drawings.push(drawing),
+                SemanticInline::EmbeddedVisualObject(_) => {}
                 SemanticInline::Hyperlink(hyperlink) => {
                     collect_drawings_from_inlines_for_test(&hyperlink.children, drawings);
                 }
@@ -10845,6 +12669,47 @@ mod tests {
                     collect_drawings_from_inlines_for_test(&content.inlines, drawings);
                 }
                 SemanticInline::BookmarkStart(_)
+                | SemanticInline::BookmarkEnd(_)
+                | SemanticInline::Text(_)
+                | SemanticInline::Tab
+                | SemanticInline::LineBreak { .. }
+                | SemanticInline::FootnoteReference { .. }
+                | SemanticInline::EndnoteReference { .. }
+                | SemanticInline::CommentReference { .. }
+                | SemanticInline::CommentRangeStart { .. }
+                | SemanticInline::CommentRangeEnd { .. } => {}
+            }
+        }
+    }
+
+    fn collect_objects_from_inlines_for_test<'a>(
+        inlines: &'a [SemanticInline],
+        objects: &mut Vec<&'a EmbeddedVisualObjectProjection>,
+    ) {
+        for inline in inlines {
+            match inline {
+                SemanticInline::EmbeddedVisualObject(object) => objects.push(object),
+                SemanticInline::Hyperlink(hyperlink) => {
+                    collect_objects_from_inlines_for_test(&hyperlink.children, objects);
+                }
+                SemanticInline::Field(field) => {
+                    collect_objects_from_inlines_for_test(&field.result.children, objects);
+                }
+                SemanticInline::TrackedChange { change } => match &change.content {
+                    TrackedContent::Inline { items } => {
+                        collect_objects_from_inlines_for_test(items, objects);
+                    }
+                    TrackedContent::Block { blocks } => {
+                        objects.extend(collect_objects_from_blocks_for_test(blocks));
+                    }
+                    TrackedContent::PropertyChange { .. } => {}
+                },
+                SemanticInline::MceSelectedContent(content) => {
+                    objects.extend(collect_objects_from_blocks_for_test(&content.blocks));
+                    collect_objects_from_inlines_for_test(&content.inlines, objects);
+                }
+                SemanticInline::Drawing(_)
+                | SemanticInline::BookmarkStart(_)
                 | SemanticInline::BookmarkEnd(_)
                 | SemanticInline::Text(_)
                 | SemanticInline::Tab
@@ -10924,7 +12789,7 @@ mod tests {
                         return true;
                     }
                 }
-                SemanticInline::Drawing(_) => {}
+                SemanticInline::Drawing(_) | SemanticInline::EmbeddedVisualObject(_) => {}
                 SemanticInline::TrackedChange { change } => match &change.content {
                     TrackedContent::Inline { items } => {
                         if contains_inline_wrapper_in_inlines(items, predicate) {
@@ -11039,7 +12904,7 @@ mod tests {
                     collect_inline_text(child, text);
                 }
             }
-            SemanticInline::Drawing(_) => {}
+            SemanticInline::Drawing(_) | SemanticInline::EmbeddedVisualObject(_) => {}
             SemanticInline::TrackedChange { change } => {
                 if let TrackedContent::Inline { items } = &change.content {
                     for inline in items {
@@ -11165,7 +13030,7 @@ mod tests {
                 SemanticInline::Field(field) => {
                     collect_mce_inline_wrappers_from_inlines(&field.result.children, wrappers);
                 }
-                SemanticInline::Drawing(_) => {}
+                SemanticInline::Drawing(_) | SemanticInline::EmbeddedVisualObject(_) => {}
                 SemanticInline::Text(_)
                 | SemanticInline::BookmarkStart(_)
                 | SemanticInline::BookmarkEnd(_)
