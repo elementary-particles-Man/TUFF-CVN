@@ -486,6 +486,8 @@ pub struct DrawingProjection {
     #[serde(default)]
     pub vml_style_properties: BTreeMap<String, String>,
     #[serde(default)]
+    pub embedded_visual_objects: Vec<EmbeddedVisualObjectProjection>,
+    #[serde(default)]
     pub diagnostics: Vec<DrawingResolutionDiagnostic>,
 }
 

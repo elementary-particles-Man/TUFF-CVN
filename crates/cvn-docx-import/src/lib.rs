@@ -2794,6 +2794,7 @@ fn append_visual_inline(
     document_id: &DocumentId,
     source_part_path: &str,
     document_digest: &str,
+    container_kind: VisualInlineContainerKind,
     anchor: SourceAnchor,
     raw_xml: &str,
     id_set: &mut BTreeSet<String>,
@@ -2803,26 +2804,7 @@ fn append_visual_inline(
     hyperlink_stack: &mut [HyperlinkBuilder],
     field_stack: &mut [FieldBuilder],
 ) -> Result<(), DocxImportError> {
-    if let Some(object) = parse_embedded_visual_object_projection(
-        document_id,
-        source_part_path,
-        document_digest,
-        anchor.clone(),
-        raw_xml,
-        id_set,
-    )? {
-        append_inline(
-            paragraph_stack,
-            run_stack,
-            active_change,
-            hyperlink_stack,
-            field_stack,
-            SemanticInline::EmbeddedVisualObject(object),
-        );
-        return Ok(());
-    }
-
-    let drawing = parse_drawing_projection(
+    let mut drawing = parse_drawing_projection(
         document_id,
         source_part_path,
         document_digest,
@@ -2830,6 +2812,23 @@ fn append_visual_inline(
         raw_xml,
         id_set,
     )?;
+    if container_kind == VisualInlineContainerKind::Drawing {
+        if let Some(object) = parse_embedded_visual_object_projection(
+            document_id,
+            source_part_path,
+            document_digest,
+            drawing.source_anchor.clone(),
+            raw_xml,
+            id_set,
+        )? {
+            if matches!(
+                object.kind,
+                EmbeddedVisualObjectKind::Chart | EmbeddedVisualObjectKind::SmartartDiagram
+            ) {
+                drawing.embedded_visual_objects.push(object);
+            }
+        }
+    }
     append_inline(
         paragraph_stack,
         run_stack,
@@ -2839,6 +2838,12 @@ fn append_visual_inline(
         SemanticInline::Drawing(drawing),
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualInlineContainerKind {
+    Drawing,
+    Pict,
 }
 
 fn parse_embedded_visual_object_projection(
@@ -3108,6 +3113,7 @@ fn parse_drawing_projection(
         vml_shape_type: None,
         vml_style_raw: None,
         vml_style_properties: BTreeMap::new(),
+        embedded_visual_objects: Vec::new(),
         diagnostics: Vec::new(),
     };
     let mut reader = Reader::from_reader(Cursor::new(raw_xml.as_bytes()));
@@ -4546,6 +4552,7 @@ fn parse_semantic_document(
                             document_id,
                             source_part_path,
                             &document_digest,
+                            VisualInlineContainerKind::Drawing,
                             anchor,
                             &raw_xml,
                             &mut id_set,
@@ -4573,6 +4580,7 @@ fn parse_semantic_document(
                             document_id,
                             source_part_path,
                             &document_digest,
+                            VisualInlineContainerKind::Pict,
                             anchor,
                             &raw_xml,
                             &mut id_set,
@@ -5087,6 +5095,7 @@ fn parse_semantic_document(
                             document_id,
                             source_part_path,
                             &document_digest,
+                            VisualInlineContainerKind::Drawing,
                             anchor,
                             &raw_xml,
                             &mut id_set,
@@ -5104,6 +5113,7 @@ fn parse_semantic_document(
                             document_id,
                             source_part_path,
                             &document_digest,
+                            VisualInlineContainerKind::Pict,
                             anchor,
                             &raw_xml,
                             &mut id_set,
@@ -5389,13 +5399,24 @@ fn parse_semantic_document(
                         | "sectPrChange"
                 ) {
                     if let Some(change) = active_change.take() {
-                        tracked_changes.push(change.finish(
+                        let tracked_change = change.finish(
                             document_id,
                             &name.local_name,
                             &source_part_path.to_owned(),
                             &document_digest,
                             &mut id_set,
-                        )?);
+                        )?;
+                        tracked_changes.push(tracked_change.clone());
+                        append_inline(
+                            &mut paragraph_stack,
+                            &mut run_stack,
+                            &mut active_change,
+                            &mut hyperlink_stack,
+                            &mut field_stack,
+                            SemanticInline::TrackedChange {
+                                change: Box::new(tracked_change),
+                            },
+                        );
                     }
                 }
                 end_element(
@@ -6577,8 +6598,8 @@ fn resolve_semantic_references(
         resolve_story_registry(stories, &semantic.blocks, relationships);
     }
     resolve_document_references(semantic, relationships);
-    resolve_document_drawings(semantic, relationships, content_types, parts);
     resolve_embedded_visual_objects(semantic, relationships, content_types, parts, objects);
+    resolve_document_drawings(semantic, relationships, content_types, parts);
 }
 
 fn resolve_block_references(
@@ -7164,6 +7185,19 @@ fn collect_embedded_visual_objects_from_inlines(
 ) {
     for inline in inlines {
         match inline {
+            SemanticInline::Drawing(drawing) => {
+                for object in &mut drawing.embedded_visual_objects {
+                    resolve_embedded_visual_object_targets(
+                        object,
+                        relationships,
+                        content_types,
+                        parts,
+                        objects,
+                    );
+                    projection.diagnostics.extend(object.diagnostics.clone());
+                    projection.objects.push(object.clone());
+                }
+            }
             SemanticInline::EmbeddedVisualObject(object) => {
                 resolve_embedded_visual_object_targets(
                     object,
@@ -7231,7 +7265,6 @@ fn collect_embedded_visual_objects_from_inlines(
             SemanticInline::Text(_)
             | SemanticInline::BookmarkStart(_)
             | SemanticInline::BookmarkEnd(_)
-            | SemanticInline::Drawing(_)
             | SemanticInline::Tab
             | SemanticInline::LineBreak { .. }
             | SemanticInline::FootnoteReference { .. }
@@ -11008,11 +11041,11 @@ mod tests {
         add(&mut zip, options, "[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="bin" ContentType="application/octet-stream"/><Default Extension="docx" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/><Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/><Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/><Override PartName="/word/diagrams/data1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml"/><Override PartName="/word/diagrams/layout1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.diagramLayout+xml"/><Override PartName="/word/diagrams/style1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.diagramStyle+xml"/></Types>"#);
         add(&mut zip, options, "_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="officeDocument" Target="word/document.xml"/></Relationships>"#);
         add(&mut zip, options, "word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader1" Type="header" Target="header1.xml"/><Relationship Id="rIdFootnotes" Type="footnotes" Target="footnotes.xml"/><Relationship Id="rIdChart1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/><Relationship Id="rIdDiagramData" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml"/><Relationship Id="rIdDiagramLayout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout" Target="diagrams/layout1.xml"/><Relationship Id="rIdDiagramStyle" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle" Target="diagrams/style1.xml"/><Relationship Id="rIdDiagramColors" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors" Target="diagrams/missing-colors1.xml"/><Relationship Id="rIdOle1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/><Relationship Id="rIdOleLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="https://example.invalid/ole-object" TargetMode="External"/><Relationship Id="rIdPackage1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="embeddings/package1.docx"/><Relationship Id="rIdControl1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/control" Target="activeX/activeX1.bin"/><Relationship Id="rIdPreview" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/preview.png"/><Relationship Id="rIdWrongType" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/><Relationship Id="rIdMissingPart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/missing.bin"/></Relationships>"#);
-        add(&mut zip, options, "word/_rels/header1.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeaderObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/></Relationships>"#);
-        add(&mut zip, options, "word/_rels/footnotes.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFootObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="embeddings/package1.docx"/></Relationships>"#);
-        add(&mut zip, options, "word/document.xml", br##"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><w:body><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rIdDiagramData" r:lo="rIdDiagramLayout" r:qs="rIdDiagramStyle" r:cs="rIdDiagramColors"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:object><v:shape id="OleShape1"><v:imagedata r:id="rIdPreview" o:title="Previewed object"/></v:shape><o:OLEObject Type="Embed" ProgID="Word.Document.12" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" UpdateMode="Always" r:id="rIdOle1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Link" ProgID="Excel.Sheet.12" ShapeID="_x0000_i1026" ObjectID="_2" r:id="rIdOleLink"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1027" ObjectID="_3" r:id="rIdPackage1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:control r:id="rIdControl1"/><o:OLEObject Type="Embed" ProgID="Forms.CommandButton.1" ShapeID="_x0000_i1028" ObjectID="_4" r:id="rIdControl1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_5" r:id="rIdMissingObject"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_6" r:id="rIdWrongType"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_7" r:id="rIdMissingPart"/></w:object></w:r></w:p><w:p><w:hyperlink w:anchor="LocalAnchor"><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:hyperlink></w:p><w:p><w:r><w:fldSimple w:instr=" REF LocalAnchor "><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ObjectID="_8" r:id="rIdPackage1"/></w:object></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="61" w:author="Alice"><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_9" r:id="rIdOle1"/></w:object></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"##);
-        add(&mut zip, options, "word/header1.xml", br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:o="urn:schemas-microsoft-com:office:office"><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_10" r:id="rIdHeaderObject"/></w:object></w:r></w:p></w:hdr>"#);
-        add(&mut zip, options, "word/footnotes.xml", br#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:o="urn:schemas-microsoft-com:office:office"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ObjectID="_11" r:id="rIdFootObject"/></w:object></w:r></w:p></w:footnote></w:footnotes>"#);
+        add(&mut zip, options, "word/_rels/header1.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeaderObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/><Relationship Id="rIdHeaderChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/_rels/footnotes.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFootObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="embeddings/package1.docx"/><Relationship Id="rIdFootDiagramData" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml"/><Relationship Id="rIdFootDiagramLayout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout" Target="diagrams/layout1.xml"/><Relationship Id="rIdFootDiagramStyle" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle" Target="diagrams/style1.xml"/><Relationship Id="rIdFootDiagramColors" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors" Target="diagrams/missing-colors1.xml"/></Relationships>"#);
+        add(&mut zip, options, "word/document.xml", br##"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><w:body><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rIdDiagramData" r:lo="rIdDiagramLayout" r:qs="rIdDiagramStyle" r:cs="rIdDiagramColors"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:object><v:shape id="OleShape1"><v:imagedata r:id="rIdPreview" o:title="Previewed object"/></v:shape><o:OLEObject Type="Embed" ProgID="Word.Document.12" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" UpdateMode="Always" r:id="rIdOle1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Link" ProgID="Excel.Sheet.12" ShapeID="_x0000_i1026" ObjectID="_2" r:id="rIdOleLink"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1027" ObjectID="_3" r:id="rIdPackage1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:control r:id="rIdControl1"/><o:OLEObject Type="Embed" ProgID="Forms.CommandButton.1" ShapeID="_x0000_i1028" ObjectID="_4" r:id="rIdControl1"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_5" r:id="rIdMissingObject"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_6" r:id="rIdWrongType"/></w:object></w:r></w:p><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_7" r:id="rIdMissingPart"/></w:object></w:r></w:p><w:p><w:hyperlink w:anchor="LocalAnchor"><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:hyperlink></w:p><w:p><w:r><w:fldSimple w:instr=" REF LocalAnchor "><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ObjectID="_8" r:id="rIdPackage1"/></w:object></w:r></w:fldSimple></w:r></w:p><w:p><w:r><w:fldSimple w:instr=" REF LocalAnchor "><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rIdDiagramData" r:lo="rIdDiagramLayout" r:qs="rIdDiagramStyle" r:cs="rIdDiagramColors"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:fldSimple></w:r></w:p><w:p><w:ins w:id="61" w:author="Alice"><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_9" r:id="rIdOle1"/></w:object></w:r></w:ins></w:p><w:p><w:ins w:id="62" w:author="Alice"><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:ins></w:p><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><mc:AlternateContent><mc:Choice Requires="w"><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rIdDiagramData" r:lo="rIdDiagramLayout" r:qs="rIdDiagramStyle" r:cs="rIdDiagramColors"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>fallback-2</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent><w:p><w:pPr><w:sectPr><w:headerReference r:id="rIdHeader1" w:type="default"/></w:sectPr></w:pPr></w:p><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"##);
+        add(&mut zip, options, "word/header1.xml", br##"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Word.Document.12" ObjectID="_10" r:id="rIdHeaderObject"/></w:object></w:r></w:p><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdHeaderChart"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:hdr>"##);
+        add(&mut zip, options, "word/footnotes.xml", br##"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"><w:footnote w:id="-1"/><w:footnote w:id="1"><w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="Package" ObjectID="_11" r:id="rIdFootObject"/></w:object></w:r></w:p><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rIdFootDiagramData" r:lo="rIdFootDiagramLayout" r:qs="rIdFootDiagramStyle" r:cs="rIdFootDiagramColors"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:footnote></w:footnotes>"##);
         add(&mut zip, options, "word/charts/chart1.xml", br##"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Chart Title</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:tx><c:v>Series 1</c:v></c:tx><c:cat><c:strRef><c:f>Sheet1!$A$1:$A$2</c:f><c:strCache><c:pt idx="0"><c:v>Cat A</c:v></c:pt><c:pt idx="1"><c:v>Cat B</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Sheet1!$B$1:$B$2</c:f><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea><c:externalData r:id="rIdChartExt"><c:autoUpdate val="1"/></c:externalData></c:chart></c:chartSpace>"##);
         add(&mut zip, options, "word/charts/_rels/chart1.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdWorkbook" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/workbook1.xlsx"/><Relationship Id="rIdChartExt" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="https://example.invalid/chart-data.xlsx" TargetMode="External"/></Relationships>"#);
         add(&mut zip, options, "word/diagrams/data1.xml", br##"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt modelId="0"><dgm:t><a:t>Node A</a:t></dgm:t></dgm:pt><dgm:pt modelId="2"><dgm:t><a:t>Node B</a:t></dgm:t></dgm:pt></dgm:ptLst><dgm:cxnLst><dgm:cxn modelId="1" srcId="0" destId="2"/></dgm:cxnLst></dgm:dataModel>"##);
@@ -12100,12 +12133,71 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "CVN_DIAGRAM_PART_MISSING"));
 
         assert!(semantic_contains_object_wrapper(&first.document.semantic));
+        let top_level_chart = drawing_inline_at(&first.document.semantic.blocks, 0, 0, 0);
+        assert!(drawing_contains_object_kind(
+            top_level_chart,
+            EmbeddedVisualObjectKind::Chart
+        ));
+        let top_level_chart_object = top_level_chart
+            .embedded_visual_objects
+            .iter()
+            .find(|object| object.kind == EmbeddedVisualObjectKind::Chart)
+            .unwrap();
+        assert_ne!(top_level_chart.id, top_level_chart_object.id);
+
+        let top_level_diagram = drawing_inline_at(&first.document.semantic.blocks, 1, 0, 0);
+        assert!(drawing_contains_object_kind(
+            top_level_diagram,
+            EmbeddedVisualObjectKind::SmartartDiagram
+        ));
+        assert!(matches!(
+            inline_at(&first.document.semantic.blocks, 2, 0, 0),
+            SemanticInline::EmbeddedVisualObject(object)
+                if object.kind == EmbeddedVisualObjectKind::OleEmbeddedObject
+        ));
+        assert!(contains_hyperlink_with_drawing_object_kind(
+            &first.document.semantic.blocks,
+            EmbeddedVisualObjectKind::Chart
+        ));
+        assert!(contains_field_with_drawing_object_kind(
+            &first.document.semantic.blocks,
+            EmbeddedVisualObjectKind::SmartartDiagram
+        ));
+        assert!(contains_tracked_change_with_drawing_object_kind(
+            &first.document.semantic.blocks,
+            EmbeddedVisualObjectKind::Chart
+        ));
+        assert!(contains_mce_with_drawing_object_kind(
+            &first.document.semantic.blocks,
+            EmbeddedVisualObjectKind::SmartartDiagram
+        ));
         let main_objects = collect_objects_from_blocks_for_test(&first.document.semantic.blocks);
         assert!(main_objects.len() >= 10);
         assert!(
-            story_part_objects(&first.document.semantic, StoryPartKind::HeaderDefault).len() >= 1
+            main_objects
+                .iter()
+                .filter(|object| object.kind == EmbeddedVisualObjectKind::Chart)
+                .count()
+                >= 4
         );
-        assert!(story_part_objects(&first.document.semantic, StoryPartKind::Footnotes).len() >= 1);
+        assert!(
+            story_part_objects(&first.document.semantic, StoryPartKind::HeaderDefault).len() >= 2
+        );
+        assert!(
+            story_part_drawings(&first.document.semantic, StoryPartKind::HeaderDefault)
+                .iter()
+                .any(|drawing| {
+                    drawing_contains_object_kind(drawing, EmbeddedVisualObjectKind::Chart)
+                })
+        );
+        assert!(story_part_objects(&first.document.semantic, StoryPartKind::Footnotes).len() >= 2);
+        assert!(
+            story_part_drawings(&first.document.semantic, StoryPartKind::Footnotes)
+                .iter()
+                .any(|drawing| {
+                    drawing_contains_object_kind(drawing, EmbeddedVisualObjectKind::SmartartDiagram)
+                })
+        );
 
         let out1 =
             std::env::temp_dir().join(format!("tuff-cvn-objects-out-1-{}", std::process::id()));
@@ -12326,23 +12418,18 @@ mod tests {
     }
 
     fn semantic_contains_object_wrapper(document: &SemanticDocument) -> bool {
-        contains_inline_wrapper(&document.blocks, |inline| {
-            matches!(inline, SemanticInline::EmbeddedVisualObject(_))
-        }) || document.stories.as_ref().is_some_and(|stories| {
-            stories.parts.iter().any(|part| {
-                contains_inline_wrapper(&part.blocks, |inline| {
-                    matches!(inline, SemanticInline::EmbeddedVisualObject(_))
-                }) || part.notes.iter().any(|note| {
-                    contains_inline_wrapper(&note.blocks, |inline| {
-                        matches!(inline, SemanticInline::EmbeddedVisualObject(_))
-                    })
-                }) || part.comments.iter().any(|comment| {
-                    contains_inline_wrapper(&comment.blocks, |inline| {
-                        matches!(inline, SemanticInline::EmbeddedVisualObject(_))
-                    })
+        !collect_objects_from_blocks_for_test(&document.blocks).is_empty()
+            || document.stories.as_ref().is_some_and(|stories| {
+                stories.parts.iter().any(|part| {
+                    !collect_objects_from_blocks_for_test(&part.blocks).is_empty()
+                        || part.notes.iter().any(|note| {
+                            !collect_objects_from_blocks_for_test(&note.blocks).is_empty()
+                        })
+                        || part.comments.iter().any(|comment| {
+                            !collect_objects_from_blocks_for_test(&comment.blocks).is_empty()
+                        })
                 })
             })
-        })
     }
 
     fn collect_drawing_semantic_ids(document: &SemanticDocument) -> Vec<String> {
@@ -12510,8 +12597,12 @@ mod tests {
                     collect_object_ids_from_blocks(&content.blocks, ids);
                     collect_object_ids_from_inlines(&content.inlines, ids);
                 }
-                SemanticInline::Drawing(_)
-                | SemanticInline::BookmarkStart(_)
+                SemanticInline::Drawing(drawing) => {
+                    for object in &drawing.embedded_visual_objects {
+                        ids.push(object.id.as_str().to_owned());
+                    }
+                }
+                SemanticInline::BookmarkStart(_)
                 | SemanticInline::BookmarkEnd(_)
                 | SemanticInline::Text(_)
                 | SemanticInline::Tab
@@ -12567,6 +12658,223 @@ mod tests {
             }
         }
         objects
+    }
+
+    fn inline_at(
+        blocks: &[SemanticBlock],
+        paragraph_index: usize,
+        run_index: usize,
+        inline_index: usize,
+    ) -> &SemanticInline {
+        let SemanticBlock::Paragraph(paragraph) = &blocks[paragraph_index] else {
+            panic!("expected paragraph at block index {paragraph_index}");
+        };
+        &paragraph.runs[run_index].inlines[inline_index]
+    }
+
+    fn drawing_inline_at(
+        blocks: &[SemanticBlock],
+        paragraph_index: usize,
+        run_index: usize,
+        inline_index: usize,
+    ) -> &DrawingProjection {
+        match inline_at(blocks, paragraph_index, run_index, inline_index) {
+            SemanticInline::Drawing(drawing) => drawing,
+            other => panic!("expected drawing inline, found {other:?}"),
+        }
+    }
+
+    fn drawing_contains_object_kind(
+        drawing: &DrawingProjection,
+        kind: EmbeddedVisualObjectKind,
+    ) -> bool {
+        drawing
+            .embedded_visual_objects
+            .iter()
+            .any(|object| object.kind == kind)
+    }
+
+    fn contains_hyperlink_with_drawing_object_kind(
+        blocks: &[SemanticBlock],
+        kind: EmbeddedVisualObjectKind,
+    ) -> bool {
+        contains_inline_wrapper(blocks, |inline| {
+            match inline {
+            SemanticInline::Hyperlink(hyperlink) => hyperlink.children.iter().any(|child| {
+                matches!(child, SemanticInline::Drawing(drawing) if drawing_contains_object_kind(drawing, kind))
+            }),
+            _ => false,
+        }
+        })
+    }
+
+    fn contains_field_with_drawing_object_kind(
+        blocks: &[SemanticBlock],
+        kind: EmbeddedVisualObjectKind,
+    ) -> bool {
+        contains_inline_wrapper(blocks, |inline| {
+            match inline {
+            SemanticInline::Field(field) => field.result.children.iter().any(|child| {
+                matches!(child, SemanticInline::Drawing(drawing) if drawing_contains_object_kind(drawing, kind))
+            }),
+            _ => false,
+        }
+        })
+    }
+
+    fn contains_tracked_change_with_drawing_object_kind(
+        blocks: &[SemanticBlock],
+        kind: EmbeddedVisualObjectKind,
+    ) -> bool {
+        contains_drawing_object_kind_in_blocks(blocks, kind, false)
+    }
+
+    fn tracked_content_contains_drawing_object_kind(
+        content: &TrackedContent,
+        kind: EmbeddedVisualObjectKind,
+    ) -> bool {
+        match content {
+            TrackedContent::Inline { items } => {
+                contains_drawing_object_kind_in_inlines(items, kind, true)
+            }
+            TrackedContent::Block { blocks } => {
+                contains_drawing_object_kind_in_blocks(blocks, kind, true)
+            }
+            TrackedContent::PropertyChange { .. } => false,
+        }
+    }
+
+    fn contains_drawing_object_kind_in_blocks(
+        blocks: &[SemanticBlock],
+        kind: EmbeddedVisualObjectKind,
+        within_tracked_change: bool,
+    ) -> bool {
+        blocks.iter().any(|block| match block {
+            SemanticBlock::Paragraph(paragraph) => paragraph.runs.iter().any(|run| {
+                contains_drawing_object_kind_in_inlines(&run.inlines, kind, within_tracked_change)
+            }),
+            SemanticBlock::Table(table) => table.rows.iter().any(|row| {
+                row.cells.iter().any(|cell| {
+                    contains_drawing_object_kind_in_blocks(
+                        &cell.blocks,
+                        kind,
+                        within_tracked_change,
+                    )
+                })
+            }),
+            SemanticBlock::TrackedChange(change) => {
+                tracked_content_contains_drawing_object_kind(&change.content, kind)
+            }
+            SemanticBlock::MceSelectedContent(content) => {
+                contains_drawing_object_kind_in_blocks(&content.blocks, kind, within_tracked_change)
+                    || contains_drawing_object_kind_in_inlines(
+                        &content.inlines,
+                        kind,
+                        within_tracked_change,
+                    )
+            }
+        })
+    }
+
+    fn contains_drawing_object_kind_in_inlines(
+        inlines: &[SemanticInline],
+        kind: EmbeddedVisualObjectKind,
+        within_tracked_change: bool,
+    ) -> bool {
+        inlines.iter().any(|inline| match inline {
+            SemanticInline::Drawing(drawing) => {
+                within_tracked_change && drawing_contains_object_kind(drawing, kind)
+            }
+            SemanticInline::Hyperlink(hyperlink) => contains_drawing_object_kind_in_inlines(
+                &hyperlink.children,
+                kind,
+                within_tracked_change,
+            ),
+            SemanticInline::Field(field) => contains_drawing_object_kind_in_inlines(
+                &field.result.children,
+                kind,
+                within_tracked_change,
+            ),
+            SemanticInline::TrackedChange { change } => {
+                tracked_content_contains_drawing_object_kind(&change.content, kind)
+            }
+            SemanticInline::MceSelectedContent(content) => {
+                contains_drawing_object_kind_in_blocks(&content.blocks, kind, within_tracked_change)
+                    || contains_drawing_object_kind_in_inlines(
+                        &content.inlines,
+                        kind,
+                        within_tracked_change,
+                    )
+            }
+            SemanticInline::EmbeddedVisualObject(_)
+            | SemanticInline::BookmarkStart(_)
+            | SemanticInline::BookmarkEnd(_)
+            | SemanticInline::Text(_)
+            | SemanticInline::Tab
+            | SemanticInline::LineBreak { .. }
+            | SemanticInline::FootnoteReference { .. }
+            | SemanticInline::EndnoteReference { .. }
+            | SemanticInline::CommentReference { .. }
+            | SemanticInline::CommentRangeStart { .. }
+            | SemanticInline::CommentRangeEnd { .. } => false,
+        })
+    }
+
+    fn contains_mce_with_drawing_object_kind(
+        blocks: &[SemanticBlock],
+        kind: EmbeddedVisualObjectKind,
+    ) -> bool {
+        blocks.iter().any(|block| match block {
+            SemanticBlock::MceSelectedContent(content) => {
+                content.blocks.iter().any(|inner| match inner {
+                    SemanticBlock::Paragraph(paragraph) => paragraph.runs.iter().any(|run| {
+                        run.inlines.iter().any(|inline| {
+                            matches!(inline, SemanticInline::Drawing(drawing) if drawing_contains_object_kind(drawing, kind))
+                        })
+                    }),
+                    SemanticBlock::Table(table) => table.rows.iter().any(|row| {
+                        row.cells
+                            .iter()
+                            .any(|cell| contains_mce_with_drawing_object_kind(&cell.blocks, kind))
+                    }),
+                    SemanticBlock::TrackedChange(change) => {
+                        tracked_content_contains_drawing_object_kind(&change.content, kind)
+                    }
+                    SemanticBlock::MceSelectedContent(content) => {
+                        contains_mce_with_drawing_object_kind(&content.blocks, kind)
+                    }
+                }) || content.inlines.iter().any(|inline| {
+                    matches!(inline, SemanticInline::Drawing(drawing) if drawing_contains_object_kind(drawing, kind))
+                })
+            }
+            SemanticBlock::Paragraph(paragraph) => paragraph.runs.iter().any(|run| {
+                run.inlines.iter().any(|inline| match inline {
+                    SemanticInline::MceSelectedContent(content) => {
+                        content.inlines.iter().any(|child| {
+                            matches!(child, SemanticInline::Drawing(drawing) if drawing_contains_object_kind(drawing, kind))
+                        }) || contains_mce_with_drawing_object_kind(&content.blocks, kind)
+                    }
+                    _ => false,
+                })
+            }),
+            SemanticBlock::Table(table) => table.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .any(|cell| contains_mce_with_drawing_object_kind(&cell.blocks, kind))
+            }),
+            SemanticBlock::TrackedChange(change) => match &change.content {
+                TrackedContent::Block { blocks } => contains_mce_with_drawing_object_kind(blocks, kind),
+                TrackedContent::Inline { items } => items.iter().any(|inline| match inline {
+                    SemanticInline::MceSelectedContent(content) => {
+                        content.inlines.iter().any(|child| {
+                            matches!(child, SemanticInline::Drawing(drawing) if drawing_contains_object_kind(drawing, kind))
+                        }) || contains_mce_with_drawing_object_kind(&content.blocks, kind)
+                    }
+                    _ => false,
+                }),
+                TrackedContent::PropertyChange { .. } => false,
+            },
+        })
     }
 
     fn collect_drawings_from_blocks_for_test<'a>(
@@ -12688,6 +12996,9 @@ mod tests {
     ) {
         for inline in inlines {
             match inline {
+                SemanticInline::Drawing(drawing) => {
+                    objects.extend(drawing.embedded_visual_objects.iter());
+                }
                 SemanticInline::EmbeddedVisualObject(object) => objects.push(object),
                 SemanticInline::Hyperlink(hyperlink) => {
                     collect_objects_from_inlines_for_test(&hyperlink.children, objects);
@@ -12708,8 +13019,7 @@ mod tests {
                     objects.extend(collect_objects_from_blocks_for_test(&content.blocks));
                     collect_objects_from_inlines_for_test(&content.inlines, objects);
                 }
-                SemanticInline::Drawing(_)
-                | SemanticInline::BookmarkStart(_)
+                SemanticInline::BookmarkStart(_)
                 | SemanticInline::BookmarkEnd(_)
                 | SemanticInline::Text(_)
                 | SemanticInline::Tab
