@@ -123,7 +123,7 @@ fn verify_command(args: &[String]) -> Result<(), CliError> {
 fn inspect_command(args: &[String]) -> Result<(), CliError> {
     if args.len() < 2 {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings]".to_owned(),
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings] [--objects]".to_owned(),
         ));
     }
     let flags = &args[1..];
@@ -139,10 +139,11 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
                 | "--signatures"
                 | "--references"
                 | "--drawings"
+                | "--objects"
         )
     }) {
         return Err(CliError::Usage(
-            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings]"
+            "usage: tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings] [--objects]"
                 .to_owned(),
         ));
     }
@@ -185,6 +186,10 @@ fn inspect_command(args: &[String]) -> Result<(), CliError> {
             "--drawings" => println!(
                 "{}",
                 serde_json::to_string_pretty(&cvn_json.payload.semantic.drawings)?
+            ),
+            "--objects" => println!(
+                "{}",
+                serde_json::to_string_pretty(&cvn_json.payload.semantic.embedded_visual_objects)?
             ),
             _ => unreachable!("validated inspect flag"),
         }
@@ -343,7 +348,7 @@ Commands:
   tcvn verify <input.cvn> --against <document.docx>
       Verify CanonicalPackageIntegrity and ExpandedOpcPartByteIdentity.
 
-  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings]
+  tcvn inspect <input.cvn> [--semantic] [--styles] [--numbering] [--stories] [--changes] [--mce] [--signatures] [--references] [--drawings] [--objects]
       Print read-only projections from cvn.json.
 
   tcvn diff <left.cvn> <right.cvn>
